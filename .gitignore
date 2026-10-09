@@ -19,3 +19,7 @@ SECURITY_FIX_REPORT.md
 DEPENDENCY_FIX_REPORT.md
 semver-output.txt
 SEMVER_FIX_REPORT.md
+
+# Python bytecode
+__pycache__/
+*.pyc

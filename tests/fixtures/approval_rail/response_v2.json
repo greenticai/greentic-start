@@ -1,0 +1,10 @@
+{
+  "target": "default::run=RUN-1::node=gate",
+  "operation": "response",
+  "output": {
+    "decision": "approved",
+    "resolved_by": "boss@acme.test",
+    "decision_token": "EXAMPLE-TOKEN-NOT-A-REAL-SECRET",
+    "note": null
+  }
+}

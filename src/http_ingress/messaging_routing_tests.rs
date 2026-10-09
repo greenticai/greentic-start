@@ -22,6 +22,7 @@ fn flow(id: &str, kind: &str) -> AppFlowInfo {
         id: id.into(),
         kind: kind.into(),
         subscribes_to: vec![],
+        node_ids: vec![],
     }
 }
 
@@ -436,8 +437,10 @@ fn flows_run_by_ingress(root: &Path, c: &OperatorContext, session: &str) -> Vec<
     let discovery = crate::discovery::discover(root).expect("discovery");
     let secrets =
         secrets_gate::resolve_secrets_manager(root, &c.tenant, c.team.as_deref()).expect("secrets");
-    let runner_host = DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets, false)
-        .expect("runner host");
+    let runner_host = std::sync::Arc::new(
+        DemoRunnerHost::new(root.to_path_buf(), &discovery, None, secrets, false)
+            .expect("runner host"),
+    );
     // Egress fails without a provider pack; the run itself already happened.
     let _ = route_messaging_envelopes(
         root,

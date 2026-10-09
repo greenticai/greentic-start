@@ -300,6 +300,11 @@ At startup, [src/lib.rs](/projects/ai/greentic-ng/greentic-start/src/lib.rs:115)
 
 Do not accidentally break these unless the contract is intentionally changing.
 
+### Typing signal
+
+- `GREENTIC_TYPING_SIGNAL` — default on; `0`/`false`/`no`/`off` stops every
+  `send_typing` call. See [docs/typing-signal.md](typing-signal.md).
+
 ### DirectLine session-token renewal
 
 The HTTP ingress fronts the webchat provider's `/v3/directline/...` endpoints and
@@ -324,6 +329,32 @@ failures on these endpoints carry a machine-readable `code`
   Background: [docs/directline-token-renewal.md](/projects/ai/greentic-ng/greentic-start/docs/directline-token-renewal.md).
 - WebSocket `/stream` keepalive (re-mint the pump's internal token, `touch` the
   window while connected) is not wired yet — follow-up.
+
+### Inbound provider-webhook authentication (revision path)
+
+The revision-serve path (`greentic start --env`, i.e. `gtc op` environments and
+every cloud deploy) runs two gates on a pack-declared provider webhook before
+the body is trusted, both inside `dispatch_provider_route`:
+
+- `src/provider_auth.rs` — Telegram. Constant-time compares
+  `x-telegram-bot-api-secret-token` against the endpoint's `webhook_secret_ref`.
+  Endpoints provisioned before that ref existed are `Skipped` (back-compat).
+- `src/provider_webhook_verify.rs` — Slack. Verifies `X-Slack-Signature` by
+  invoking the pack's own `messaging.provider_ingress.v1` component
+  (`messaging-ingress-slack`), the same component the legacy `http_ingress`
+  server dispatches through. This gate exists because the revision path calls
+  the provider's `ingest_http` op directly, and `messaging-provider-slack`'s
+  `ingest_http` verifies nothing — without the gate a Slack webhook on this path
+  was unauthenticated.
+
+Two consequences to remember:
+
+- **It fails closed.** A Slack deployment with no `SLACK_SIGNING_SECRET`
+  configured is refused (`401`/`503`) rather than served. The refusal is logged
+  with the secret name. Configure the secret — do not weaken the gate.
+- **Do not assume a provider component authenticates anything on this path.**
+  It does not run the pack's ingress extension. Anything a provider would have
+  checked on the legacy path must be checked explicitly here.
 
 ### Setup-derived tunnel behavior
 

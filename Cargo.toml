@@ -2,7 +2,7 @@ bench = [{ name = "perf", harness = false }]
 
 [package]
 name = "greentic-start"
-version = "1.1.43"
+version = "1.2.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Greentic lifecycle runner for start/restart/stop orchestration"
@@ -38,30 +38,57 @@ async-trait = "0.1"
 backhand = "0.25"
 base64 = "0.22"
 chrono = "0.4"
+# Flow triggers (greentic.triggers.v1): cron evaluated in the declared IANA
+# timezone. `cron` matches the runner's own timer dialect (adapt_timer).
+chrono-tz = "0.10"
+cron = "0.16"
 dashmap = "6"
 flate2 = "1"
 futures-util = "0.3"
-# Pinned to the research build so the agentic-worker graph (aw-runtime,
-# runner-host w/ greentic-llm-backend) and main-lane LLM code resolve to one
-# greentic-llm. Main-lane consumers carried into the AW dependency world:
-#   greentic-llm        -> src/llm + src/fast2flow/llm_router
-#   opentelemetry stack -> src/metrics + src/otlp_telemetry
-#   reqwest             -> src/lib.rs + src/runner_host/dispatch.rs
-#   tracing-*           -> src/otlp_telemetry + src/lib.rs
-greentic-llm = { version = "=1.2.6-research" }
+# A pre-release RANGE, not a plain `"1"` and no longer an exact pin, and both
+# halves of that matter.
+#
+# Pre-release: cargo excludes pre-releases from a requirement that carries none,
+# so `"1"` could never resolve this lane at all — it sat on 1.1.0, and a
+# published greentic-start therefore shipped a runner that predates describe-v2.
+#
+# Range rather than exact: the exact pin existed because runner-host's
+# `greentic-llm-backend` feature pulled its own `greentic-llm = "=1.3.1-research.0"`
+# (greentic-runner#743), and an `Arc<dyn LlmProvider>` crossing that boundary
+# only type-checks when both sides resolve ONE copy. Since greentic-runner#788
+# runner-host declares `>=1.2.0-dev, <1.3.0-0` instead, and greentic-dw's
+# operala crates declare the same range from the registry — so a single lane
+# range here unifies all three, and an exact pin would now be the thing most
+# likely to break unification the next time a neighbour publishes. The
+# obligation is unchanged and still worth checking after any bump:
+# `cargo tree -i greentic-llm` must print ONE instance.
+#
+# The floor is the publish this tree resolves and was verified against, and it
+# carries the two surfaces this graph depends on (checked in the resolved
+# source, not inferred): `ProviderKind::requires_api_key()`
+# (`capabilities.rs:101`, which runner-host's `agent_node` asks whether an empty
+# key is legitimate for the configured provider) and Ollama advertising
+# `tools: true` (`capabilities.rs:249` — the matrix is consulted by
+# `RigBackend::chat` BEFORE a request is built, so a `false` there does not
+# degrade a tool-calling turn, it refuses one).
+greentic-llm = { version = ">=1.2.0-0, <1.3.0-0" }
 hmac = "0.13"
 http-body-util = "0.1"
 hyper-tungstenite = "0.20"
 hyper-util = "0.1"
 include_dir = "0.7"
 jsonschema = "0.46"
+# RS256 verification of the MCP OAuth tokens (worker-interop contract §3).
+# Already in the tree transitively; declared here because this crate now
+# verifies tokens itself.
+jsonwebtoken = "10"
 libc = "0.2"
 notify-debouncer-full = "0.7"
 once_cell = "1.21"
 open = "5"
 opentelemetry = { version = "0.32", features = ["logs"] }
 opentelemetry-appender-tracing = "0.32"
-opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto"] }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client"] }
 opentelemetry_sdk = { version = "0.32", features = ["rt-tokio", "logs"] }
 rand = "0.10"
 redis = { version = "1", features = [
@@ -74,20 +101,41 @@ redis = { version = "1", features = [
     "tls-rustls-webpki-roots",
 ] }
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"] }
+# AES-256-GCM for the secrets door's client-side-encrypted values; `ring` is already
+# in the tree through rustls' `ring` provider, so this adds no new crate.
+ring = "0.17"
+# MCP SERVER surface (`POST /mcp`, worker-interop contract §3). Pinned
+# EXACTLY: the 3.x line shipped five releases in three weeks
+# (3.0.1 2026-07-29 → 3.1.4 2026-08-20), so a caret range would move the
+# protocol implementation under us between builds. This is the same pin
+# greentic-designer's own MCP surface carries; the two speak to the same
+# clients and must not drift.
+#
+# `default-features = false` states the feature set rather than inheriting it.
+# `server` pulls `schemars` (tool input schemas), `macros` the `#[tool]`
+# attributes, and `transport-streamable-http-server` the
+# `http`/`http-body`/`bytes`/`tower-service` stack this crate already has via
+# hyper 1. Deliberately NOT `client`, `auth`, or any `reqwest` feature: this is
+# a server-only surface, and the token check is this crate's own.
+rmcp = { version = "=3.1.4", default-features = false, features = [
+    "macros",
+    "server",
+    "transport-streamable-http-server",
+] }
 rpassword = "7"
 rustls = "0.23"
 rustls-pemfile = "2"
 semver = "1"
 serde_cbor = "0.11"
 serde_json = "1.0"
+# hmac-sha1 webhook verification (greentic.triggers.v1 §6.3.3); same digest
+# 0.11 line as sha2, so it composes with `hmac` 0.13.
+sha1 = "0.11"
 sha2 = "0.11"
 subtle = "2"
 sys-locale = "0.3"
 sysinfo = "0.39"
 tar = "0.4"
-# Runtime dep (not just dev): the update-notify receiver stages the posted plan
-# + DSSE sidecar into a TempDir so the deployer `updates::get` file-import path
-# can read them, then drops it after the staging call returns.
 tempfile = "3"
 thiserror = "2"
 tokio-rustls = "0.26"
@@ -112,205 +160,277 @@ version = "0.8"
 version = "4.5"
 features = ["derive"]
 
-# Agentic Worker (dw.agent) serve runtime, from the research (agentic) lineage.
-# Version pin kept from research for now; re-pin once the merged runner is
-# republished. 1.1.6 is the first publish on async-nats 0.49 (see the async-nats
-# note above) — 1.1.5 forces `rustls-webpki` 0.102.8 into the lock.
+# The agent runtime's billing surface: `billing::WorkerUsageMeter`, which
+# `crate::interop::metering::runtime_meter` builds per unit from the staged
+# `metering` block and hands to `TenantRuntime::load_revision_with`
+# (greentic-runner#798). runner-host does not re-export the crate. Same
+# requirement as runner-host's (see the runner-desktop block below), so it is
+# ONE crate with the copy runner-host pulls through its `agentic-worker`
+# feature. No features: `test-mock` stays dev-only (below).
 [dependencies.greentic-aw-runtime]
-version = "=1.1.6"
+version = ">=1.2.0-0, <1.3.0-0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
 # / `Revision` cross the deployer boundary, so resolution must not pick an
-# older deploy-spec. Floor bumped to the publish that adds
-# `EnvironmentHostConfig.gui_enabled` + `resolved_gui_enabled()` (deployer#322);
-# greentic-start reads the resolver at boot to gate the built-in webchat
-# console, and earlier publishes lack both the field and the method. Floor
-# bumped again to the M2 PR1 publish (deployer#335) — `revision_pull` reads
-# `Revision.bundle_source_uri` at boot to decide which bundles to pull, and
-# earlier publishes lack that field. Floor bumped again to the Phase-4 config
-# publish (deployer#424) — the update-notify receiver reads `UpdateChannelConfig`
-# / `OnNotifyAction` (per-env update-channel gate); earlier publishes lack those
-# types. Floor bumped to the 0.2.x line (deployer#430 `plan_endpoint` +
-# deployer#434 forward-compat catch-all) — the P6.4 poll loop calls
-# `UpdateChannelConfig::resolved_plan_endpoint()` (0.2.0) and relies on the
-# unknown-field preservation (0.2.1); earlier publishes lack both. A `>=0.2.1`
-# floor also keeps a SINGLE deploy-spec copy in the tree: `greentic-deployer`
-# (below) pulls deploy-spec transitively, so both must land on `^0.2` or the
-# build resolves two copies and the deploy-spec types stop unifying (E0308).
-# Floor bumped to 0.2.2 (deployer#443) — `notify_action` reads
-# `UpdateChannelConfig::resolved_action()` / `UpdateAction`, the additive
-# supersession of `on_notify`; earlier publishes lack both. Additive on purpose:
-# `greentic-runner-host` pins `<0.3.0-0`, so a 0.3 here would fork the copy it
-# shares with us (E0308) and drag the runner into the release train.
+# older deploy-spec. The same types also cross the `greentic-runner-host`
+# boundary, so all three must share ONE copy — which is what forces the floor
+# and the lane to be the same for deploy-spec, deployer and runner-host.
+#
+# Surfaces this crate consumes, each of which was once its own floor bump and
+# all of which the dev lane has carried for months:
+#   `Environment::validate`, `BundleDeployment`, `ExtensionBinding::answers_ref`,
+#   `ids::*`, `UpdateAction` / `resolved_action()`,
+#   `UpdateChannelConfig::blob_base_url` + `resolved_blob_base_url()`,
+#   `EnvironmentHostConfig::new` + `#[non_exhaustive]`,
+#   `host_config.default_bundle`, `DefaultBundleReason`,
+#   `Environment::resolve_default_bundle`.
+#
+# The floor is the RUNID this tree RESOLVES and was compiled and tested against,
+# not the publish any one of those APIs first appeared in — the dev lane stamps
+# `1.2.0-dev.<run id>` on every develop push, so a run id is a position in that
+# sequence rather than an API marker, and claiming otherwise would be a comment
+# nothing checks. What the floor buys is that a fresh resolve cannot pick a
+# publish OLDER than this one. A bare `>=1.2.0-dev` means `>=1.2.0-dev.0`, i.e.
+# the whole lane back to its first publish, which is what this said before
+# greentic-start#625 and is what CLAUDE.md's `>=M.m.p-dev.RUNID` rule exists to
+# stop.
 [dependencies.greentic-deploy-spec]
-# Floor bumped to 0.2.3 (deployer#460) — the update-stream task reads
-# `UpdateChannelConfig::{resolved_push_enabled, resolved_stream_endpoint}`, and
-# neither exists before 0.2.3. An API floor, so a stale `--locked` build fails
-# to compile rather than silently degrading to poll-only.
-# Floor raised to 0.2.4: `greentic-deployer` (below) uses
-# `greentic_deploy_spec::DEFAULT_PLAN_ENDPOINT`, added in 0.2.4, but declares only
-# `>=0.2.3` — an underspecified floor on its side (deployer#495). Its own workspace
-# masks that with a path dep; resolving from crates.io picks 0.2.3 and fails to
-# compile `greentic-deployer`. Our floor is what actually constrains the shared
-# resolution, so raise it here rather than wait for their republish.
-# Floor raised to 0.2.5: `EnvironmentHostConfig` is now `#[non_exhaustive]` and
-# must be constructed via `EnvironmentHostConfig::new(env_id)` + builder setters.
-# The `new()` constructor and `#[non_exhaustive]` do not exist before 0.2.5.
-# Exact-pinned because a range upper-bounded at `<0.3` admits dev-lane
-# `0.2.<RUN_ID>` publishes (e.g. 0.2.29986812583), which transitively require
-# `greentic-types >=1.2.0-dev` and conflict with the stable `=1.1.2` pin above.
-# An exact pin also forces deploy-spec to unify with the copy `greentic-deployer`
-# (below) pulls transitively, avoiding a two-copy E0308 fork.
-version = "=0.2.5"
+version = ">=1.2.0-0, <1.3.0-0"
 
-# Lower bound pinned to the first dev build re-exporting `load_trust_root`
-# (per-env trust root + operator key, deployer #226). Floor bumped to the
-# Change-C-part-1 publish (deployer #250) — `EnvironmentHostConfig.public_base_url`
-# is consumed here in `configured_public_base_url_from_env_store` and the
-# `ensure_local_environment` call now passes the 2-arg signature; earlier
-# publishes lack both surfaces. Floor bumped again to the M2 PR2a publish
-# (deployer#337) — `revision_pull` calls
-# `cli::bundle_stage::materialize_revision_from_bundle` to stage a worker's
-# pulled bundle at boot; earlier publishes lack that function. Floor bumped to
-# the stable 1.1.3 release that carries the updater on the main lane — the
-# update-notify receiver calls `cli::updates::{get, UpdatesGetPayload}` +
-# `environment::LocalFsStore::load_update_channel`; earlier publishes lack the
-# `updates` module. A plain `>=1.1.3` (no `-dev` suffix) intentionally requires
-# the stable release, not the develop `1.1.3-dev.*` prereleases (updater ships
-# on main, so there is no pre-release matching to satisfy). Floor bumped to
-# 1.1.7 to unify deploy-spec at `^0.2`: 1.1.7 depends on deploy-spec 0.2.x
-# (same line this crate pins directly above), so a single deploy-spec copy
-# resolves. A lower deployer (1.1.3–1.1.6) would drag in deploy-spec `^0.1`
-# transitively and collide with the `^0.2` direct pin (two copies → E0308).
-# Floor bumped to 1.1.10 (deployer#443) — the `NotifyAction::Apply` arm calls
-# `cli::updates::{apply_updates, ApplyUpdatesPayload}` and needs the 0.2.2
-# deploy-spec that 1.1.10 pulls; earlier publishes drag in 0.2.1 and fork the copy.
-# Floor bumped to 1.1.14 (deployer#456) — `runtime_config` calls
-# `pack_ref::classify_pack_ref`, which does not exist before it.
-# Floor bumped to 1.1.15 (deployer#459) — a BEHAVIOUR floor, not an API one, so
-# it needs the Cargo.lock bump beside it: we stage bundles in-process via
-# `cli::bundle_stage`, and before 1.1.15 that only scanned `packs/`. A bundle's
-# `extension_providers` land in `providers/<domain>/`, so none of them reached
-# `pack-list.lock` — and `revision_boot` takes its pack paths exclusively from
-# that lock. The result was an env that served NO provider routes at all
-# (webchat GUI 405 on `/v1/web/webchat/{tenant}/`). Nothing failed to compile,
-# so only the lock keeps a `--locked` release build off the broken copy.
+# Surfaces this crate consumes across the deployer boundary, each once its own
+# floor bump: `load_trust_root` (per-env trust root + operator key, #226),
+# `EnvironmentHostConfig.public_base_url` and the 2-arg
+# `ensure_local_environment` (#250 — `configured_public_base_url_from_env_store`
+# and the bootstrap call site), `cli::bundle_stage::materialize_revision_from_bundle`
+# (#337 — `revision_pull` stages a worker's pulled bundle at boot),
+# `StagedPlan::verify_binary_on_disk` + the staging binary CAS, and
+# `plan::plan_targets_env` (the fleet broadcast env id `_`, which
+# `revision_serve::check_plan_identity` calls instead of the local copy it
+# carried while the dev lane lacked the export).
+#
+# The floor is `35969201904` (greentic-deployer#613, `bf7b66e3`) because
+# `materialize_revision_from_bundle` runs `pack_config_stage` at BOOT: before
+# #613 it refused an Agentic Worker's `state/pack-configs/pack.dw.<slug>.json`
+# ("pack_id `pack.dw.<slug>` is not in the bundle's pack-list.lock", the wizard
+# locks it as `pack-dw-<slug>`). The designer's CLI deployer already carried
+# #613, so `op env up` staged the revision and the container then died before
+# binding its port -- a Cloud Run readiness timeout for every worker with any
+# setup answer (designer.demo, 2026-09-24).
+#
+# The RUNID is the publish this tree resolves and was verified against — see the
+# deploy-spec block above for why a dev-lane run id is a position in a sequence
+# and not an API marker, and why `>=1.2.0-dev` (i.e. `.0`) is not a floor at all.
+# deployer and deploy-spec publish together, so the two run ids match.
 [dependencies.greentic-deployer]
-# Floor raised to 1.1.21: the release carrying the broadcast-channel consumer
-# gates AND the broadcast-address localisation. The stage path here delegates
-# to `updates::get` / `updates::apply_updates` in this crate, so below that
-# floor the record-only change above is not merely inert, it is INCONSISTENT:
-# record-only would accept a `_`-addressed plan the delegated stage path then
-# refuses. Also collapses a duplicate `greentic-update` copy in the lockfile —
-# 1.1.15 still pinned the dead `greentic-update 0.1.x` line.
-#
-# Floor raised to 1.1.26: the release carrying the per-channel resume re-gate
-# (`current_admission_facts` scoped by channel). The delegated `updates::get`
-# resume path here would otherwise wedge a plan resuming after a channel
-# migration against the other channel's applied sequence. Transitively pins
-# greentic-update >= 1.1.2 (the authoritative channel-scoped gate).
-#
-# Floor raised to 1.1.29 in lockstep with deploy-spec 0.2.5: that release adds
-# `EnvironmentHostConfig::default_bundle` and makes the struct
-# `#[non_exhaustive]`, and every deployer up to and including the published
-# 1.1.28 constructs it with literals, so resolving the new spec against an
-# older deployer fails inside the registry copy (E0639; E0063 before the
-# attribute). 1.1.29, not 1.1.28: main cut and published 1.1.28 from #520 while
-# this work was open, so that release predates the conversion.
-version = ">=1.1.29, <1.2.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 default-features = false
 
-# Lower bound pinned to the first dev build exposing the `signing` module
-# (verify_artifact_dsse / TrustRoot); earlier 1.1.0-dev builds lack it. Floor
-# bumped to the publish that adds
-# `DefaultRegistryClient::with_insecure_registries` (distributor-client#168) —
-# `bundle_ref::fetch_remote_bundle` calls it when
-# GREENTIC_OCI_INSECURE_REGISTRIES is set so listed registries are pulled over
-# plain HTTP; earlier publishes lack that constructor.
+# Surfaces this crate consumes: the `signing` module (`verify_artifact_dsse` /
+# `TrustRoot`) and `DefaultRegistryClient::with_insecure_registries`
+# (distributor-client#168 — `bundle_ref::fetch_remote_bundle` calls it when
+# GREENTIC_OCI_INSECURE_REGISTRIES is set, so listed registries are pulled over
+# plain HTTP). Both have been on the dev lane for months.
+#
+# Floor `1.2.0-dev.36501735929` is an API marker, not only a verified-against
+# publish: it is the dev-lane publish of distributor-client #278 (PD5, merge
+# bf18ef48), which added `DefaultRegistryClient::try_with_insecure_transport`,
+# `uses_plain_http_for` and `has_credentials`. `bundle_ref::build_registry_client`
+# needs the first to pull from a registry that is BOTH plain-HTTP and
+# password-protected; `ensure_plain_http_honoured` needs the second.
 [dependencies.greentic-distributor-client]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 default-features = false
 features = ["pack-fetch"]
 
-# Agentic pins from the research lineage (agentic-worker + greentic-llm-backend
-# features drive the dw.agent serve path). Version pins left as research for now;
-# re-pin once the merged runner is republished — this temporarily supersedes
-# main's greentic-runner#466 flow-node component-id resolution floor, which must
-# be re-asserted after the merged runner build.
+# Floor `1.2.0-dev.37943364688` is the dev-lane publish built from greentic-runner
+# a42d26a5 (develop, #840): greentic-a2a fetches a path-hosted agent's card under
+# its own path (`<base>/.well-known/agent-card.json`), falling back to the origin
+# root only on a 404. Workers sharing one Cloud Run origin, each under `/<unit>`,
+# were unreachable for any A2A caller (a router, an `a2a` node) before this.
+# The floor before it, `1.2.0-dev.37770593936`, is the dev-lane publish built from greentic-runner
+# af8ddecd (develop, #838): the user ledger is keyed by the caller's verified IdP
+# issuer as well as `sub`. A caller block's optional `iss` reaches the door as
+# `issuer` (omitted when absent, the legacy key); a present but malformed `iss`
+# gets no ledger turn. `UserLedger` now takes `&LedgerSubject`; this crate does
+# not implement or call it.
+# The floor before it, `1.2.0-dev.37650006313`, is the dev-lane publish built from greentic-runner
+# a849324f (develop, #835): a turn the visitor did not take (blank text and no
+# submit payload, e.g. WebChat's auto-start turn) still READS the user ledger but
+# appends nothing to it, so opening a conversation no longer adds a history row.
+# `UserLedgerBinding::turn_for` changed signature; this crate does not call it.
+# The floor before it, `1.2.0-dev.37551620766`, is the dev-lane publish built from greentic-runner
+# 2068e7f0 (develop, after #832): `RevisionHostOptions::with_user_ledger` and
+# `greentic_aw_runtime::UserLedgerTarget`, which
+# `crate::interop::metering::user_ledger` installs per unit. The same publish
+# carries #828 (run-trace sharing, opt-in by pack sidecar), #829 (a `dw.agent`
+# inside a flow tool runs a real agent turn; opt out with
+# `GREENTIC_AW_NESTED_FLOW_AGENTS=0`) and #830 (a typed message while a flow
+# tool is parked is answered as a side turn). The floor before it,
+# `1.2.0-dev.37349538821`, took #831 (the flat side-turn reply list).
+# Floor `1.2.0-dev.37225724381` serves WIT state-store `write-if-absent` (forwarding to
+# `StateStore::set_json_if_absent`). The floor before it, `1.2.0-dev.37141311769`, is the dev-lane publish built from greentic-runner
+# #823 (the `on_message` route arm: a menu card takes its default edge for a typed
+# message, so a deployed card flow stops re-showing its menu). The floor before it,
+# `1.2.0-dev.36747192269`, is the dev-lane publish built from
+# greentic-runner 5e9ab7da (the develop merge of #819; that dev-publish run's
+# head_sha IS 5e9ab7da). #819 stops runner-host writing its `.staged` marker
+# inside the extension directory it hands to the signature-checking loader, so
+# a signed extension carried in a worker pack (`extensions/<name>.gtxpack`) is
+# no longer rejected as "extension '<id>' not found" — without it no deployed
+# Agentic Worker can call a tool from a pack-carried extension. An older resolve
+# compiles and fails at run time, silently. (The floor before it, 36574625149,
+# was built from 07d0d678, the develop merge of #816 — the HTTP approval rail:
+# `ApprovalInboxTarget`, `HttpApprovalDispatcher` and
+# `RevisionHostOptions::with_approval_inbox`, which
+# `crate::interop::metering::approval_inbox` installs per unit; the one before
+# that, 36211472866, was built from b07fa100, the develop merge of #802.) Note the yanked `1.2.0-research` of these crates
+# would outrank every `-dev` build in this range were it not yanked. This crate resolved that revision from git through a
+# `[patch.crates-io]` section until it was published; the three runner crates
+# (runner-desktop, runner-host, greentic-aw-runtime) share the one floor so they
+# resolve as one revision. See the note at the foot of this file.
+#
+# The surface that forced the revision on this crate: `RunOptions::entry_node`
+# (greentic-runner#698), which the demo messaging host uses to name a flow node
+# as the flow's entry node.
 [dependencies.greentic-runner-desktop]
-version = "=1.1.7"
-default-features = false
-features = ["agentic-worker", "greentic-llm-backend", "desktop-agent-ephemeral"]
+version = ">=1.2.0-0, <1.3.0-0"
 
+# Same floor as runner-desktop (see above). The surfaces that accumulated as
+# floor bumps, all of them carried by that publish, kept because each names a
+# real failure an older resolve produces:
+#   * #466 — `HostNode::from` no longer splits a resolved component symbol on
+#     its last dot when the operation is carried structurally; earlier publishes
+#     mis-resolve any dotted component id (`ai.greentic.component-templates` →
+#     `ai.greentic`) and fail with "component '…' not found in pack". Supersedes
+#     the C5 `runtime_refs` floor (#424).
+#   * #599 — the first dev publish built against deploy-spec 0.2. runner-host's
+#     ids cross into revision_pull / doctor_env alongside the deployer's, so an
+#     earlier publish drags a second deploy-spec copy in (E0308).
+#   * #698 — `FlowEngine::execute_from`, the ported `var.set` and card `answers`
+#     node families, and the one-shot routing action; without them a designer
+#     card journey loses every captured field.
+#   * #700/#701 — re-enables `agentic-worker`, which is what makes an MCP flow
+#     node actually dispatch (before it `execute_mcp` was a stub returning Ok
+#     with an `{error: …}` payload, so an MCP node reported success while doing
+#     nothing), and grows `HostConfig` with `agents`/`graphs`.
+#   * #792 — `storage::{StorageConfig, SessionBackend, StateBackend}` and
+#     `HostBuilder::with_storage`, which `crate::durable_state` is built on.
 [dependencies.greentic-runner-host]
-version = "=1.1.7"
-default-features = false
-features = ["agentic-worker", "greentic-llm-backend"]
+version = ">=1.2.0-0, <1.3.0-0"
+# `greentic-llm-backend` routes every in-process `dw.agent` LLM call through
+# greentic-llm's multi-provider backend. Without it runner-host compiles the
+# OpenAI-only client (`agent_node.rs`, "built WITHOUT the greentic-llm-backend
+# feature"): the agent's configured `llm.provider` is ignored, Ollama cannot call
+# tools, and a keyless provider still needs a key. greentic-runner's own release
+# binary has always been built with it; the operator environment, k8s and
+# Cloud Run all serve through THIS binary instead, so they never had it.
+#
+# `desktop-agent-ephemeral` is deliberately NOT enabled. runner-host documents it
+# as "must NOT be enabled in the server binary": it switches on greentic-aw-runtime's
+# `test-mock` (a mock token meter) and `dev-allow-unsigned`, and this binary is
+# also the greentic-start-distroless image pods run. That does not make Redis a
+# prerequisite: with `GREENTIC_AW_REDIS_URL` unset, runner-host's
+# `aw_backends::select_state_backend` falls back to an in-memory agent state
+# store in every build (greentic-runner, 2026-07-08; corrected in its docs by
+# #786). So `dw.agent` and deep-worker tools run without Redis; set it only for
+# conversation memory and budgets that survive restarts and span replicas.
+#
+# `operala-in-process` (greentic-runner #774) wires the in-process deep-worker
+# handler for `operala.call` nodes (`greentic-dw-operala-invoker` running
+# `DeepLoopCoordinator` over a `greentic_llm::RigBackend`), so a deployed Deep
+# worker runs without a NATS remote dispatcher. Unlike `desktop-agent-ephemeral`
+# it does NOT imply greentic-aw-runtime's `test-mock` (or `dev-allow-unsigned`):
+# runner-host declares it server-safe, pulling only `agentic-worker`, the two
+# operala crates and `greentic-llm`. The handler is wired only when an LLM key
+# resolves, by the same policy `dw.agent`'s in-process backend uses:
+# `GREENTIC_LLM_API_KEY` / `OPENAI_API_KEY` first, else the first agent's
+# `llm.credential_ref` from the tenant secrets store. With no key, `operala.call`
+# falls back to NATS (and fails without it). `GREENTIC_OPERALA_DISPATCH=nats`
+# forces the NATS `RemoteDispatchHandler` path. The operala crates used to pin
+# greentic-llm from GIT, which needed a `[patch."…/greentic-llm"]` section here
+# to keep the graph on one copy; since the dev-lane move they declare the
+# registry range instead, so that patch is gone and unification is plain
+# resolution. `cargo tree -i greentic-llm` is still the check.
+#
+# `session-redis` is named EXPLICITLY even though it is in runner-host's default
+# feature set. Without it a Redis session backend is a hard build-time refusal
+# (`storage::session::store_from_config`'s `#[cfg(not(feature = ...))]` arm), so
+# the day that default changes upstream, an operator's
+# `GREENTIC_RUNNER_SESSION_BACKEND=redis` stops booting — which is the right
+# failure, and a failure we would rather not discover from a deployment. Naming
+# it here makes this binary's need for durable conversation state a declared
+# fact rather than an inherited one. See `crate::durable_state`.
+features = ["greentic-llm-backend", "operala-in-process", "session-redis"]
 
 [dependencies.greentic-secrets-lib]
 # `providers-vault` brings in the HashiCorp Vault KV backend used for runtime
 # secret resolution under pod workload identity (Phase E). The Kubernetes-auth
-# token exchange it relies on landed in greentic-secrets#94, first published in
-# 1.1.0-dev.28218485692 (the floor below) — older publishes resolve a vault
-# provider that only supports a static VAULT_TOKEN, not the pod-identity login.
-# `providers-dev` keeps the dev store for local/agentic runs.
-version = ">=1.1.0-0, <1.2.0-0"
+# token exchange it relies on landed in greentic-secrets#94; a publish without
+# it resolves a vault provider that only supports a static VAULT_TOKEN, not the
+# pod-identity login. The whole 1.2.0-dev lane carries it — the `1.1.0-dev`
+# number this comment used to name as "the floor below" stopped being the floor
+# when the crate moved lanes, and naming it here after the move was a comment
+# describing a requirement that was not in the file.
+#
+# The RUNID is the publish this tree resolves and was verified against; see the
+# deploy-spec block. `greentic-secrets-spec` rides the same publish.
+version = ">=1.2.0-0, <1.3.0-0"
 features = ["providers-dev", "providers-vault"]
 
-# Kept on the platform 1.1.x range (main lineage). Lower bound pinned to the
-# publish that updates the bootstrap call site for the deployer's 2-arg
-# `ensure_local_environment` (greentic-setup#134).
+# Consumes the bootstrap call site updated for the deployer's 2-arg
+# `ensure_local_environment` (greentic-setup#134); a publish with the 1-arg call
+# does not compile against the deployer floor above.
+#
+# The RUNID is the publish this tree resolves and was verified against — and for
+# this crate it is also the NEWEST 1.2.0-dev publish, which is worth noticing:
+# greentic-setup's dev lane sits ~1.7M run ids behind its neighbours', so it is
+# the one crate in this file whose registry copy is meaningfully older than the
+# git revision it was pinned at before greentic-start#625. If something in the
+# setup/onboarding surface regresses, look here first.
 [dependencies.greentic-setup]
-version = ">=1.1.0-0, <1.2.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
+
+[dependencies.greentic-state]
+# Implements `greentic_state::StateStore` for the `state-sorla` HTTP backend
+# (`crate::sorla_state`). The same crate runner-host resolves for its own
+# `DynStateStore`, so it is ONE copy: a trait object from here type-checks as the
+# runner's store. Floor `1.2.0-dev.37220328375` is the first publish with
+# `StateStore::set_json_if_absent` (the atomic claim `HttpStateStore` implements);
+# the default method errors, so an older resolve compiles and fails at run time.
+version = ">=1.2.0-0, <1.3.0-0"
 
 [dependencies.greentic-telemetry]
-# Floor pinned to the first dev publish that exposes `RolloutEvent` +
-# `emit_rollout_event` (C5.1); lower versions in the same range satisfy
-# `>=1.1.0-dev` but lack the rollout module.
-version = ">=1.1.0-0, <1.2.0-0"
+# Consumes `RolloutEvent` + `emit_rollout_event` (C5.1) and `TelemetryCtx::kv()`
+# carrying `gt.pack_id` (which runner-host's C5.4 export path needs, and which
+# every 1.2 dev publish has).
+#
+# The RUNID is the publish this tree resolves and was verified against; see the
+# deploy-spec block. Note this crate's dev lane is much older than its
+# neighbours' — 28923800659 is the NEWEST 1.2.0-dev publish, not a held-back
+# floor — so the run ids here are not comparable across crates.
+version = ">=1.2.0-0, <1.3.0-0"
 
-# Exact-pinned to the research-content build (carries ComponentDescribe.outcomes,
-# PackManifest.agents, and runtime_dispatch types the agentic runner rev needs).
-# A loose `>=1.1.0-dev, <1.2.0-0` would resolve to a higher-numbered develop/main
-# build that LACKS those, breaking the agentic graph. Re-pin when a newer
-# research/merged build is published.
 [dependencies.greentic-types]
-version = "=1.1.2"
+# `EnvId`, `TenantCtx`, `ReplyScope`, `GreenticError` and friends cross the
+# runner-host, deployer and secrets boundaries, so this must resolve to the one
+# copy every neighbour resolved. The RUNID is the publish this tree resolves and
+# was verified against; see the deploy-spec block for why a bare `>=1.2.0-dev`
+# is `>=1.2.0-dev.0` and therefore not a floor.
+version = ">=1.2.0-0, <1.3.0-0"
 features = ["serde"]
 
-# NOTE (agentic graph, from research): greentic-runner pulls
-# greentic-extension-sdk-contract =1.2.11-research and greentic-mcp-exec
-# (list_tools), both git-tag/branch-only (not republished to crates.io). Cargo
-# [patch] does NOT propagate through git dependencies, so once the merged runner
-# is republished greentic-start may need to declare the same [patch.crates-io]
-# redirects to resolve the agentic-worker graph. Do NOT patch greentic-types
-# (we pin the published research build above) — a git patch would unify
-# greentic-types graph-wide and break greentic-setup's 0.5 line.
-
+# Update-serving surface (revision_serve.rs): `binswap` carries the archive-unpack
+# + atomic-swap primitive behind the stage-only binary self-update path
+# (`select_binary`); `stream` carries the SSE client the push path uses
+# (`stream::{build_stream_client, run_stream}`). Tracks greentic-update's dev
+# line — the `0.1.x` cross-lane conflict that once blocked this (distributor-client
+# 1.2) is gone now that greentic-update publishes `1.2.0-dev.N` on the same lane.
+#
+# The RUNID is the publish this tree resolves and was verified against; see the
+# deploy-spec block.
 [dependencies.greentic-update]
-# MOVED LANES, not just bumped (update#21). This crate used to track
-# greentic-update's `0.1.<RUN_ID>` dev line, because that was its only line. That
-# stopped working when develop moved `greentic-distributor-client` to the 1.2 dev
-# lane: we pin that same crate `<1.2.0-0` right above, and no version can satisfy
-# both — cargo admits a `1.2.0-dev.N` pre-release only when a comparator shares
-# its exact `1.2.0`, so the ranges cannot be reconciled from either side. Every
-# greentic-update publish after 2026-07-13 was therefore unresolvable here, and
-# this crate sat frozen on the 2026-07-07 build without anything failing loudly.
-#
-# greentic-update now ships a stable 1.1.x line from its `main` branch, pinned to
-# the same 1.1 fleet we are. Track that; the 0.1.x dev line is for `develop`
-# consumers only, and the two ranges deliberately do not overlap.
-#
-# `binswap` carries the archive-unpack + atomic-swap primitive behind the P7d
-# stage-only binary self-update path (`binaries` / `select_binary`). `stream`
-# carries the SSE client the push path uses (`stream::{build_stream_client,
-# run_stream}`). Push is the *primary* discovery path and this poll loop is the
-# fallback, so losing `stream` is a silent latency regression (seconds ->
-# `poll_interval_secs`), not a compile error — which is why it is a hard floor.
-# Floor raised to 1.1.1: first publish carrying `plan::plan_targets_env`,
-# the shared plan->environment addressing predicate (broadcast channel `_`).
-version = ">=1.1.1, <1.2.0-0"
+version = ">=1.2.0-0, <1.3.0-0"
 features = ["binswap", "stream"]
 
 [dependencies.hyper]
@@ -318,7 +438,11 @@ version = "1"
 features = ["full"]
 
 [dependencies.qa-spec]
-version = ">=1.1.0-0, <1.2.0-0"
+# The QA form specifications `onboard/` serves and `component_qa_ops` validates
+# against. It crosses the greentic-setup boundary, so it has to be the copy
+# setup resolved. The RUNID is the publish this tree resolves and was verified
+# against; see the deploy-spec block.
+version = ">=1.2.0-0, <1.3.0-0"
 
 [dependencies.serde]
 version = "1.0"
@@ -330,7 +454,7 @@ version = "2.5.2"
 
 [dependencies.tokio]
 version = "1"
-features = ["rt-multi-thread", "signal", "sync", "net", "macros"]
+features = ["rt-multi-thread", "signal", "sync", "net", "macros", "time"]
 
 [dependencies.tokio-stream]
 version = "0.1"
@@ -347,8 +471,110 @@ features = ["v4", "serde"]
 [dev-dependencies]
 criterion = "0.8"
 ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
+# The agent runtime this binary is built against, with its test doubles, so
+# agent_provenance's contract test drives the REAL `AgentRuntime::step` rather
+# than a hand-written trail. Dev-only: `test-mock` never reaches a release
+# build (edition-2024 resolver keeps dev-dependency features out of it). Same
+# requirement runner-host has, so it is ONE crate with runner-host's, not a
+# second copy.
+greentic-aw-runtime = { version = ">=1.2.0-0, <1.3.0-0", features = ["test-mock"] }
+# For `ExtensionRuntime::for_test()`. It must be the same SOURCE and a
+# compatible requirement to whatever greentic-aw-runtime declares, or the graph
+# holds two copies and the `ExtensionRuntime` handed across the boundary does
+# not type-check. It used to be a git rev because aw-runtime's was; since the
+# dev-lane move aw-runtime declares `greentic-ext-runtime = ">=1.2.0, <1.3.0"`
+# from the registry, so this is byte-identical to it rather than "exact".
+#
+# No RUNID floor: this crate does NOT publish on the `1.2.0-dev.<run id>` lane —
+# it publishes plain `1.2.<run id>` releases — so the CLAUDE.md dev-lane floor
+# rule does not apply and copying aw-runtime's requirement verbatim is what
+# keeps the two in step.
+greentic-ext-runtime = ">=1.2.0-0, <1.3.0-0"
 # Enable greentic-llm's scriptable test double (TestLlmProvider) for unit tests
 # only — `test-mock` stays out of release builds.
-greentic-llm = { version = "=1.2.6-research", features = ["test-mock"] }
-tempfile = "3"
+# Must stay byte-identical to the [dependencies] pin above (see its comment):
+# a differing requirement here resolves a second greentic-llm for test builds.
+greentic-llm = { version = ">=1.2.0-0, <1.3.0-0", features = ["test-mock"] }
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 tokio = { version = "1", features = ["test-util"] }
+wat = "1"
+
+# THE LANE: `1.2.0-dev`. greentic-runner#788 moved the runner workspace off the
+# 1.3.0-research line and back onto the single `1.2.0-dev` crates.io lane that
+# `dev-publish.yml` stamps on every develop push, and deleted the runner's own
+# `[patch.crates-io]` section outright. greentic-runner-host now requires
+# `greentic-deploy-spec`, `greentic-flow`, `greentic-secrets-lib`,
+# `greentic-session`, `greentic-state` and `greentic-llm` as
+# `>=1.2.0-dev, <1.3.0-0`; this binary crosses every one of those types with the
+# runner, so its own requirements had to move with it or the graph resolves two
+# copies of each and the hand-offs stop type-checking (E0308).
+#
+# That is the unwind the previous comment here asked for: the research-line
+# numbers (`greentic-deploy-spec 1.3.0-research.3`, `greentic-setup
+# 1.3.1-research.0`, …) never existed on crates.io — they were develop's code
+# under never-published numbers, resolved by commit while the fleet-wide
+# publishing lock ran (2026-09-08 to 2026-09-22). The lock is lifted and the
+# dev lane is current, so every one of those crates now resolves from the
+# registry and the patches for them are gone.
+#
+# The last patch, for the three greentic-runner crates, is gone too: they are
+# floored at `1.2.0-dev.36747192269`, the dev-lane publish built from exactly
+# 5e9ab7da (#819, pack-carried signed extensions load; checked against that
+# dev-publish run's head_sha). Before it, 36574625149 was built from 07d0d678
+# (#816, the HTTP approval rail). The floor before that, 36211472866, was built from b07fa100, the
+# develop merge of greentic-runner#802, which makes our own A2A CLIENT read a completed task's
+# STRUCTURED artifacts and not only its prose. #639 made this binary ANSWER a
+# turn that produced `result.structured_content` with a Task whose artifacts
+# carry it (worker-interop contract D13); #802 is the other half, on the calling
+# side. Without it `a2a_source::task_reply` reads
+# `task.artifacts[].parts[].text` only, so a deployed worker calling another
+# Greentic worker receives the sentence and never the object the callee
+# deliberately produced — the call succeeds, the model answers from the prose
+# alone, and the missing result is indistinguishable from the callee not having
+# produced one. Nothing is red at any layer. Tracked as #642.
+#
+# Two rules #802 states at its own call site, because each is silent if
+# changed: the media type is matched EXACTLY (`application/json`), never by a
+# `+json` suffix, so an Adaptive Card
+# (`application/vnd.microsoft.card.adaptive+json`) cannot reach a model that
+# never asked for one (contract D10); and a task carrying a structured part and
+# no prose is ANSWERED rather than reported as having said nothing.
+#
+# It is the direct child of 5a1b3684, the develop merge
+# of greentic-runner#801 (`run_outcome::HttpRunOutcomeSink` +
+# `RevisionHostOptions::with_run_outcome_sink` — one run outcome per flow turn,
+# the deployed run audit; `interop::metering::run_outcome` installs it). It is
+# the direct child of b1f82a18, the develop merge
+# of greentic-runner#800 (`component == "a2a"` — the flow node that lets a plain
+# FLOW, not only an agentic worker, call an external agent). Without it `a2a` is
+# absent from `NATIVE_OP_KEYS`, so a deployed flow carrying that node has it
+# silently wrapped as an undispatchable component. It descends from 79e516b5,
+# the develop merge of greentic-runner#798 (`TenantRuntime::load_revision_with`,
+# `RevisionHostOptions::with_billing_meter`, `billing::WorkerUsageMeter` — the
+# per-unit worker-usage meter), and from f6ff5590, the develop merge
+# of greentic-runner#792, which makes runner-host's session and flow-state
+# stores configurable (`storage::StorageConfig` + `HostBuilder::with_storage`)
+# — the surface `durable_state::resolve_storage_config` depends on. A patch
+# section does not travel into a published crate, so while it existed
+# `dev-publish` could not package this crate at all (`greentic-aw-runtime =
+# "=1.2.0-dev.0"` matches nothing on crates.io).
+#
+# HAZARD, recorded rather than fixed: `<1.3.0-0` does NOT exclude the
+# `1.2.0-research.N` line. Pre-release identifiers compare as strings, `"dev"`
+# sorts BELOW `"research"`, so every range in this file — floor or not — prefers
+# a `1.2.0-research.N` publish over any `1.2.0-dev.<run id>`. A RUNID floor does
+# not help: research still sorts above it. Nothing resolves one today only
+# because every such publish is YANKED, verified against the sparse index on
+# 2026-09-23 for distributor-client (.0–.2), types (bare + .1–.3), qa-spec
+# (.0–.1), secrets-lib/-spec (.0–.1), llm (bare), setup (.0), flow (.0–.1),
+# pack-lib (.0–.4), session (.0–.1) and state (.0–.1); deployer, deploy-spec,
+# telemetry and update have none at all.
+#
+# So this rests on a yank, not on a requirement, and a yank can be reversed.
+# Excluding the line properly needs an upper bound below it (`<1.2.0-e`, or
+# `<1.2.0-research`), which would also exclude the stable `1.2.0` this lane is
+# meant to graduate to, and would put this repo out of step with the identical
+# ranges every neighbour declares. If the research line is ever un-yanked or
+# revived, revisit every range in this file BEFORE the next resolve — do not
+# assume the committed lock protects you, since a lock is only consulted with
+# `--locked`.

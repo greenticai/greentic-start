@@ -74,12 +74,16 @@ pub(crate) async fn authenticate_provider_webhook(
     provider_type: &str,
     request_headers: &[(String, String)],
 ) -> Result<AuthOutcome, Response<Full<Bytes>>> {
-    // Provider-class gate: only Telegram is wired today (its identify hint is
+    // Provider-class gate: only Telegram is wired here (its identify hint is
     // the only one that declares a header-borne secret). Other classes
-    // legitimately reach this site (Slack signature verification lives inside
-    // the component itself); the gate is a no-op for them so adding the field
-    // to a non-Telegram endpoint doesn't fail the request before the
-    // component sees it.
+    // legitimately reach this site and are a no-op for THIS gate, so adding
+    // the field to a non-Telegram endpoint doesn't fail the request before the
+    // component sees it. That is not the same as their being unauthenticated:
+    // a provider that signs its requests rather than echoing a shared secret
+    // (Slack) is gated immediately after this one, by
+    // [`crate::provider_webhook_verify`]. The provider component's own
+    // `ingest_http` verifies nothing on the revision path — do not read a
+    // `Skipped` here as "the component will check it".
     if derive_provider_name(provider_type).as_deref() != Some("telegram") {
         return Ok(AuthOutcome::Skipped);
     }

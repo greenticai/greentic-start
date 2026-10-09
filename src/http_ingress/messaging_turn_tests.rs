@@ -21,6 +21,7 @@ fn flow(id: &str) -> AppFlowInfo {
         id: id.into(),
         kind: "messaging".into(),
         subscribes_to: vec![],
+        node_ids: vec![],
     }
 }
 
@@ -90,6 +91,7 @@ struct Call {
     flow: String,
     text: Option<String>,
     route_to_card: Option<String>,
+    entry_node: Option<String>,
 }
 
 /// Drive one turn. `fail` makes the runner return the error-fallback echo.
@@ -101,11 +103,12 @@ fn drive<'p>(
     probe: impl FnOnce() -> Result<Routed<'p>, Unrouted>,
 ) -> (Vec<ChannelMessageEnvelope>, Vec<Call>) {
     let mut calls = Vec::new();
-    let mut run = |flow: &AppFlowInfo, env: &ChannelMessageEnvelope| {
+    let mut run = |flow: &AppFlowInfo, env: &ChannelMessageEnvelope, entry: Option<&str>| {
         calls.push(Call {
             flow: flow.id.clone(),
             text: env.text.clone(),
             route_to_card: env.metadata.get("routeToCardId").cloned(),
+            entry_node: entry.map(str::to_string),
         });
         FlowRun {
             outputs: vec![env.clone()],
@@ -168,7 +171,7 @@ fn a_miss_with_the_opt_in_runs_the_default_flow_with_the_original_message() {
     assert_eq!(calls[0].flow, "default");
     assert_eq!(calls[0].text.as_deref(), Some(TEXT));
     assert_eq!(calls[0].route_to_card, None);
-    assert_eq!(calls[0].route_to_card, None);
+    assert_eq!(calls[0].entry_node, None);
     assert_no_signal(&outputs[0]);
 }
 
@@ -265,7 +268,7 @@ fn a_bm25_flow_dispatch_stamps_the_flow_on_the_reply() {
 }
 
 #[test]
-fn a_node_dispatch_stamps_the_node_and_runs_the_default_flow_with_the_card_target() {
+fn a_node_dispatch_stamps_the_node_and_enters_the_default_flow_there() {
     let dir = tempdir().expect("tempdir");
     let info = pack(false);
     let inbound = forged_inbound();
@@ -278,9 +281,7 @@ fn a_node_dispatch_stamps_the_node_and_runs_the_default_flow_with_the_card_targe
         )
     });
     assert_eq!(calls[0].flow, "default");
-    // 1.1.x: no entry-node support in the runner, so the card target rides
-    // the envelope into the default flow (the card asset is absent here).
-    assert_eq!(calls[0].route_to_card.as_deref(), Some("refund_card"));
+    assert_eq!(calls[0].entry_node.as_deref(), Some("refund_card"));
     let (_, object) = signal(&outputs[0]);
     assert_eq!(
         object,

@@ -1,0 +1,17 @@
+{
+  "schema": "greentic.triggers.v1",
+  "pack_id": "pack.acme.reports",
+  "triggers": [
+    {
+      "trigger_id": "weekday_digest",
+      "kind": "cron",
+      "flow_id": "main",
+      "entry_node": "collect_mentions",
+      "enabled": true,
+      "session": { "mode": "per_run" },
+      "limits": { "max_concurrency": 1 },
+      "source": { "extension_id": "greentic.schedule", "node_id": "weekday_digest" },
+      "cron": { "expr": "0 0 9 * * MON-FRI", "timezone": "Europe/Amsterdam" }
+    }
+  ]
+}

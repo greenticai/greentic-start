@@ -4,6 +4,8 @@ mod directline_session;
 mod flow_owner;
 mod helpers;
 mod messaging;
+mod setup_gate;
+pub(crate) use messaging::decode_injected_config_for_provider;
 pub mod websocket;
 
 use std::{
@@ -24,6 +26,7 @@ use hyper::{
 };
 use hyper_util::rt::tokio::TokioIo;
 use tokio::{net::TcpListener, runtime::Runtime, sync::oneshot};
+use tracing::Instrument as _;
 
 use crate::deployment_routes::RevisionIngressRouting;
 use crate::domains::Domain;
@@ -107,7 +110,9 @@ impl HttpIngressServer {
             for warning in &static_route_plan.warnings {
                 operator_log::warn(module_path!(), format!("static route warning: {warning}"));
             }
-            let table = ActiveRouteTable::from_plan(&static_route_plan);
+            let table = ActiveRouteTable::from_plan(&static_route_plan).with_setup_surfaces(
+                crate::setup_surface::discover_bundle_setup_surfaces(runner_host.bundle_root()),
+            );
             if !table.is_empty() {
                 operator_log::info(
                     module_path!(),
@@ -303,10 +308,12 @@ impl HttpIngressServer {
                         tokio::select! {
                             _ = &mut shutdown => break,
                             accept = listener.accept() => match accept {
-                                Ok((stream, _peer)) => {
+                                Ok((stream, peer)) => {
                                     let connection_state = state.clone();
                                     tokio::spawn(async move {
-                                        let service = service_fn(move |req| {
+                                        let service = service_fn(move |mut req| {
+                                            req.extensions_mut()
+                                                .insert(setup_gate::PeerAddr(peer));
                                             handle_request(req, connection_state.clone())
                                         });
                                         let http = Http1Builder::new();
@@ -433,17 +440,49 @@ where
 {
     let started = std::time::Instant::now();
     let method = req.method().as_str().to_string();
-    let route = crate::metrics::normalise_route(req.uri().path());
-    let response = match handle_request_inner(req, state).await {
+    let path = req.uri().path().to_string();
+    let route = crate::metrics::normalise_route(&path);
+    let span = crate::request_span::request_span(&method, &path);
+    let response = match handle_request_inner(req, state)
+        .instrument(span.clone())
+        .await
+    {
         Ok(response) => with_cors(response),
         Err(response) => with_cors(response),
     };
     let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    crate::request_span::record_status(&span, response.status().as_u16());
     crate::metrics::record_http_request(&method, &route, response.status().as_u16(), elapsed_ms);
     Ok(response)
 }
 
 async fn handle_request_inner<B>(
+    req: Request<B>,
+    state: Arc<HttpIngressState>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
+where
+    B: Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    // Provider setup surface: D7 bearer gate for non-loopback peers (see
+    // `setup_gate`), and anti-framing headers on whatever answers. A CORS
+    // preflight carries no credentials and is left to the router.
+    if req.method() != Method::OPTIONS {
+        let path = req.uri().path().to_string();
+        let is_setup_surface = setup_gate::gate(&req, &path, &state)
+            .await
+            .map_err(crate::setup_surface::harden_response)?;
+        if is_setup_surface {
+            return match route_request(req, state).await {
+                Ok(response) => Ok(crate::setup_surface::harden_response(response)),
+                Err(response) => Err(crate::setup_surface::harden_response(response)),
+            };
+        }
+    }
+    route_request(req, state).await
+}
+
+async fn route_request<B>(
     req: Request<B>,
     state: Arc<HttpIngressState>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>>
@@ -1598,16 +1637,55 @@ fn directline_session_preflight(
     headers: &mut Vec<(String, String)>,
     ctx: &OperatorContext,
 ) -> directline_session::Preflight {
+    // This is the `--bundle` boot ingress path (the designer's Run Demo via
+    // `DemoRunnerHost`), never a deployed bundle — deployed traffic runs
+    // through `revision_serve.rs::read_provider_signing_key` instead, which
+    // this call site does not share.
+    //
+    // `get_secret` distinguishes "not found" (`Ok(None)`) from a genuine read
+    // failure (`Err`), but `.ok().flatten()` collapses both into `None` here,
+    // so this lane cannot tell "no key configured" from "secrets backend
+    // degraded" — a failed read is accepted as `SigningKey::NotConfigured`
+    // and the request is forwarded unverified. That fail-open is accepted on
+    // this path and tracked separately from the DirectLine fix above; it is
+    // not this function's job to close it.
+    //
+    // Hazard for whoever DOES close it: `get_secret` (`runner_host/mod.rs`)
+    // already distinguishes the two cases internally, but not with
+    // `SecretError`'s variants — it uses `is_secret_not_found`, a STRING
+    // matcher over the error's `Display` output (`contains("not found")`,
+    // `"NotFound"`, `"not-found"`, `"not provisioned"`). Forwarding
+    // `get_secret`'s `Err` here without going through that same matcher would
+    // fail OPEN on any `SecretError::Backend` whose message happens to
+    // contain one of those substrings (e.g. `Backend("upstream said not
+    // found")`), the opposite of what closing this is meant to do. If this
+    // lane and the `SecretError`-based classification in `revision_serve.rs`
+    // are ever unified, `is_secret_not_found` moves onto the enum — the
+    // string matcher does not get promoted to the shared classifier.
+    //
+    // One thing here already changed as a side effect of the shared type: an
+    // empty secret (`Ok(Some(vec![]))`) used to reach the old `preflight` as
+    // `Some(&[])`, filtered down to "no key", and forward unverified. Because
+    // this call site shares `directline_session::preflight` with the fixed
+    // path, an empty secret now reads as `SigningKey::Present(&[])`, which
+    // `preflight` normalises to `Unavailable` and refuses (500) instead.
+    // Intentional, not reverted here, and distinct from the not-found/backend
+    // collapse above (which is about `get_secret`'s `Err`, not an empty
+    // `Ok`).
     let signing_key = state
         .runner_host
         .get_secret(provider, "jwt_signing_key", ctx)
         .ok()
         .flatten();
+    let signing_key = match signing_key.as_deref() {
+        Some(key) => directline_session::SigningKey::Present(key),
+        None => directline_session::SigningKey::NotConfigured,
+    };
     let outcome = directline_session::preflight(
         method,
         provider_path,
         headers,
-        signing_key.as_deref(),
+        signing_key,
         &state.directline_sessions,
     );
     if let directline_session::Preflight::Forward(plan) = &outcome
@@ -1949,7 +2027,12 @@ where
             let provider = request.provider.to_string();
             let ctx_for_worker = ctx.clone();
             let runner_host = state.runner_host.clone();
+            // The worker thread has no span context of its own; carry the
+            // `http.request` span across so `messaging.turn` is its child and
+            // the whole turn lands in the request's trace.
+            let request_span = tracing::Span::current();
             std::thread::spawn(move || {
+                let _request = request_span.enter();
                 if let Err(err) = route_messaging_envelopes(
                     &bundle,
                     &runner_host,
@@ -2191,6 +2274,16 @@ fn extract_scope_from_route_match(
     Some((tenant?, team))
 }
 
+/// Provider ops whose output may carry a webchat `_greentic` block that must wake
+/// the WS pump. `send_typing` is here so a WS-connected browser sees the typing
+/// activity (docs/typing-signal.md).
+fn webchat_notify_op(op_name: &str) -> bool {
+    matches!(
+        op_name,
+        "directline_http" | "send_payload" | crate::typing::TYPING_OP
+    )
+}
+
 /// Wire the post-op callback on the runner host so successful webchat provider
 /// invocations are forwarded to the activity notifier. Filters by provider id
 /// and op name; events without `_greentic` metadata are dropped.
@@ -2201,11 +2294,11 @@ fn register_webchat_post_op_notifier(state: &Arc<HttpIngressState>) {
             if provider != "messaging-webchat" && provider != "messaging-webchat-gui" {
                 return;
             }
-            if op_name != "directline_http" && op_name != "send_payload" {
+            if !webchat_notify_op(op_name) {
                 operator_log::debug(
                     module_path!(),
                     format!(
-                        "[ws post-op-notifier] op={} provider={} skipped (not directline_http or send_payload)",
+                        "[ws post-op-notifier] op={} provider={} skipped (not a webchat activity op)",
                         op_name, provider,
                     ),
                 );
@@ -2307,6 +2400,16 @@ impl websocket::RunnerHostHandle for DemoRunnerHost {
             }
             _ => Vec::new(),
         };
+        let ctx = OperatorContext {
+            tenant: tenant.to_string(),
+            team: Some(team.to_string()),
+            correlation_id: None,
+        };
+        // Same config the ingress resolves (#585): without it the provider's
+        // deploy-time answers vanish on every poll the pump makes.
+        let config =
+            crate::ingress_dispatch::build_injected_config(self, Domain::Messaging, provider, &ctx)
+                .map_err(|err| format!("resolve config for provider {provider}: {err:#}"))?;
         let payload = serde_json::json!({
             "v": 1,
             "provider": provider,
@@ -2319,14 +2422,9 @@ impl websocket::RunnerHostHandle for DemoRunnerHost {
             "query": format!("watermark={watermark}&tenant={tenant}&team={team}"),
             "headers": headers,
             "body_b64": "",
-            "config": serde_json::Value::Null,
+            "config": config.unwrap_or(serde_json::Value::Null),
         });
         let payload_bytes = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
-        let ctx = OperatorContext {
-            tenant: tenant.to_string(),
-            team: Some(team.to_string()),
-            correlation_id: None,
-        };
         // The webchat provider exposes its directline routing under the
         // generic `ingest_http` op (with hyphen alias). Try the canonical
         // name first, then fall back to the underscore alias used by older
@@ -2389,6 +2487,17 @@ mod tests {
     use std::sync::Arc;
     use tempfile::tempdir;
     use tokio::runtime::Runtime;
+
+    #[test]
+    fn webchat_ws_notify_covers_send_typing() {
+        assert!(webchat_notify_op("directline_http"));
+        assert!(webchat_notify_op("send_payload"));
+        assert!(
+            webchat_notify_op("send_typing"),
+            "without it a WS-connected browser never sees the typing activity"
+        );
+        assert!(!webchat_notify_op("render_plan"));
+    }
 
     async fn test_state(domains: Vec<Domain>) -> Arc<HttpIngressState> {
         build_test_state(domains, None).await
@@ -2553,6 +2662,8 @@ mod tests {
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             app_packs: Default::default(),
+            triggers: Default::default(),
+            runtime_metered: Default::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2600,6 +2711,8 @@ mod tests {
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             app_packs: Default::default(),
+            triggers: Default::default(),
+            runtime_metered: Default::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2938,6 +3051,147 @@ mod tests {
         let body =
             runtime.block_on(async { response.into_body().collect().await.unwrap().to_bytes() });
         assert!(String::from_utf8_lossy(&body).contains("<html>ok</html>"));
+    }
+
+    /// Legacy `--bundle` listener: a provider setup surface needs the D7
+    /// bearer from a non-loopback peer, and answers with anti-framing headers.
+    #[test]
+    fn legacy_setup_surface_is_gated_for_non_loopback_peers() {
+        use sha2::{Digest, Sha256};
+        let runtime = Runtime::new().unwrap();
+        let dir = tempdir().unwrap();
+        let discovery = crate::discovery::discover(dir.path()).unwrap();
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default")).unwrap();
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .unwrap(),
+        );
+        std::fs::create_dir_all(dir.path().join("site")).unwrap();
+        std::fs::write(
+            dir.path().join("site").join("index.html"),
+            "<html>wiz</html>",
+        )
+        .unwrap();
+        let route = StaticRouteDescriptor {
+            route_id: "wiz".to_string(),
+            pack_id: "wiz".to_string(),
+            pack_path: dir.path().to_path_buf(),
+            public_path: "/wiz".to_string(),
+            source_root: "site".to_string(),
+            index_file: Some("index.html".to_string()),
+            spa_fallback: Some("index.html".to_string()),
+            tenant_scoped: false,
+            team_scoped: false,
+            cache_strategy: CacheStrategy::None,
+            route_segments: vec![RouteScopeSegment::Literal("wiz".to_string())],
+            scope: None,
+        };
+        // The unit credential, staged where the revision listener reads it.
+        let bundle = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let uri =
+            crate::ingress_auth::ingress_secret_uri(&crate::resolve_env(None), "default", &bundle);
+        let digest: String = Sha256::digest(b"tok")
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let doc = serde_json::json!({
+            "v": 1, "a2a": false, "mcp": false, "tenant_slug": "t",
+            "credentials": [{"id": "c1", "sha256": digest}],
+        });
+        runtime
+            .block_on(
+                runner_host
+                    .secrets_manager()
+                    .write(&uri, doc.to_string().as_bytes()),
+            )
+            .unwrap();
+        let notifier = runtime
+            .block_on(crate::notifier::build_notifier(
+                crate::notifier::NotifierConfig::default(),
+            ))
+            .expect("build notifier");
+        let state = Arc::new(HttpIngressState {
+            runner_host,
+            domains: vec![],
+            active_route_table: ActiveRouteTable::from_plan(&StaticRoutePlan {
+                routes: vec![route],
+                warnings: vec![],
+                blocking_failures: vec![],
+            })
+            .with_setup_surfaces(crate::setup_surface::SetupSurfaceTable::for_tests(
+                &["/wiz", "/api/wiz/{tenant}"],
+                None,
+            )),
+            http_route_table: HttpRouteTable::default(),
+            revision_routing: None,
+            admin_relay: None,
+            notifier,
+            session_manager: Arc::new(websocket::SessionManager::new(
+                websocket::WsLimits::default(),
+            )),
+            webchat_provider: "messaging-webchat".to_string(),
+            conversation_dedup: Arc::new(ConversationDedupCache::new()),
+            directline_sessions: Arc::new(directline_session::DirectLineSessions::from_env()),
+        });
+        let run = |method: Method, path: &str, peer: Option<&str>, bearer: Option<&str>| {
+            let mut req = empty_request(method, path);
+            if let Some(peer) = peer {
+                req.extensions_mut()
+                    .insert(setup_gate::PeerAddr(peer.parse().unwrap()));
+            }
+            if let Some(token) = bearer {
+                req.headers_mut().insert(
+                    hyper::header::AUTHORIZATION,
+                    format!("Bearer {token}").parse().unwrap(),
+                );
+            }
+            let (Ok(response) | Err(response)) =
+                runtime.block_on(handle_request_inner(req, state.clone()));
+            response
+        };
+        let remote = Some("203.0.113.9:5000");
+        // No bearer: GET page, GET api state, POST api next -> 401.
+        for (method, path) in [
+            (Method::GET, "/wiz/"),
+            (Method::GET, "/api/wiz/demo"),
+            (Method::POST, "/api/wiz/demo/next"),
+        ] {
+            let response = run(method, path, remote, None);
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+            assert_eq!(response.headers()["www-authenticate"], "Bearer");
+        }
+        // Unknown peer is treated as remote; wrong bearer is refused.
+        assert_eq!(
+            run(Method::GET, "/wiz/", None, None).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            run(Method::GET, "/wiz/", remote, Some("nope")).status(),
+            StatusCode::UNAUTHORIZED
+        );
+        // Valid bearer and loopback both reach the page, with anti-framing.
+        for (peer, bearer) in [(remote, Some("tok")), (Some("127.0.0.1:5000"), None)] {
+            let response = run(Method::GET, "/wiz/", peer, bearer);
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["x-frame-options"], "DENY");
+            assert_eq!(
+                response.headers()["content-security-policy"],
+                "frame-ancestors 'none'"
+            );
+        }
     }
 
     #[test]

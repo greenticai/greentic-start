@@ -201,6 +201,66 @@ struct DlClaims {
     ctx: DlContext,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     conv: Option<String>,
+    /// Every other claim on the token — `groups`, `role`, `teams`, `email`,
+    /// `name`, whatever the issuer put there.
+    ///
+    /// Without this the re-mint below dropped all of them, so an identity
+    /// provider's roles and groups never reached the provider's second look at
+    /// the token (greentic-start#584). They are only ever read out of a token
+    /// whose HMAC signature has ALREADY verified against the provider's own
+    /// signing key ([`parse_token`]), so they are exactly as trustworthy as
+    /// `sub` — never request input.
+    ///
+    /// On deserialize, serde routes the named fields above into their own
+    /// slots, so a reserved name can only appear here when a value is built by
+    /// hand; [`carried_extra_claims`] strips those anyway before signing.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    extra: serde_json::Map<String, Value>,
+}
+
+/// Claims whose meaning greentic-start or the provider owns. They are never
+/// copied from [`DlClaims::extra`]: the named fields are re-stamped by
+/// [`mint_token`], and letting an extra with the same name through would
+/// serialize a duplicate key — which parsers resolve differently — or, for
+/// `jti`, replay a single-use id onto a new token.
+const RESERVED_CLAIMS: &[&str] = &[
+    "iss", "aud", "sub", "iat", "nbf", "exp", "jti", "ctx", "conv",
+];
+
+/// Upper bound on the serialized size of the carried extra claims. The token
+/// travels in an `Authorization` header on every poll, and common proxies
+/// refuse headers past ~8 KiB; an issuer that stuffs hundreds of groups into
+/// its token must not turn every Direct Line request into a 431.
+const MAX_EXTRA_CLAIMS_BYTES: usize = 4096;
+
+/// The extra claims a re-minted token carries: reserved names removed, and the
+/// whole set dropped (with a warning) when it exceeds
+/// [`MAX_EXTRA_CLAIMS_BYTES`].
+///
+/// Over the cap it drops ALL of them rather than truncating. A truncated
+/// `groups` array, or `role` kept while `groups` is lost, would hand a
+/// downstream authorisation check a partial identity that looks complete;
+/// an absent claim is an answer every consumer already has to handle.
+fn carried_extra_claims(extra: &serde_json::Map<String, Value>) -> serde_json::Map<String, Value> {
+    let carried: serde_json::Map<String, Value> = extra
+        .iter()
+        .filter(|(name, _)| !RESERVED_CLAIMS.contains(&name.as_str()))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    let size = serde_json::to_vec(&carried)
+        .map(|b| b.len())
+        .unwrap_or(usize::MAX);
+    if size > MAX_EXTRA_CLAIMS_BYTES {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "directline re-mint: dropping {} extra claim(s) ({size} bytes > {MAX_EXTRA_CLAIMS_BYTES} byte cap); the renewed token carries only sub/ctx/conv",
+                carried.len()
+            ),
+        );
+        return serde_json::Map::new();
+    }
+    carried
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +299,8 @@ fn parse_token(token: &str, key: &[u8]) -> Result<DlClaims, TokenError> {
     serde_json::from_slice::<DlClaims>(&payload_bytes).map_err(|_| TokenError::Malformed)
 }
 
-/// Mint a fresh DirectLine JWT carrying the same `sub`/`ctx`/`conv` as
+/// Mint a fresh DirectLine JWT carrying the same `sub`/`ctx`/`conv` — and the
+/// same non-reserved extra claims (see [`carried_extra_claims`]) — as
 /// `template`, with `iat = nbf = now` and `exp = now + ttl_secs`, signed with
 /// `key`. The provider validates it like any token it issued itself.
 fn mint_token(template: &DlClaims, key: &[u8], ttl_secs: u64) -> String {
@@ -253,6 +314,7 @@ fn mint_token(template: &DlClaims, key: &[u8], ttl_secs: u64) -> String {
         exp: now + ttl_secs as i64,
         ctx: template.ctx.clone(),
         conv: template.conv.clone(),
+        extra: carried_extra_claims(&template.extra),
     };
     let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
     let payload_enc =
@@ -299,6 +361,11 @@ pub struct ForwardPlan {
     /// On a 2xx response, parse `conversationId` from the body and `touch` the
     /// sliding window for it (used for `POST /v3/directline/conversations`).
     pub seed_from_response: bool,
+    /// The caller's token was already bound to the conversation in the URL
+    /// (`conv` claim equal to the path id), not a conversation-less bootstrap
+    /// token. Only such a request may (re-)establish the conversation's revision
+    /// pin after the provider accepts it.
+    pub token_bound_to_conversation: bool,
 }
 
 /// Outcome of screening a DirectLine request before it reaches the provider.
@@ -312,22 +379,49 @@ pub enum Preflight {
     Respond(Response<Full<Bytes>>),
 }
 
+/// What the caller found when it looked for this provider's signing key.
+///
+/// The three states must stay distinct. A provider that never had a key has
+/// DirectLine auth switched off and has always been forwarded; a read that
+/// FAILED is a degraded secrets backend, and forwarding there turns a
+/// transient error into an authentication bypass. Collapsing them into one
+/// `Option` is what this type replaces — see the classification in
+/// `read_provider_signing_key` (`revision_serve.rs`), and the visibility fix
+/// that preceded it (`git log --grep "report an unreadable signing key"`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SigningKey<'a> {
+    /// A key was read and requests are verified against it.
+    Present(&'a [u8]),
+    /// No key is configured for this provider. Auth is off, deliberately.
+    NotConfigured,
+    /// A key may exist but could not be read. Refuse rather than guess.
+    Unavailable,
+}
+
 /// Screen a normalized DirectLine request (`provider_path` is post
 /// [`normalize_directline_dispatch`], e.g. `/v3/directline/conversations/<id>/activities`).
 ///
 /// Side effect: accepted activity / reconnect / refresh requests `touch` the
 /// sliding-window store for their conversation. `signing_key` is the
-/// `jwt_signing_key` secret for the target provider; when absent the request is
-/// forwarded unchanged (the provider performs its own auth) except for
-/// `/tokens/refresh`, which cannot work without it.
+/// `jwt_signing_key` secret for the target provider; when [`SigningKey::NotConfigured`]
+/// the request is forwarded unchanged (the provider performs its own auth)
+/// except for `/tokens/refresh`, which cannot work without it. When
+/// [`SigningKey::Unavailable`] the request is refused rather than forwarded
+/// unverified.
 pub fn preflight(
     method: &Method,
     provider_path: &str,
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let signing_key = signing_key.filter(|key| !key.is_empty());
+    // An empty key cannot verify anything. Treat it as a broken configuration
+    // (`Unavailable`), never as "no key" (`NotConfigured`) — the latter would
+    // silently reopen the fail-open this type exists to close.
+    let signing_key = match signing_key {
+        SigningKey::Present([]) => SigningKey::Unavailable,
+        other => other,
+    };
     let segments: Vec<&str> = provider_path.trim_start_matches('/').split('/').collect();
     match segments.as_slice() {
         ["v3", "directline", "tokens", "refresh"] if method == Method::POST => {
@@ -409,11 +503,17 @@ fn handle_activities(
     method: &Method,
     conv_id: &str,
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Forward(ForwardPlan::default());
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured => {
+            return Preflight::Forward(ForwardPlan::default());
+        }
+        SigningKey::Unavailable => {
+            return signing_key_unavailable();
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -449,6 +549,7 @@ fn handle_activities(
     // conv-bound bearer so the provider's strict `exp`+conversation checks pass and
     // the client can adopt a properly-bound token (even if it sent a conv-less one).
     sessions.touch(conv_id);
+    let token_bound_to_conversation = claims.conv.as_deref() == Some(conv_id);
     claims.conv = Some(conv_id.to_string());
     let renewed = mint_token(&claims, key, sessions.ttl_secs());
     // POST = a user-typed message (low frequency) — always echo the renewed
@@ -460,17 +561,24 @@ fn handle_activities(
         rewrite_authorization: Some(format!("Bearer {renewed}")),
         inject_renewed_token: echo_renewed.then_some(renewed),
         seed_from_response: false,
+        token_bound_to_conversation,
     })
 }
 
 fn handle_reconnect(
     conv_id: &str,
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Forward(ForwardPlan::default());
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured => {
+            return Preflight::Forward(ForwardPlan::default());
+        }
+        SigningKey::Unavailable => {
+            return signing_key_unavailable();
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -497,6 +605,7 @@ fn handle_reconnect(
         return unauthorized("TokenExpired", "invalid token: Expired");
     }
     sessions.touch(conv_id);
+    let token_bound_to_conversation = claims.conv.as_deref() == Some(conv_id);
     // Forward a fresh conv-bound bearer so the provider's reconnect handler
     // accepts it; its response already carries a freshly issued token.
     claims.conv = Some(conv_id.to_string());
@@ -505,19 +614,26 @@ fn handle_reconnect(
         rewrite_authorization: Some(format!("Bearer {renewed}")),
         inject_renewed_token: None,
         seed_from_response: false,
+        token_bound_to_conversation,
     })
 }
 
 fn handle_conversations_create(
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Forward(ForwardPlan {
-            seed_from_response: true,
-            ..ForwardPlan::default()
-        });
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured => {
+            return Preflight::Forward(ForwardPlan {
+                seed_from_response: true,
+                ..ForwardPlan::default()
+            });
+        }
+        SigningKey::Unavailable => {
+            return signing_key_unavailable();
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -543,21 +659,20 @@ fn handle_conversations_create(
         rewrite_authorization,
         inject_renewed_token: None,
         seed_from_response: true,
+        ..ForwardPlan::default()
     })
 }
 
 fn handle_refresh(
     headers: &[(String, String)],
-    signing_key: Option<&[u8]>,
+    signing_key: SigningKey<'_>,
     sessions: &DirectLineSessions,
 ) -> Preflight {
-    let Some(key) = signing_key else {
-        return Preflight::Respond(coded_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "server_error",
-            "ServerError",
-            "directline signing key unavailable",
-        ));
+    let key = match signing_key {
+        SigningKey::Present(key) => key,
+        SigningKey::NotConfigured | SigningKey::Unavailable => {
+            return signing_key_unavailable();
+        }
     };
     let token = match bearer(headers) {
         Some(token) => token,
@@ -644,6 +759,20 @@ fn forbidden(code: &str, message: &str) -> Preflight {
     ))
 }
 
+/// The refusal every handler returns for [`SigningKey::Unavailable`] (and,
+/// in `handle_refresh`, for [`SigningKey::NotConfigured`] too — that handler
+/// has no "auth off" posture, see its own match). One function so a future
+/// fifth handler cannot spell this refusal subtly differently from the other
+/// four.
+fn signing_key_unavailable() -> Preflight {
+    Preflight::Respond(coded_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "server_error",
+        "ServerError",
+        "directline signing key unavailable",
+    ))
+}
+
 fn coded_error(
     status: StatusCode,
     error: &str,
@@ -702,6 +831,7 @@ mod tests {
                 team: None,
             },
             conv: conv.map(str::to_string),
+            extra: serde_json::Map::new(),
         };
         let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
         let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).unwrap());
@@ -746,6 +876,139 @@ mod tests {
         assert_eq!(sessions.tracked(), 0);
     }
 
+    /// Sign an arbitrary JSON payload, so a test can put claims on a token that
+    /// `DlClaims` would not produce itself (duplicates, `jti`, IdP claims).
+    fn sign_raw(payload: &Value, key: &[u8]) -> String {
+        let header_enc = URL_SAFE_NO_PAD.encode(JOSE_HEADER);
+        let payload_enc = URL_SAFE_NO_PAD.encode(serde_json::to_vec(payload).unwrap());
+        let signing_input = format!("{header_enc}.{payload_enc}");
+        let sig = URL_SAFE_NO_PAD.encode(hs256(&signing_input, key));
+        format!("{signing_input}.{sig}")
+    }
+
+    fn payload_of(token: &str) -> Value {
+        let payload = token.split('.').nth(1).unwrap();
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap()
+    }
+
+    fn idp_token(extra: Value, key: &[u8]) -> String {
+        let now = now_secs();
+        let mut payload = json!({
+            "iss": TOKEN_ISS, "aud": TOKEN_AUD, "sub": "alice",
+            "iat": now, "nbf": now, "exp": now + 1800,
+            "ctx": { "env": "default", "tenant": "demo", "team": "sales" },
+            "conv": "conv-1",
+        });
+        for (name, value) in extra.as_object().unwrap() {
+            payload[name] = value.clone();
+        }
+        sign_raw(&payload, key)
+    }
+
+    #[test]
+    fn re_mint_carries_the_identity_providers_extra_claims() {
+        let token = idp_token(
+            json!({
+                "groups": ["engineering", "admins"],
+                "role": "owner",
+                "teams": ["sales"],
+                "email": "alice@example.com",
+                "name": "Alice",
+            }),
+            KEY,
+        );
+        let claims = parse_token(&token, KEY).unwrap();
+        let minted = mint_token(&claims, KEY, 1800);
+        let reparsed = parse_token(&minted, KEY).unwrap();
+
+        assert_eq!(reparsed.sub, "alice");
+        assert_eq!(reparsed.ctx.team.as_deref(), Some("sales"));
+        assert_eq!(reparsed.extra["groups"], json!(["engineering", "admins"]));
+        assert_eq!(reparsed.extra["role"], json!("owner"));
+        assert_eq!(reparsed.extra["teams"], json!(["sales"]));
+        assert_eq!(reparsed.extra["email"], json!("alice@example.com"));
+        assert_eq!(reparsed.extra["name"], json!("Alice"));
+
+        // And the renewed token the preflight hands upstream carries them too.
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let Preflight::Forward(plan) = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &auth(&token),
+            SigningKey::Present(KEY),
+            &sessions,
+        ) else {
+            panic!("expected forward");
+        };
+        let rewritten = plan.rewrite_authorization.unwrap();
+        let forwarded = payload_of(rewritten.strip_prefix("Bearer ").unwrap());
+        assert_eq!(forwarded["groups"], json!(["engineering", "admins"]));
+        assert_eq!(forwarded["role"], json!("owner"));
+    }
+
+    #[test]
+    fn reserved_claims_cannot_be_spoofed_through_extras() {
+        // A template built by hand whose extras shadow every reserved name.
+        let token = make_token("alice", Some("conv-1"), 100, 200, KEY);
+        let mut claims = parse_token(&token, KEY).unwrap();
+        for name in RESERVED_CLAIMS {
+            claims.extra.insert((*name).to_string(), json!("forged"));
+        }
+        claims.extra.insert("role".to_string(), json!("owner"));
+
+        let minted = mint_token(&claims, KEY, 1800);
+        let payload = payload_of(&minted);
+        let raw = String::from_utf8(
+            URL_SAFE_NO_PAD
+                .decode(minted.split('.').nth(1).unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(payload["sub"], json!("alice"));
+        assert_eq!(payload["iss"], json!(TOKEN_ISS));
+        assert_eq!(payload["aud"], json!(TOKEN_AUD));
+        assert_eq!(payload["conv"], json!("conv-1"));
+        assert_eq!(payload["ctx"]["tenant"], json!("demo"));
+        assert!(payload["exp"].as_i64().unwrap() > now_secs());
+        assert!(payload.get("jti").is_none(), "jti must not be replayed");
+        assert_eq!(payload["role"], json!("owner"));
+        // No duplicate keys in the signed bytes.
+        for name in ["\"sub\"", "\"iss\"", "\"exp\"", "\"conv\"", "\"ctx\""] {
+            assert_eq!(raw.matches(name).count(), 1, "duplicate {name} in {raw}");
+        }
+    }
+
+    #[test]
+    fn an_inbound_jti_is_not_copied_onto_the_renewed_token() {
+        let token = idp_token(json!({ "jti": "once-only", "role": "owner" }), KEY);
+        let claims = parse_token(&token, KEY).unwrap();
+        let payload = payload_of(&mint_token(&claims, KEY, 1800));
+        assert!(payload.get("jti").is_none());
+        assert_eq!(payload["role"], json!("owner"));
+    }
+
+    #[test]
+    fn oversized_extra_claims_are_dropped_whole_not_truncated() {
+        let groups: Vec<String> = (0..500).map(|i| format!("group-number-{i}")).collect();
+        let token = idp_token(json!({ "groups": groups, "role": "owner" }), KEY);
+        let claims = parse_token(&token, KEY).unwrap();
+        let payload = payload_of(&mint_token(&claims, KEY, 1800));
+        assert!(payload.get("groups").is_none());
+        assert!(payload.get("role").is_none());
+        assert_eq!(payload["sub"], json!("alice"));
+        assert_eq!(payload["conv"], json!("conv-1"));
+    }
+
+    #[test]
+    fn extra_claims_on_a_token_with_a_bad_signature_are_never_read() {
+        let token = idp_token(json!({ "role": "owner" }), b"someone-elses-key");
+        assert!(matches!(
+            parse_token(&token, KEY),
+            Err(TokenError::BadSignature)
+        ));
+    }
+
     #[test]
     fn mint_round_trips_through_parse() {
         let original = make_token("alice", Some("conv-1"), 100, 200, KEY);
@@ -781,7 +1044,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         match outcome {
@@ -806,7 +1069,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         assert!(
@@ -823,7 +1086,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         let Preflight::Respond(resp) = outcome else {
@@ -850,7 +1113,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         let Preflight::Respond(resp) = outcome else {
@@ -870,7 +1133,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         );
         let Preflight::Respond(resp) = outcome else {
@@ -890,7 +1153,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/tokens/refresh",
             &auth(&token),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected respond");
@@ -915,7 +1178,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations",
             &auth(&bootstrap),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -947,7 +1210,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations",
             &auth(&bound),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected reject");
@@ -965,7 +1228,7 @@ mod tests {
                 &Method::POST,
                 "/v3/directline/tokens/generate",
                 &[],
-                Some(KEY),
+                SigningKey::Present(KEY),
                 &sessions
             ),
             Preflight::Forward(plan) if plan.rewrite_authorization.is_none()
@@ -973,7 +1236,13 @@ mod tests {
                 && !plan.seed_from_response
         ));
         assert!(matches!(
-            preflight(&Method::GET, "/v3/directline", &[], Some(KEY), &sessions),
+            preflight(
+                &Method::GET,
+                "/v3/directline",
+                &[],
+                SigningKey::Present(KEY),
+                &sessions
+            ),
             Preflight::Forward(_)
         ));
     }
@@ -986,7 +1255,7 @@ mod tests {
                 &Method::POST,
                 "/v3/directline/conversations/conv-1/activities",
                 &auth("whatever"),
-                None,
+                SigningKey::NotConfigured,
                 &sessions
             ),
             Preflight::Forward(_)
@@ -995,12 +1264,81 @@ mod tests {
             &Method::POST,
             "/v3/directline/tokens/refresh",
             &auth("whatever"),
-            None,
+            SigningKey::NotConfigured,
             &sessions,
         ) else {
             panic!("expected respond");
         };
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn an_unreadable_signing_key_refuses_activities_instead_of_forwarding() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let now = now_secs();
+        let token = make_token("alice", Some("conv-1"), now, now + 1800, KEY);
+        let outcome = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &auth(&token),
+            SigningKey::Unavailable,
+            &sessions,
+        );
+        let Preflight::Respond(resp) = outcome else {
+            panic!("an unreadable signing key must never forward an unverified request");
+        };
+        let (status, body) = body_of(resp);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["code"], "ServerError");
+    }
+
+    #[test]
+    fn an_unreadable_signing_key_refuses_reconnect_and_conversation_create() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        for (method, path) in [
+            (Method::GET, "/v3/directline/conversations/conv-1"),
+            (Method::POST, "/v3/directline/conversations"),
+        ] {
+            let outcome = preflight(&method, path, &[], SigningKey::Unavailable, &sessions);
+            let Preflight::Respond(resp) = outcome else {
+                panic!("{path} forwarded an unverified request on an unreadable key");
+            };
+            let (status, _) = body_of(resp);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{path}");
+        }
+    }
+
+    #[test]
+    fn an_empty_signing_key_is_refused_rather_than_treated_as_absent() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let outcome = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &[],
+            SigningKey::Present(b""),
+            &sessions,
+        );
+        let Preflight::Respond(resp) = outcome else {
+            panic!("an empty key cannot verify anything and must not forward");
+        };
+        let (status, _) = body_of(resp);
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn a_tenant_with_no_key_configured_is_still_served() {
+        // Auth was never switched on for this provider. That is a deliberate
+        // posture, not a degraded one, and it must keep working exactly as it
+        // did before this change — otherwise the fix takes a live tenant down.
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let outcome = preflight(
+            &Method::POST,
+            "/v3/directline/conversations/conv-1/activities",
+            &[],
+            SigningKey::NotConfigured,
+            &sessions,
+        );
+        assert!(matches!(outcome, Preflight::Forward(_)));
     }
 
     #[test]
@@ -1046,7 +1384,13 @@ mod tests {
             let now = now_secs();
             // Modelled as "the t = 0 bearer, observed `elapsed` seconds later".
             let original = make_token("alice", Some(conv), now - elapsed, now - elapsed + ttl, KEY);
-            match preflight(&Method::POST, &path, &auth(&original), Some(KEY), &sessions) {
+            match preflight(
+                &Method::POST,
+                &path,
+                &auth(&original),
+                SigningKey::Present(KEY),
+                &sessions,
+            ) {
                 Preflight::Forward(plan) => {
                     let renewed = plan
                         .rewrite_authorization
@@ -1089,7 +1433,7 @@ mod tests {
                 &Method::POST,
                 "/v3/directline/conversations/conv-idle/activities",
                 &auth(&stale),
-                Some(KEY),
+                SigningKey::Present(KEY),
                 &sessions,
             ),
             Preflight::Respond(_)
@@ -1106,7 +1450,7 @@ mod tests {
             &Method::GET,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&fresh),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1127,7 +1471,7 @@ mod tests {
             &Method::GET,
             "/v3/directline/conversations/conv-1/activities",
             &auth(&stale),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1145,7 +1489,7 @@ mod tests {
             &Method::GET,
             "/v3/directline/conversations/conv-7",
             &auth(&unbound),
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected forward");
@@ -1162,6 +1506,75 @@ mod tests {
         assert!(sessions.is_alive("conv-7"));
     }
 
+    fn forward_plan(method: Method, path: &str, token: &str) -> ForwardPlan {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        match preflight(
+            &method,
+            path,
+            &auth(token),
+            SigningKey::Present(KEY),
+            &sessions,
+        ) {
+            Preflight::Forward(plan) => plan,
+            Preflight::Respond(_) => panic!("expected forward"),
+        }
+    }
+
+    #[test]
+    fn only_a_token_already_bound_to_the_conversation_may_repin() {
+        let now = now_secs();
+        let bound = make_token("alice", Some("conv-7"), now, now + 1800, KEY);
+        let unbound = make_token("alice", None, now, now + 1800, KEY);
+        for (method, path) in [
+            (Method::GET, "/v3/directline/conversations/conv-7"),
+            (
+                Method::POST,
+                "/v3/directline/conversations/conv-7/activities",
+            ),
+            (
+                Method::GET,
+                "/v3/directline/conversations/conv-7/activities",
+            ),
+        ] {
+            assert!(
+                forward_plan(method.clone(), path, &bound).token_bound_to_conversation,
+                "a bound token may re-pin {method} {path}"
+            );
+            assert!(
+                !forward_plan(method.clone(), path, &unbound).token_bound_to_conversation,
+                "a conversation-less token must not re-pin {method} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_token_bound_to_another_conversation_is_refused_so_it_cannot_pin() {
+        let sessions = DirectLineSessions::with_ttl_secs(1800);
+        let now = now_secs();
+        let other = make_token("alice", Some("conv-OTHER"), now, now + 1800, KEY);
+        for (method, path) in [
+            (Method::GET, "/v3/directline/conversations/conv-7"),
+            (
+                Method::POST,
+                "/v3/directline/conversations/conv-7/activities",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    preflight(
+                        &method,
+                        path,
+                        &auth(&other),
+                        SigningKey::Present(KEY),
+                        &sessions
+                    ),
+                    Preflight::Respond(_)
+                ),
+                "{method} {path} must be refused before it can reach the provider"
+            );
+        }
+    }
+
     #[test]
     fn activities_missing_authorization_is_401() {
         let sessions = DirectLineSessions::with_ttl_secs(1800);
@@ -1169,7 +1582,7 @@ mod tests {
             &Method::POST,
             "/v3/directline/conversations/conv-1/activities",
             &[],
-            Some(KEY),
+            SigningKey::Present(KEY),
             &sessions,
         ) else {
             panic!("expected reject");

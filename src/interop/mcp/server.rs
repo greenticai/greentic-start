@@ -1,0 +1,403 @@
+//! The `rmcp` service behind `POST /mcp`, its one tool, and the transport
+//! configuration that makes it correct for a public, multi-instance
+//! deployment.
+//!
+//! The four settings in [`mcp_config`] all differ from `rmcp`'s defaults, and
+//! three of those defaults fail silently rather than loudly here — so each
+//! carries its reasoning rather than a bare value. Three of them are the ones
+//! greentic-designer's own MCP surface sets, for the same reasons; the fourth
+//! is the request-body cap, which exists because `/mcp` is the one POST on
+//! this ingress that does not go through `revision_serve::read_body_limited`.
+
+use std::sync::Arc;
+
+use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::wrapper::Parameters;
+use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
+use rmcp::transport::streamable_http_server::{StreamableHttpServerConfig, StreamableHttpService};
+use rmcp::{ErrorData, ServerHandler, tool, tool_handler, tool_router};
+use serde::Deserialize;
+use serde_json::{Map, Value, json};
+
+use crate::interop::a2a::rpc::TurnRunner;
+use crate::interop::input_request::answer_payload;
+use crate::interop::limits::{RateLimiter, TURN_COST, TurnGate};
+use crate::interop::metering::event::{Surface, usage_from_replies};
+use crate::interop::reply::{ReplyItem, project_replies};
+use greentic_deploy_spec::ids::DeploymentId;
+
+/// Longest `conversation_id` accepted; it becomes part of a session key.
+const MAX_CONVERSATION_ID_LEN: usize = 256;
+
+/// Everything one authenticated caller's tools may reach.
+///
+/// Built per request in [`crate::revision_serve`] and captured by the service
+/// factory, so the caller is baked into the handler rather than read back out
+/// of an `rmcp` request extension. That is the whole reason this surface needs
+/// no `caller()` helper: a service instance serves exactly one authenticated
+/// request.
+pub(crate) struct McpContext {
+    pub runner: Arc<dyn TurnRunner>,
+    pub turns: Arc<TurnGate>,
+    /// The same bucket table the transport charged the pre-filter against, so
+    /// the tool can settle the true price of a turn. See
+    /// [`crate::interop::mcp::request_cost`].
+    pub limiter: Arc<RateLimiter>,
+    /// What this request already paid from the `Mcp-Method` pre-filter.
+    pub prepaid: f64,
+    pub deployment_id: DeploymentId,
+    pub tenant: String,
+    pub bundle_id: String,
+    /// The OAuth `sub` or the staged credential id — the conversation
+    /// namespace, so two callers cannot resume each other's parked flow.
+    pub caller_key: String,
+    /// The staged credential id when the caller authenticated with the A2A
+    /// bearer, `None` for an OAuth one. Distinct from `caller_key`, which
+    /// collapses the two: a usage event may only name a credential the
+    /// designer staged, and an OAuth `sub` is not one.
+    pub credential_id: Option<String>,
+    /// Where to record what this unit's turns spend. `None` when the unit
+    /// stages no `metering` block.
+    pub metering: Option<crate::interop::metering::TurnMetering>,
+    /// What the worker calls itself, for the server's `instructions`.
+    pub agent_name: String,
+}
+
+/// The MCP service. Cloned per request by the factory in [`service`].
+#[derive(Clone)]
+pub(crate) struct WorkerMcpServer {
+    ctx: Arc<McpContext>,
+    tool_router: ToolRouter<Self>,
+}
+
+impl WorkerMcpServer {
+    pub(crate) fn new(ctx: Arc<McpContext>) -> Self {
+        Self {
+            ctx,
+            tool_router: Self::tool_router_ask(),
+        }
+    }
+}
+
+/// `ask`'s arguments. Exactly the three the contract names: everything else a
+/// turn needs is a property of the deployment, not of the call.
+#[derive(Debug, Deserialize, rmcp::schemars::JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+pub(crate) struct AskArgs {
+    /// What to say to the worker.
+    ///
+    /// Optional ONLY because `answer` alone is a valid submit — a form filled
+    /// in with no covering sentence (contract D12). A call carrying neither
+    /// is refused, which is the same refusal the agent-to-agent surface gives
+    /// a message with no parts.
+    #[serde(default)]
+    pub message: Option<String>,
+    /// The conversation to continue. Omit it to start one; the id is returned
+    /// so the next call can pass it back.
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    /// The filled-in fields of the `input_request` the previous call
+    /// returned: field id → value.
+    ///
+    /// `answer` and `message` are NOT alternatives — a caller may send both,
+    /// either, and is refused only for neither. An EMPTY object submits
+    /// nothing and counts as absent.
+    #[serde(default)]
+    pub answer: Option<Map<String, Value>>,
+}
+
+#[tool_router(router = tool_router_ask, vis = "pub(crate)")]
+impl WorkerMcpServer {
+    /// Send one message to the worker and return its reply.
+    ///
+    /// ONE tool, deliberately. The worker's own bound tools are NOT exposed:
+    /// they are the worker's private means, an MCP client has no business
+    /// driving them directly, and re-publishing them would let a caller run a
+    /// tool the worker's instructions and guardrails never chose to run.
+    #[tool(
+        name = "ask",
+        description = "Ask this Greentic worker a question, or continue a conversation with it. \
+Returns the worker's reply. Pass the `conversation_id` it returns to stay in the same \
+conversation.\n\n\
+When the worker needs more from you it answers with `awaiting_input: true` and an \
+`input_request` in `structuredContent`, listing the named fields it is waiting for. Answer it \
+by calling `ask` again on the SAME `conversation_id` with `answer` set to an object of those \
+field ids and the values you are submitting — `input_request.fields[].id` are the exact keys, \
+and to press one of `input_request.actions` put its id under `action`. `answer` and `message` \
+are independent: send `answer` alone to submit the form with nothing to say, or both to submit \
+it with a covering sentence.\n\n\
+Never put a credential in `answer` — no API key, token, password or other secret. It is form \
+content typed by an operator, it travels through this client's logs and prompt history, and a \
+worker reads its own secrets from the credentials staged for it, never from a tool argument."
+    )]
+    pub(crate) async fn ask(
+        &self,
+        Parameters(args): Parameters<AskArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let message = args
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|message| !message.is_empty());
+        // An empty object submits nothing, so it is the same as no `answer`
+        // at all rather than a submit of zero fields.
+        let answer = args.answer.as_ref().filter(|answer| !answer.is_empty());
+        if message.is_none() && answer.is_none() {
+            return Err(ErrorData::invalid_params(
+                "send `message`, `answer`, or both",
+                None,
+            ));
+        }
+        let conversation_id = match args.conversation_id.as_deref().map(str::trim) {
+            Some(id) if !id.is_empty() => {
+                if id.len() > MAX_CONVERSATION_ID_LEN || id.chars().any(char::is_control) {
+                    return Err(ErrorData::invalid_params("invalid `conversation_id`", None));
+                }
+                id.to_string()
+            }
+            _ => ulid::Ulid::new().to_string(),
+        };
+        let session_hint =
+            crate::interop::session_hint("mcp", &self.ctx.caller_key, &conversation_id);
+        let user = format!("mcp:{}", self.ctx.caller_key);
+
+        // Settle the true price BEFORE running anything. The transport priced
+        // this request from the caller's own `Mcp-Method` header, which a
+        // `tools/call` may announce as `tools/list`; this is what makes a turn
+        // cost a turn regardless.
+        let owed = TURN_COST - self.ctx.prepaid;
+        if owed > 0.0
+            && let Err(retry_after) = self.ctx.limiter.check(&self.ctx.caller_key, owed)
+        {
+            return Ok(failed(
+                &conversation_id,
+                &format!("too many turns from this connection; retry in {retry_after} seconds"),
+            ));
+        }
+
+        // The cap is per deployment and nothing queues: an MCP caller holds
+        // its connection open for the whole turn, so a queue would convert a
+        // burst into a pile of timeouts.
+        let Some(_permit) = self.ctx.turns.try_acquire(self.ctx.deployment_id) else {
+            return Ok(busy(&conversation_id));
+        };
+
+        // The submit shape a parked card node reads its answers back out of,
+        // built by the one function the agent-to-agent `data` part goes
+        // through — so the two surfaces cannot answer an input request
+        // differently. The field ids are deliberately not validated here
+        // (contract §9.4): this server does not hold the parked card, and a
+        // wrong id already fails the way a wrong id fails from webchat.
+        let payload = match answer {
+            Some(answer) => answer_payload(answer, message),
+            // `message` is `Some` on this arm — the refusal above is what
+            // makes that true — and an empty text is the same turn either
+            // way, so this reads the value rather than asserting it.
+            None => json!({ "text": message.unwrap_or_default() }),
+        };
+        // One event per turn that RAN — see the same comment in
+        // `a2a::rpc::send_message`. Everything refused above (neither a
+        // message nor an answer, a bad conversation id, the limiter, a full
+        // turn gate) ran nothing and records nothing.
+        let started = std::time::Instant::now();
+        let outcome = self.ctx.runner.run(&session_hint, &user, &payload).await;
+        let elapsed = started.elapsed();
+        if let Some(metering) = self.ctx.metering.as_ref() {
+            let usage = outcome
+                .as_ref()
+                .map(|replies| usage_from_replies(replies))
+                .unwrap_or_default();
+            metering.record(
+                Surface::Mcp,
+                self.ctx.credential_id.as_deref(),
+                usage,
+                elapsed,
+            );
+        }
+        let Ok(replies) = outcome else {
+            // A tool-level error, not a protocol error: the request was valid
+            // and reached the worker; the TURN is what failed.
+            return Ok(failed(
+                &conversation_id,
+                "the worker could not answer this turn",
+            ));
+        };
+
+        let projected = project_replies(
+            &replies,
+            "mcp",
+            &self.ctx.tenant,
+            &self.ctx.bundle_id,
+            &session_hint,
+        );
+        let mut texts: Vec<String> = Vec::new();
+        for item in &projected.items {
+            match item {
+                ReplyItem::Text(text) => texts.push(text.clone()),
+                // Only the card's plain-text fallback. MCP has no
+                // `acceptedOutputModes`, so an MCP caller can never opt in to
+                // an Adaptive Card (contract D10) and never receives one: the
+                // question it is being asked travels as `input_request`
+                // below, which a model can actually fill in.
+                ReplyItem::Card { fallback, .. } => texts.push(fallback.clone()),
+            }
+        }
+        // `awaiting_input` is always present, true or false. A flag that
+        // exists only when set cannot be told apart from a server that does
+        // not report it, and "is this conversation waiting for me" is the one
+        // question the text cannot answer.
+        let mut structured = json!({
+            "conversation_id": conversation_id,
+            "awaiting_input": projected.awaiting_input,
+        });
+        if projected.awaiting_input
+            && let Value::Object(map) = &mut structured
+        {
+            map.insert("input_request".to_string(), projected.input_request());
+        }
+
+        let content = if texts.is_empty() {
+            Vec::new()
+        } else {
+            vec![ContentBlock::text(texts.join("\n\n"))]
+        };
+        let mut result = if projected.flow_error {
+            // The flow ran and ended at a failure. `isError` is how an MCP
+            // client knows the answer is not an answer — without it the
+            // categorized error text reads as the worker's reply.
+            CallToolResult::error(content)
+        } else {
+            CallToolResult::success(content)
+        };
+        result.structured_content = Some(structured);
+        Ok(result)
+    }
+}
+
+/// A tool-level error carrying the conversation id, so a caller can retry the
+/// same conversation.
+///
+/// `awaiting_input` is present and `false` for the same reason it is on the
+/// success path: the key set must not depend on the outcome, or a caller has
+/// to tell "not waiting" apart from "did not say".
+fn failed(conversation_id: &str, message: &str) -> CallToolResult {
+    let mut result = CallToolResult::error(vec![ContentBlock::text(message.to_string())]);
+    result.structured_content =
+        Some(json!({ "conversation_id": conversation_id, "awaiting_input": false }));
+    result
+}
+
+fn busy(conversation_id: &str) -> CallToolResult {
+    failed(
+        conversation_id,
+        "this worker is running as many turns as it can at once; retry shortly",
+    )
+}
+
+#[tool_handler(router = self.tool_router)]
+impl ServerHandler for WorkerMcpServer {
+    fn get_info(&self) -> ServerInfo {
+        // Built through the constructors rather than a struct literal: both
+        // types are `#[non_exhaustive]`, so a literal would not compile — and
+        // that is the point, since a field added upstream must not silently
+        // acquire this crate's `Default`.
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "greentic-worker",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(format!(
+                "Talk to {}, a Greentic worker. Use `ask` to send a message; pass the \
+                 `conversation_id` it returns to continue the same conversation. When a \
+                 reply says `awaiting_input: true`, its `input_request` names the fields \
+                 the worker is waiting for — answer by calling `ask` again on the same \
+                 conversation with those field ids under `answer`.",
+                self.ctx.agent_name
+            ))
+    }
+}
+
+/// The `rmcp` transport for `POST /mcp`. Its settings are [`mcp_config`].
+pub(crate) fn service(
+    ctx: Arc<McpContext>,
+) -> StreamableHttpService<WorkerMcpServer, NeverSessionManager> {
+    StreamableHttpService::new(
+        move || Ok(WorkerMcpServer::new(Arc::clone(&ctx))),
+        // `NeverSessionManager`, not `LocalSessionManager`. With
+        // `legacy_session_mode = false` no session is ever created, so the two
+        // behave identically today — but this one makes the statelessness
+        // STRUCTURAL: if that flag is ever flipped back, session creation
+        // fails loudly here instead of quietly minting per-process sessions
+        // that break only behind a load balancer.
+        Arc::new(NeverSessionManager::default()),
+        mcp_config(),
+    )
+}
+
+/// The transport configuration [`service`] runs on, built separately so a
+/// test can read the values back — `StreamableHttpService` exposes none of
+/// them once constructed.
+///
+/// # Two `rmcp` defaults deliberately KEPT
+///
+/// **`stateless_protocol_metadata_required` stays `false`.** Setting it would
+/// refuse the ordinary (non-`initialize`) requests of any client negotiated
+/// below `2026-07-28`, which today is most of them — `rmcp` 3.1.4 shipped one
+/// day before that revision was written. Statelessness does not depend on it:
+/// `legacy_session_mode(false)` plus [`NeverSessionManager`] guarantee that
+/// independently.
+///
+/// **`allowed_origins` stays empty, so `Origin` validation is OFF.** What
+/// makes that safe is a property of this surface rather than of this line: the
+/// only credential accepted is a bearer token in `Authorization` (see
+/// [`super::auth`]), and `/mcp` is excluded from CORS
+/// (`crate::interop::mcp::is_cors_excluded`), so a browser cannot present a
+/// usable credential cross-origin — the preflight for `Authorization` never
+/// succeeds. ⚠️ Serving CORS on this path would make both this knob and
+/// `allowed_hosts` load-bearing, and they would have to be set in the same
+/// change.
+pub(crate) fn mcp_config() -> StreamableHttpServerConfig {
+    StreamableHttpServerConfig::default()
+        // ⚠️ `legacy_session_mode` DEFAULTS TO TRUE, and the default is wrong
+        // for this deployment in a way that cannot reproduce on one instance.
+        // The contract picks the stateless MCP core precisely so `/mcp` runs
+        // unchanged across many Cloud Run instances: no sticky sessions, no
+        // shared store. Left true, a client negotiating an OLDER revision
+        // still gets a session — held in this process only — and its next
+        // request lands on another instance, which answers
+        // `404 Not Found: Session not found`. Load-dependent and
+        // client-version-dependent, and invisible to a single local instance.
+        .with_legacy_session_mode(false)
+        // Prefer plain JSON for simple request/response tools; rmcp falls back
+        // to SSE by itself if a handler emits anything before the result.
+        .with_json_response(true)
+        // ⚠️ `allowed_hosts` DEFAULTS TO `["localhost", "127.0.0.1", "::1"]`,
+        // and an EMPTY list is `rmcp`'s documented "allow any host"
+        // (`host_is_allowed` returns `true` on an empty slice). Passing the
+        // empty vec is therefore a deliberate opt-out, not an oversight, and
+        // it must stay explicit: dropping this call silently restores the
+        // loopback default, which a public deployment fails every request
+        // against — rmcp reads the RAW `Host` (or HTTP/2 `:authority`) and
+        // never `X-Forwarded-Host`, so a proxied request presents the origin
+        // authority and is refused AFTER the token has verified. That took the
+        // designer's whole MCP surface down for a release, reading as a client
+        // bug. DNS rebinding, which the default defends against, needs a
+        // browser to make a CREDENTIALED request, and this surface accepts
+        // only a bearer header with no CORS.
+        .with_allowed_hosts(Vec::<String>::new())
+        // ⚠️ `max_request_body_bytes` DEFAULTS TO 4 MiB, four times what the
+        // sibling surfaces of this same ingress accept: every other POST is
+        // read through `revision_serve::read_body_limited` at
+        // [`MAX_BODY_BYTES`], and `/mcp` bypasses it because `rmcp` reads its
+        // own body. That gap was only ever reachable through `message`, which
+        // a caller has some reason to keep short; `ask` now also takes
+        // `answer`, an arbitrary JSON object, so it is the argument that makes
+        // the looser cap worth closing. A body over the cap is refused by the
+        // transport before any tool runs.
+        .with_max_request_body_bytes(crate::revision_serve::MAX_BODY_BYTES)
+}
+
+#[cfg(test)]
+#[path = "server_tests.rs"]
+mod server_tests;

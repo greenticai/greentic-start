@@ -255,6 +255,7 @@ mod tests {
             id: id.into(),
             kind: kind.into(),
             subscribes_to: vec![],
+            node_ids: vec![],
         }
     }
 

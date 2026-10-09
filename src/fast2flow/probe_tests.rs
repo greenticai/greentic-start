@@ -30,6 +30,7 @@ fn flow(id: &str) -> AppFlowInfo {
         id: id.to_string(),
         kind: "messaging".to_string(),
         subscribes_to: vec![],
+        node_ids: vec![],
     }
 }
 

@@ -1,0 +1,29 @@
+{
+  "schema": "greentic.triggers.v1",
+  "pack_id": "pack.acme.community",
+  "triggers": [
+    {
+      "trigger_id": "threads_replies",
+      "kind": "webhook",
+      "flow_id": "main",
+      "entry_node": "normalize_event",
+      "enabled": true,
+      "session": { "mode": "per_run" },
+      "limits": { "max_concurrency": 8, "max_firings_per_hour": 600 },
+      "source": { "extension_id": "greentic.webhook", "node_id": "threads_hook" },
+      "webhook": {
+        "methods": ["POST"],
+        "verify": {
+          "scheme": "hmac-sha256",
+          "header": "X-Hub-Signature-256",
+          "prefix": "sha256=",
+          "encoding": "hex",
+          "secret_ref": "threads/app_secret"
+        },
+        "challenge": { "scheme": "meta_hub", "verify_token_ref": "threads/verify_token" },
+        "max_body_bytes": 262144,
+        "allowed_sources": []
+      }
+    }
+  ]
+}

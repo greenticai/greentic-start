@@ -1,5 +1,19 @@
 name: publish-distroless
 
+# Publishes the STABLE image (`:latest`, `:vX.Y.Z`, `:X.Y.Z`) from `v*` tags.
+#
+# Multi-arch: each platform is built NATIVELY on its own runner (amd64 on
+# `ubuntu-latest`, arm64 on `ubuntu-24.04-arm`) and pushed by digest only; the
+# `merge` job then stitches the digests into one index under the tags above.
+# Same shape as `distroless-dev.yml`, which also build-checks both platforms on
+# pull requests that touch the image inputs.
+#
+# The `merge` job also builds a platform-release registration request for the
+# image INDEX digest (release-request.json, always uploaded). It is UNARMED:
+# it POSTs to the admin only when BOTH secrets RELEASE_ADMIN_URL and
+# RELEASE_PUBLISHER_KEY exist and register_dry_run is not true (empty on a tag
+# push). Arming steps: docs/runtime-release-registration.md. The dev lane
+# (`distroless-dev.yml`) is intentionally not registered.
 on:
   push:
     tags: ["v*"]
@@ -8,6 +22,10 @@ on:
       tag:
         description: "Existing v* tag to (re)build (e.g. v0.5.18)"
         required: true
+      register_dry_run:
+        description: "Only write release-request.json; never register with the admin"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -21,22 +39,32 @@ defaults:
   run:
     shell: bash
 
+env:
+  IMAGE: ghcr.io/greenticai/greentic-start-distroless
+
 jobs:
-  publish-distroless:
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.ref.outputs.tag }}
+      version: ${{ steps.ref.outputs.version }}
     steps:
       - name: Resolve build ref
         id: ref
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
             if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([+-].+)?$ ]]; then
               echo "::error::workflow_dispatch input.tag must match v<MAJOR>.<MINOR>.<PATCH>; got '$tag'"
               exit 1
             fi
           else
-            tag="${{ github.ref_name }}"
+            tag="$REF_NAME"
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=${tag#v}" >> "$GITHUB_OUTPUT"
@@ -46,15 +74,89 @@ jobs:
           ref: ${{ steps.ref.outputs.tag }}
 
       - name: Validate Cargo.toml version matches tag
+        env:
+          TAG: ${{ steps.ref.outputs.tag }}
+          TAG_VERSION: ${{ steps.ref.outputs.version }}
         run: |
           set -euo pipefail
           cargo_version=$(awk -F\" '/^version *=/ {print $2; exit}' Cargo.toml)
-          tag_version="${{ steps.ref.outputs.version }}"
-          if [ "$cargo_version" != "$tag_version" ]; then
-            echo "::error::tag ${{ steps.ref.outputs.tag }} does not match Cargo.toml version $cargo_version (refusing to retag :latest with mismatched build)"
+          if [ "$cargo_version" != "$TAG_VERSION" ]; then
+            echo "::error::tag $TAG does not match Cargo.toml version $cargo_version (refusing to retag :latest with mismatched build)"
             exit 1
           fi
-          echo "Cargo.toml version $cargo_version matches tag ${{ steps.ref.outputs.tag }}"
+          echo "Cargo.toml version $cargo_version matches tag $TAG"
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: prepare
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-latest
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract Docker metadata (labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+
+      - name: Build and push by digest ${{ matrix.platform }}
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.distroless
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -70,18 +172,76 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/greenticai/greentic-start-distroless
+          images: ${{ env.IMAGE }}
           tags: |
             type=raw,value=latest
-            type=raw,value=${{ steps.ref.outputs.tag }}
-            type=raw,value=${{ steps.ref.outputs.version }}
+            type=raw,value=${{ needs.prepare.outputs.tag }}
+            type=raw,value=${{ needs.prepare.outputs.version }}
 
-      - name: Build and push distroless greentic-start image
-        uses: docker/build-push-action@v6
+      - name: Create multi-arch manifest list and push
+        working-directory: ${{ runner.temp }}/digests
+        run: |
+          set -euo pipefail
+          count=$(find . -maxdepth 1 -type f | wc -l)
+          if [ "$count" -ne 2 ]; then
+            echo "::error::expected 2 platform digests (amd64, arm64), found $count"
+            exit 1
+          fi
+          # shellcheck disable=SC2046
+          docker buildx imagetools create \
+            $(jq -cr '.tags | map("-t " + .) | join(" ")' <<< "$DOCKER_METADATA_OUTPUT_JSON") \
+            $(printf "${IMAGE}@sha256:%s " *)
+
+      - name: Verify both platforms are in the index
+        run: |
+          set -euo pipefail
+          ref=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          docker buildx imagetools inspect "$ref"
+          platforms=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' \
+            | jq -r '[.manifests[] | select(.platform.os != "unknown") | .platform.architecture] | sort | join(",")')
+          if [ "$platforms" != "amd64,arm64" ]; then
+            echo "::error::index $ref has platforms '$platforms', expected 'amd64,arm64'"
+            exit 1
+          fi
+
+      - name: Resolve image index digest
+        id: index-digest
+        run: |
+          set -uo pipefail
+          ref=$(jq -r '.tags[0]' <<< "$DOCKER_METADATA_OUTPUT_JSON")
+          # Never fail the image publish here: an empty digest makes the
+          # registration step warn (unarmed) or fail (armed).
+          digest=$(docker buildx imagetools inspect "$ref" --format '{{json .Manifest}}' | jq -r .digest) || digest=""
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::warning::could not resolve a sha256 index digest for $ref (got '$digest')"
+            digest=""
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "Image index digest: $digest" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/checkout@v4
+        id: checkout
         with:
-          context: .
-          file: ./Dockerfile.distroless
-          push: true
-          platforms: linux/amd64
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Register runtime release (unarmed)
+        # Secrets are not readable in `if:`; the script no-ops (exit 0) when
+        # either is empty or DRY_RUN is "true". A 409 fails the job.
+        env:
+          ADMIN: ${{ secrets.RELEASE_ADMIN_URL }}
+          KEY: ${{ secrets.RELEASE_PUBLISHER_KEY }}
+          DIGEST: ${{ steps.index-digest.outputs.digest }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          GITHUB_SHA: ${{ steps.checkout.outputs.commit }}
+          DRY_RUN: ${{ inputs.register_dry_run || '' }}
+          OUT: release-request.json
+        run: python3 ci/register_runtime_release.py
+
+      - name: Upload release request
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-request
+          path: release-request.json
+          if-no-files-found: ignore
+          retention-days: 30

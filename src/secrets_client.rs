@@ -9,6 +9,40 @@ use std::path::{Path, PathBuf};
 
 use crate::secret_name;
 
+/// Serialises this process's own store rewrites. A delete publishes a rewritten
+/// file by rename, so a write racing it would be lost; writes and deletes from
+/// this client therefore take this lock. Another PROCESS writing the same file
+/// is not covered (none does on a deployed runtime).
+static STORE_MUTATION: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Hard-remove `uri` from the dev store file: `DevStore::copy_excluding` writes
+/// a sanitised copy under the store's own advisory lock (no ciphertext of the
+/// entry survives) and the copy replaces the store by atomic rename. An absent
+/// entry is a no-op.
+fn remove_entry(store_path: &Path, uri: &str) -> SecretResult<()> {
+    let backend = |err: &dyn std::fmt::Display| SecretError::Backend(err.to_string().into());
+    if !store_path.exists() {
+        return Ok(());
+    }
+    let mut tmp_name = store_path.as_os_str().to_owned();
+    tmp_name.push(format!(
+        ".delete-{}-{}.tmp",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+    ));
+    let tmp = PathBuf::from(tmp_name);
+    if let Err(err) = DevStore::copy_excluding(store_path, &tmp, &[uri]) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(backend(&err));
+    }
+    std::fs::rename(&tmp, store_path).map_err(|err| {
+        let _ = std::fs::remove_file(&tmp);
+        backend(&err)
+    })
+}
+
 pub struct SecretsClient {
     store_path: PathBuf,
 }
@@ -53,6 +87,7 @@ impl SecretsManager for SecretsClient {
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> SecretResult<()> {
+        let _guard = STORE_MUTATION.lock().await;
         let store = DevStore::with_path(self.store_path.clone())
             .map_err(|err| SecretError::Backend(err.to_string().into()))?;
         let canonical_path = canonicalize_dev_store_secret_uri(path);
@@ -66,12 +101,22 @@ impl SecretsManager for SecretsClient {
             .map_err(|err| SecretError::Backend(err.to_string().into()))
     }
 
-    async fn delete(&self, _: &str) -> SecretResult<()> {
-        Err(SecretError::Permission(
-            "dev secrets store is read-only".into(),
-        ))
+    async fn delete(&self, path: &str) -> SecretResult<()> {
+        let uri = canonicalize_dev_store_secret_uri(path).unwrap_or_else(|| path.to_string());
+        let _guard = STORE_MUTATION.lock().await;
+        remove_entry(&self.store_path, &uri)
     }
 }
+
+/// Provider segments whose key is stored verbatim — see
+/// `canonicalize_dev_store_secret_uri`.
+const MCP_CATEGORY: &str = "mcp";
+const A2A_CATEGORY: &str = "a2a";
+/// SoRLa route documents (`secrets://default/<tenant>/_/sorla/<sor>`), keyed
+/// by a hyphenated capability-URI pack segment that greentic-designer mints
+/// and greentic-runner-host's `sorla_route::resolve_route` reads verbatim —
+/// see `canonicalize_dev_store_secret_uri`.
+const SORLA_CATEGORY: &str = "sorla";
 
 fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     let trimmed = path.strip_prefix("secrets://")?;
@@ -79,12 +124,120 @@ fn canonicalize_dev_store_secret_uri(path: &str) -> Option<String> {
     if segments.len() != 5 {
         return None;
     }
+    // The `mcp`, `a2a` and `sorla` categories are exempt. greentic-designer-admin
+    // keys an MCP server's credential, and an external A2A agent's credential
+    // (`secrets://default/<tenant>/<team>/a2a/<agent_id>`), by a hyphenated
+    // UUID and writes it VERBATIM; greentic-designer keys a SoRLa route
+    // document (`secrets://default/<tenant>/_/sorla/<sor>`) by a hyphenated
+    // capability-URI pack segment, including the `<sor>.unit-<slug>-<hex>`
+    // per-unit form, and writes it VERBATIM too. greentic-runner reads all
+    // three verbatim (`greentic_aw_runtime::mcp_secrets`, the a2a equivalent,
+    // and `sorla_route::resolve_route`). Canonicalizing here (lowercase, and
+    // `-` to `_`) rewrote the lookup to `…/mcp/ff308b9c_951a_…` (or the a2a
+    // or sorla equivalent) and resolved nothing — silently, because an
+    // unresolved credential surfaces only as an ordinary node/dispatch error.
+    // Every other category keeps normalizing.
+    //
+    // greentic-deployer's `is_verbatim_category_rel_path`
+    // (`src/cli/secrets.rs`) is the writer that must list the same three
+    // categories, or a write and this read land on different keys.
+    if matches!(segments[3], MCP_CATEGORY | A2A_CATEGORY | SORLA_CATEGORY) {
+        return None;
+    }
+
     let canonical_key = secret_name::canonical_secret_key_path(segments[4]);
     if canonical_key == segments[4] {
         return None;
     }
     segments[4] = &canonical_key;
     Some(format!("secrets://{}", segments.join("/")))
+}
+
+#[cfg(test)]
+mod mcp_uri_tests {
+    use super::canonicalize_dev_store_secret_uri;
+
+    /// The `mcp` category is keyed by a hyphenated server UUID that
+    /// greentic-designer-admin writes VERBATIM, and greentic-runner reads
+    /// verbatim via `greentic_aw_runtime::mcp_secrets`. Canonicalizing it here
+    /// rewrote the lookup to `ff308b9c_951a_…` and resolved nothing — silently,
+    /// because a missing credential is reported as an ordinary MCP node error.
+    #[test]
+    fn an_mcp_uri_is_never_canonicalized() {
+        let uri = "secrets://default/acme/_/mcp/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri),
+            None,
+            "an mcp key must reach the store byte-for-byte"
+        );
+    }
+
+    /// Every other category keeps the existing behaviour.
+    #[test]
+    fn a_non_mcp_uri_still_canonicalizes() {
+        let uri = "secrets://local/acme/_/messaging-telegram/BOT-TOKEN";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri).as_deref(),
+            Some("secrets://local/acme/_/messaging-telegram/bot_token"),
+            "non-mcp keys must still be normalized"
+        );
+    }
+
+    /// The `a2a` category is keyed by a hyphenated agent UUID that
+    /// greentic-designer-admin writes VERBATIM
+    /// (`secrets://default/<tenant>/<team>/a2a/<agent_id>`). Canonicalizing it
+    /// here would rewrite the lookup to the underscored form and resolve
+    /// nothing — silently, since a missing credential surfaces only as an
+    /// ordinary A2A dispatch error.
+    #[test]
+    fn an_a2a_uri_is_never_canonicalized() {
+        let uri = "secrets://default/acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri),
+            None,
+            "an a2a key must reach the store byte-for-byte"
+        );
+    }
+
+    /// `a2a` only exempts the CATEGORY segment (index 3). The same literal
+    /// appearing elsewhere in the URI — e.g. as the tenant — must still be
+    /// canonicalized like any other segment.
+    #[test]
+    fn a2a_in_a_non_category_position_still_canonicalizes() {
+        let uri = "secrets://default/a2a/_/mypack/My-Secret";
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(uri).as_deref(),
+            Some("secrets://default/a2a/_/mypack/my_secret"),
+            "a2a is only exempt as the category segment"
+        );
+    }
+
+    /// The `sorla` category is keyed by a hyphenated capability-URI pack
+    /// segment that greentic-designer writes VERBATIM
+    /// (`secrets://default/<tenant>/_/sorla/<sor>`). Canonicalizing it here
+    /// would rewrite the lookup to the underscored form and resolve nothing —
+    /// silently, since a missing route document surfaces only as an ordinary
+    /// SoRLa dispatch error.
+    #[test]
+    fn a_sorla_route_document_uri_is_left_verbatim() {
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(
+                "secrets://default/default/_/sorla/landlord-tenant-sor"
+            ),
+            None,
+            "None means: look the URI up unchanged"
+        );
+    }
+
+    /// `sorla` only exempts the CATEGORY segment (index 3). A secret merely
+    /// NAMED `sorla` in a different category must still be canonicalized.
+    #[test]
+    fn a_key_merely_named_sorla_is_still_canonicalised() {
+        assert!(
+            canonicalize_dev_store_secret_uri("secrets://default/default/_/somepack/sorla-Key")
+                .is_some()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -171,6 +324,87 @@ mod tests {
         assert_eq!(value, b"xoxe-access".to_vec());
         let value = runtime.block_on(async { client.read(uri).await })?;
         assert_eq!(value, b"xoxe-access".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn round_trips_an_a2a_credential_under_its_hyphenated_agent_id() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let uri = "secrets://default/acme/_/a2a/ff308b9c-951a-40b8-acea-f62cdd19c8f3";
+        let seed = SeedDoc {
+            entries: vec![SeedEntry {
+                uri: uri.to_string(),
+                format: SecretFormat::Text,
+                value: SeedValue::Text {
+                    text: "a2a-bearer-token".to_string(),
+                },
+                description: None,
+            }],
+        };
+        let runtime = Runtime::new()?;
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 1);
+
+        let client = SecretsClient::open_with_path(store_path)?;
+        let value = runtime.block_on(async { client.read(uri).await })?;
+        assert_eq!(
+            value,
+            b"a2a-bearer-token".to_vec(),
+            "a hyphenated a2a agent id must resolve without canonicalization"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn round_trips_a_sorla_route_document_under_its_hyphenated_sor_id() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let store = DevStore::with_path(store_path.clone())?;
+        let shared_uri = "secrets://default/default/_/sorla/landlord-tenant-sor";
+        let unit_uri =
+            "secrets://default/default/_/sorla/landlord-tenant-sor.unit-abc-0123456789ab";
+        let seed = SeedDoc {
+            entries: vec![
+                SeedEntry {
+                    uri: shared_uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: r#"{"url":"https://sor.example","tenant":"landlord"}"#.to_string(),
+                    },
+                    description: None,
+                },
+                SeedEntry {
+                    uri: unit_uri.to_string(),
+                    format: SecretFormat::Text,
+                    value: SeedValue::Text {
+                        text: r#"{"url":"https://sor.example/unit-abc","tenant":"landlord"}"#
+                            .to_string(),
+                    },
+                    description: None,
+                },
+            ],
+        };
+        let runtime = Runtime::new()?;
+        let report =
+            runtime.block_on(async { apply_seed(&store, &seed, ApplyOptions::default()).await });
+        assert_eq!(report.ok, 2);
+
+        let client = SecretsClient::open_with_path(store_path)?;
+        let shared_value = runtime.block_on(async { client.read(shared_uri).await })?;
+        assert_eq!(
+            shared_value,
+            br#"{"url":"https://sor.example","tenant":"landlord"}"#.to_vec(),
+            "a hyphenated SoR id must resolve without canonicalization"
+        );
+        let unit_value = runtime.block_on(async { client.read(unit_uri).await })?;
+        assert_eq!(
+            unit_value,
+            br#"{"url":"https://sor.example/unit-abc","tenant":"landlord"}"#.to_vec(),
+            "the per-unit `<sor>.unit-<slug>-<hex>` form must resolve without canonicalization too"
+        );
         Ok(())
     }
 }

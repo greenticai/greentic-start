@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use base64::Engine as _;
 use greentic_types::ChannelMessageEnvelope;
@@ -24,7 +25,7 @@ use crate::runner_host::{DemoRunnerHost, OperatorContext};
 
 pub(super) fn route_messaging_envelopes(
     bundle: &Path,
-    runner_host: &DemoRunnerHost,
+    runner_host: &Arc<DemoRunnerHost>,
     provider: &str,
     ctx: &OperatorContext,
     envelopes: Vec<ChannelMessageEnvelope>,
@@ -45,6 +46,15 @@ pub(super) fn route_messaging_envelopes(
         ),
     );
 
+    // Channel "is typing" signal (docs/typing-signal.md): decided once per batch from
+    // the provider's declared ops, never by invoking and catching the refusal.
+    let typing = crate::typing::LegacyTyping::prepare(runner_host, provider, ctx, || {
+        Ok(
+            build_injected_config(runner_host, Domain::Messaging, provider, ctx)?
+                .map(decode_injected_config_for_provider),
+        )
+    });
+
     let probe_inputs = ProbeInputs {
         cfg: crate::fast2flow::Fast2FlowConfig::global(),
         ctx,
@@ -56,32 +66,43 @@ pub(super) fn route_messaging_envelopes(
     };
 
     for original in &envelopes {
-        let outputs = turn::turn_outputs(
-            bundle,
-            ctx,
-            &pack_info,
-            default_flow,
-            &app_pack_path,
-            original,
-            || {
-                // Per-envelope Fast2Flow probe (host router, then the
-                // embedded LLM fallback) — see `fast2flow::probe::probe`.
-                // Its owned decision is mapped back onto this pack's flows.
-                f2f_probe::probe(&probe_inputs, original)
-                    .and_then(|decision| routed(decision, &pack_info))
-            },
-            &mut |flow, envelope| {
-                run_app_flow_safe(
-                    runner_host,
-                    bundle,
-                    ctx,
-                    &app_pack_path,
-                    &pack_info,
-                    flow,
-                    envelope,
-                )
-            },
-        );
+        // Everything that makes up the turn — routing (Fast2Flow, LLM fallback), the
+        // flow run and ownership settling — runs with typing raised. Egress below
+        // starts only after typing has stopped.
+        let run_turn = || {
+            turn::turn_outputs(
+                bundle,
+                ctx,
+                &pack_info,
+                default_flow,
+                &app_pack_path,
+                original,
+                || {
+                    // Per-envelope Fast2Flow probe (host router, then the
+                    // embedded LLM fallback) — see `fast2flow::probe::probe`.
+                    // Its owned decision is mapped back onto this pack's flows.
+                    f2f_probe::probe(&probe_inputs, original)
+                        .and_then(|decision| routed(decision, &pack_info))
+                },
+                &mut |flow, envelope, entry_node| {
+                    run_app_flow_safe(
+                        runner_host,
+                        bundle,
+                        provider,
+                        ctx,
+                        &app_pack_path,
+                        &pack_info,
+                        flow,
+                        envelope,
+                        entry_node,
+                    )
+                },
+            )
+        };
+        let outputs = match typing.as_ref() {
+            Some(typing) => typing.around(original, run_turn),
+            None => run_turn(),
+        };
 
         for mut out_envelope in outputs {
             if let Some(team) = &ctx.team {
@@ -235,7 +256,7 @@ pub(super) fn route_messaging_envelopes(
     Ok(())
 }
 
-fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json::Value {
+pub(crate) fn decode_injected_config_for_provider(config: serde_json::Value) -> serde_json::Value {
     let Some(obj) = config.as_object() else {
         return config;
     };
@@ -486,15 +507,32 @@ fn read_card_from_pack(pack_path: &Path, card_key: &str) -> Option<serde_json::V
     serde_json::from_slice(&buf).ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_app_flow_safe(
     runner_host: &DemoRunnerHost,
     bundle: &Path,
+    provider: &str,
     ctx: &OperatorContext,
     app_pack_path: &Path,
     pack_info: &app::AppPackInfo,
     flow: &app::AppFlowInfo,
     envelope: &ChannelMessageEnvelope,
+    entry_node: Option<&str>,
 ) -> turn::FlowRun {
+    // Ids only, never message content — `envelope.text`/`entry_node` carry
+    // the user's text and must not be added as span attributes.
+    // `provider` is the messaging provider id the ingress route resolved
+    // (e.g. "messaging-webchat-gui"). NOT `envelope.channel`: for Direct Line
+    // that is the per-user conversation id — high-cardinality and not a
+    // provider at all.
+    let span = tracing::info_span!(
+        "messaging.turn",
+        greentic.provider = %provider,
+        greentic.tenant = %ctx.tenant,
+        greentic.pack_id = %pack_info.pack_id,
+        greentic.flow_id = %flow.id,
+    );
+    let _entered = span.enter();
     match app::run_app_flow(
         runner_host,
         bundle,
@@ -503,6 +541,7 @@ fn run_app_flow_safe(
         &pack_info.pack_id,
         &flow.id,
         envelope,
+        entry_node,
     ) {
         Ok(outputs) => turn::FlowRun {
             outputs,
@@ -539,9 +578,24 @@ const ROUTING_META_KEYS: &[&str] = &[
     "mcp_operation",
 ];
 
-// `CARD_NAV_META_KEYS` and `card_nav_target` live in `crate::fast2flow::turn`,
-// shared with the revision-serve path so both treat a card submit the same way.
-use crate::fast2flow::turn::card_nav_target;
+// `CARD_NAV_META_KEYS` (a subset of [`ROUTING_META_KEYS`]) and
+// `card_nav_target` live in `crate::fast2flow::turn`, shared with the
+// revision-serve path so both treat a card submit the same way.
+use crate::fast2flow::turn::{CARD_NAV_META_KEYS, card_nav_target};
+
+/// Drop the card-navigation directives from an envelope bound for the app flow.
+///
+/// These keys say WHERE TO GO, not what to render. The adaptive-card component
+/// prefers an inbound `nextCardId` over its node's own configured card asset,
+/// so an id that names a flow node (not a card) makes the first card node in
+/// the chain fail with `AC_ASSET_NOT_FOUND` — surfacing to the user as
+/// "Something went wrong with this service". The target is passed to the runner
+/// as the flow's entry node instead.
+fn strip_card_nav_keys(envelope: &mut ChannelMessageEnvelope) {
+    for key in CARD_NAV_META_KEYS {
+        envelope.metadata.remove(*key);
+    }
+}
 
 /// Inject form data from envelope metadata into every `Action.Submit` `data`
 /// object found in the card.  This ensures that when a user clicks a button on
@@ -998,6 +1052,7 @@ mod tests {
         let outputs = run_app_flow_safe(
             &runner_host,
             dir.path(),
+            "messaging-webchat-gui",
             &OperatorContext {
                 tenant: "demo".to_string(),
                 team: Some("default".to_string()),
@@ -1013,8 +1068,10 @@ mod tests {
                 id: "default".to_string(),
                 kind: "messaging".to_string(),
                 subscribes_to: vec![],
+                node_ids: vec![],
             },
             &original,
+            None,
         );
 
         assert!(outputs.failed, "an errored flow is reported as failed");
@@ -1022,6 +1079,86 @@ mod tests {
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].id, original.id);
         assert_eq!(outputs[0].text, original.text);
+    }
+
+    /// Pins the `messaging.turn` span's `greentic.provider` to the provider
+    /// id the ingress resolved — NOT `envelope.channel`, which for Direct
+    /// Line is the per-user conversation id — and pins that the span is a
+    /// child of whatever span is current (the `http.request` span in
+    /// production), so the turn lands in the request's trace.
+    #[test]
+    fn messaging_turn_span_records_the_provider_and_parents_to_the_request() {
+        let dir = tempdir().expect("tempdir");
+        let discovery = crate::discovery::discover(dir.path()).expect("discovery");
+        let secrets_handle =
+            secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
+                .expect("secrets handle");
+        let runner_host = DemoRunnerHost::new(
+            dir.path().to_path_buf(),
+            &discovery,
+            None,
+            secrets_handle,
+            false,
+        )
+        .expect("runner host");
+        let original = envelope();
+        let (subscriber, captured) = crate::request_span::capture::subscriber();
+        tracing::subscriber::with_default(subscriber, || {
+            let request = crate::request_span::request_span(
+                "POST",
+                "/v1/messaging/webchat/default/v3/directline/conversations/conv-1/activities",
+            );
+            let _entered = request.enter();
+            let _ = run_app_flow_safe(
+                &runner_host,
+                dir.path(),
+                "messaging-webchat-gui",
+                &OperatorContext {
+                    tenant: "demo".to_string(),
+                    team: Some("default".to_string()),
+                    correlation_id: None,
+                },
+                &dir.path().join("missing.gtpack"),
+                &AppPackInfo {
+                    pack_id: "app-pack".to_string(),
+                    flows: vec![],
+                    capabilities: Vec::new(),
+                },
+                &AppFlowInfo {
+                    id: "default".to_string(),
+                    kind: "messaging".to_string(),
+                    subscribes_to: vec![],
+                    node_ids: vec![],
+                },
+                &original,
+                None,
+            );
+        });
+
+        let requests = captured.named("http.request");
+        assert_eq!(requests.len(), 1, "one request span");
+        let turns = captured.named("messaging.turn");
+        assert_eq!(turns.len(), 1, "one turn span");
+        let turn = &turns[0];
+        assert_eq!(
+            turn.fields.get("greentic.provider").map(String::as_str),
+            Some("messaging-webchat-gui"),
+            "provider must be the resolved provider id"
+        );
+        assert_ne!(
+            turn.fields.get("greentic.provider").map(String::as_str),
+            Some(original.channel.as_str()),
+            "provider must never be the envelope channel (Direct Line conversation id)"
+        );
+        assert_eq!(
+            turn.parent,
+            Some(requests[0].id),
+            "turn must be a child of the request"
+        );
+        assert!(
+            !turn.fields.values().any(|v| v.contains("hello")),
+            "message content must never become a span attribute"
+        );
     }
 
     #[test]
@@ -1045,14 +1182,16 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
                 .expect("secrets");
-        let runner_host = DemoRunnerHost::new(
-            dir.path().to_path_buf(),
-            &discovery,
-            None,
-            secrets_handle,
-            false,
-        )
-        .expect("runner host");
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .expect("runner host"),
+        );
 
         let err = route_messaging_envelopes(
             dir.path(),
@@ -1086,14 +1225,16 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
                 .expect("secrets");
-        let runner_host = DemoRunnerHost::new(
-            dir.path().to_path_buf(),
-            &discovery,
-            None,
-            secrets_handle,
-            false,
-        )
-        .expect("runner host");
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .expect("runner host"),
+        );
 
         let mut card_routed = envelope();
         card_routed
@@ -1136,14 +1277,16 @@ mod tests {
         let secrets_handle =
             secrets_gate::resolve_secrets_manager(dir.path(), "demo", Some("default"))
                 .expect("secrets");
-        let runner_host = DemoRunnerHost::new(
-            dir.path().to_path_buf(),
-            &discovery,
-            None,
-            secrets_handle,
-            false,
-        )
-        .expect("runner host");
+        let runner_host = Arc::new(
+            DemoRunnerHost::new(
+                dir.path().to_path_buf(),
+                &discovery,
+                None,
+                secrets_handle,
+                false,
+            )
+            .expect("runner host"),
+        );
 
         let mut card_routed = envelope();
         card_routed
@@ -1164,6 +1307,59 @@ mod tests {
         assert!(
             result.is_err(),
             "expected egress error, proving the nextCardId alias took the card-routing fast-path"
+        );
+    }
+
+    #[test]
+    fn card_nav_keys_are_stripped_before_the_envelope_reaches_the_flow() {
+        // `nextCardId` says WHERE TO GO, not what to render. When it names a
+        // flow node the envelope is handed to the app flow — and every
+        // adaptive-card node downstream prefers an inbound nextCardId over its
+        // own configured card asset, so leaving it in makes the first card node
+        // fail with AC_ASSET_NOT_FOUND and the user sees a service error.
+        let mut env = envelope();
+        env.metadata
+            .insert("nextCardId".to_string(), "cap_company_name".to_string());
+        env.metadata
+            .insert("routeToCardId".to_string(), "cap_company_name".to_string());
+        env.metadata
+            .insert("toCardId".to_string(), "cap_company_name".to_string());
+        // Carried form data and locale must survive: the capture nodes read the
+        // form fields, and locale drives card i18n further down the flow.
+        env.metadata
+            .insert("company_name".to_string(), "Acme Ltd".to_string());
+        env.metadata
+            .insert("locale".to_string(), "en-GB".to_string());
+        // `action` must SURVIVE: the card node the run enters/resumes at routes
+        // on `response.action == "..."`. The engine makes it one-shot after
+        // that node has routed (`consume_routing_action`), so stripping it here
+        // would strand the journey on the card it started from.
+        env.metadata
+            .insert("action".to_string(), "continue".to_string());
+
+        strip_card_nav_keys(&mut env);
+
+        assert_eq!(
+            env.metadata.get("action").map(String::as_str),
+            Some("continue"),
+            "the action drives the entered/resumed card's own routing and must \
+             reach the flow; the engine consumes it once that node has routed"
+        );
+        for key in ["nextCardId", "routeToCardId", "toCardId"] {
+            assert!(
+                !env.metadata.contains_key(key),
+                "{key} is a navigation directive and must not reach the flow"
+            );
+        }
+        assert_eq!(
+            env.metadata.get("company_name").map(String::as_str),
+            Some("Acme Ltd"),
+            "form data must survive stripping"
+        );
+        assert_eq!(
+            env.metadata.get("locale").map(String::as_str),
+            Some("en-GB"),
+            "locale must survive stripping"
         );
     }
 

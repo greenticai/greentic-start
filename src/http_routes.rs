@@ -8,6 +8,7 @@
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context;
 use greentic_deploy_spec::{BundleId, DeploymentId, RevisionId};
@@ -54,9 +55,27 @@ pub struct HttpRouteDescriptor {
     #[allow(dead_code)]
     pub provider_type: Option<String>,
     pub domain: Domain,
+    /// The `.gtpack` this route was read from. Carried on the descriptor
+    /// because dispatch needs to reach back into the pack for the
+    /// `messaging.provider_ingress.v1` component that verifies the inbound
+    /// webhook's signature (see [`crate::provider_webhook_verify`]) — the
+    /// revision path has no other handle on the pack file.
+    pub pack_path: PathBuf,
     /// Deployment/bundle/revision this route belongs to, or `None` for a
     /// legacy single-bundle route (every route discovered today).
     pub scope: Option<RevisionScope>,
+    /// The revision's pinned `pack-config.v1.non_secret` map for this route's
+    /// pack — the deploy-time setup answers. Stamped by revision activation so
+    /// provider dispatch can hand them to the provider as `HttpInV1.config`
+    /// (see [`crate::revision_provider_config`]). `None` for legacy routes and
+    /// for packs whose revision carries no non-secret config.
+    pub pack_non_secret: Option<Arc<BTreeMap<String, serde_json::Value>>>,
+    /// Whether this route's provider declares the OPTIONAL `send_typing` op in its
+    /// `greentic.provider-extension.v1` `ops` — the same array the runner's
+    /// `declared_ops` allowlist check reads. Decided ONCE at revision activation so
+    /// the per-turn path never probes by invoking and catching the refusal. `false`
+    /// for legacy routes, which name no provider.
+    pub supports_typing: bool,
     /// Parsed segments from the pattern for matching.
     segments: Vec<RouteSegment>,
 }
@@ -104,7 +123,10 @@ pub(crate) fn descriptor_for_test(
         provider_op: INGEST_HTTP_OP.to_string(),
         provider_type: None,
         domain,
+        pack_path: PathBuf::from("<test-pack>"),
         scope,
+        pack_non_secret: None,
+        supports_typing: false,
         segments: parse_route_pattern(pattern),
     }
 }
@@ -126,7 +148,10 @@ pub(crate) fn provider_descriptor_for_test(
         provider_op: INGEST_HTTP_OP.to_string(),
         provider_type: Some(provider_type.to_string()),
         domain: Domain::Messaging,
+        pack_path: PathBuf::from("<test-pack>"),
         scope: Some(scope),
+        pack_non_secret: None,
+        supports_typing: false,
         segments: parse_route_pattern(pattern),
     }
 }
@@ -511,9 +536,14 @@ fn parse_http_routes_v1(
             provider_op: record.provider_op,
             provider_type: None,
             domain,
+            pack_path: pack_path.to_path_buf(),
             // Single-bundle discovery: no deployment provenance. B4's
             // runtime-config-backed discovery stamps `Some(..)`.
             scope: None,
+            pack_non_secret: None,
+            // Legacy http-routes.v1 names no provider; discovery may set it when a
+            // provider_type is inherited (see `discover_revision_routes`).
+            supports_typing: false,
             segments,
         });
     }
@@ -626,6 +656,17 @@ fn sole_ingest_http_provider_type(manifest: &PackManifest) -> Option<String> {
     Some(first.provider_type.clone())
 }
 
+/// Whether the manifest's `greentic.provider-extension.v1` declares `op` for the
+/// provider with `provider_type` — mirrors the runner's `declared_ops` allowlist.
+fn provider_declares_op(manifest: &PackManifest, provider_type: &str, op: &str) -> bool {
+    manifest.provider_extension_inline().is_some_and(|inline| {
+        inline
+            .providers
+            .iter()
+            .any(|p| p.provider_type == provider_type && p.ops.iter().any(|o| o == op))
+    })
+}
+
 fn synthesize_provider_routes_from_manifest(
     manifest: &PackManifest,
     pack_path: &Path,
@@ -664,7 +705,10 @@ fn synthesize_provider_routes_from_manifest(
                 provider_op: INGEST_HTTP_OP.to_string(),
                 provider_type: Some(provider.provider_type.clone()),
                 domain: Domain::Messaging,
+                pack_path: pack_path.to_path_buf(),
                 scope: Some(scope.clone()),
+                pack_non_secret: None,
+                supports_typing: provider.ops.iter().any(|op| op == crate::typing::TYPING_OP),
                 segments,
             });
         }
@@ -720,6 +764,8 @@ pub fn discover_revision_routes(
                         && let Some(pt) = pack_provider_type.as_deref()
                     {
                         route.provider_type = Some(pt.to_string());
+                        route.supports_typing =
+                            provider_declares_op(&manifest, pt, crate::typing::TYPING_OP);
                     }
                 }
                 routes.extend(declared);
@@ -1586,5 +1632,347 @@ pub(crate) mod tests {
             None,
             "unrelated deployment must not match any provider route",
         );
+    }
+
+    // ── Second-inbound-path tests ──────────────────────────────────────────
+    //
+    // A channel pack that needs a SECOND inbound path — an interactivity /
+    // button-callback endpoint distinct from the event webhook — expresses it
+    // by declaring `greentic.http-routes.v1` routes ALONGSIDE its
+    // `greentic.provider-extension.v1` provider. `discover_revision_routes`
+    // then stamps the pack's sole `ingest_http` `provider_type` onto those
+    // declared routes, which is the ONLY thing that stops
+    // `dispatch_provider_route` returning 501 for them. Nothing pinned that
+    // rule before; see `docs/approval-rail-ingress.md`.
+
+    /// Write a `.gtpack` whose manifest declares BOTH `provider-extension.v1`
+    /// providers AND `http-routes.v1` routes — the shape a channel pack uses
+    /// when one inbound path is not enough. `declared` is `(pattern,
+    /// provider_op)` pairs; every declared route is POST.
+    fn write_provider_pack_with_declared_routes(
+        path: &Path,
+        pack_id: &str,
+        provider_types: &[&str],
+        declared: &[(&str, &str)],
+    ) {
+        write_provider_pack_with_declared_routes_and_ops(
+            path,
+            pack_id,
+            provider_types,
+            &["ingest_http", "send"],
+            declared,
+        );
+    }
+
+    /// [`write_provider_pack_with_declared_routes`] with the providers' `ops` chosen.
+    fn write_provider_pack_with_declared_routes_and_ops(
+        path: &Path,
+        pack_id: &str,
+        provider_types: &[&str],
+        ops: &[&str],
+        declared: &[(&str, &str)],
+    ) {
+        use std::io::Write as _;
+        use zip::write::FileOptions;
+
+        let providers: Vec<serde_json::Value> = provider_types
+            .iter()
+            .map(|provider_type| {
+                serde_json::json!({
+                    "provider_type": provider_type,
+                    "capabilities": [],
+                    "ops": ops,
+                    "config_schema_ref": "config.schema.json",
+                    "runtime": {
+                        "component_ref": format!("{pack_id}-component"),
+                        "export": "schema-core-api",
+                        "world": "greentic:provider/schema-core@1.0.0"
+                    }
+                })
+            })
+            .collect();
+        let routes: Vec<serde_json::Value> = declared
+            .iter()
+            .map(|(pattern, provider_op)| {
+                serde_json::json!({
+                    "pattern": pattern,
+                    "methods": ["POST"],
+                    "provider_op": provider_op,
+                    "domain": "messaging"
+                })
+            })
+            .collect();
+
+        let manifest_json = serde_json::json!({
+            "schema_version": "1.0.0",
+            "pack_id": pack_id,
+            "version": "1.0.0",
+            "kind": "provider",
+            "publisher": "tests",
+            "extensions": {
+                greentic_types::PROVIDER_EXTENSION_ID: {
+                    "kind": greentic_types::PROVIDER_EXTENSION_ID,
+                    "version": "1.0.0",
+                    "inline": { "providers": providers }
+                },
+                EXT_HTTP_ROUTES_V1: {
+                    "kind": EXT_HTTP_ROUTES_V1,
+                    "version": "1.0.0",
+                    "inline": { "schema_version": 1, "routes": routes }
+                }
+            }
+        });
+        let manifest: greentic_types::PackManifest =
+            serde_json::from_value(manifest_json).expect("manifest deserializes");
+        let bytes = greentic_types::encode_pack_manifest(&manifest).expect("manifest encodes");
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("manifest.cbor", FileOptions::<()>::default())
+            .unwrap();
+        zip.write_all(&bytes).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// The load-bearing rule. A pack can already express a second inbound path
+    /// today: the declared interactivity route inherits the pack's sole
+    /// `ingest_http` `provider_type`, so it dispatches to the same provider
+    /// component as the synthesized event webhook instead of 501ing.
+    #[test]
+    fn a_declared_second_path_inherits_the_packs_sole_ingest_http_provider_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack_with_declared_routes(
+            &pack,
+            "messaging-slack",
+            &["messaging.slack.api"],
+            &[("/webhook/slack/interactivity", INGEST_HTTP_OP)],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+
+        let declared = routes
+            .iter()
+            .find(|r| r.pattern == "/webhook/slack/interactivity")
+            .expect("declared interactivity route discovered");
+        assert_eq!(
+            declared.provider_type.as_deref(),
+            Some("messaging.slack.api"),
+            "a declared route with no provider_type of its own must inherit the pack's sole \
+             ingest_http provider — without it dispatch_provider_route returns 501 and the \
+             second inbound path is dead",
+        );
+
+        // The synthesized event webhook is still there: the two paths coexist,
+        // which is what makes this a second path rather than a replacement.
+        // `messaging.slack.api` renders as `slack-api` — `derive_provider_name`
+        // strips `bot`/`graph`/`client`/`gui`/`webhook`, not `api`.
+        assert!(
+            routes.iter().any(|r| r.pattern == "/webhook/slack-api"),
+            "the synthesized event webhook must survive alongside the declared one",
+        );
+
+        // Both are matchable for the revision, and the more specific
+        // interactivity path wins over the event path.
+        let table = HttpRouteTable::from_descriptors(routes);
+        let hit = table
+            .match_request_for_revision("/webhook/slack/interactivity", "POST", &scope)
+            .expect("interactivity path matches");
+        assert_eq!(hit.descriptor.pattern, "/webhook/slack/interactivity");
+        assert_eq!(
+            hit.descriptor.provider_type.as_deref(),
+            Some("messaging.slack.api"),
+        );
+    }
+
+    /// A declared route may name a different provider op, so a second path can
+    /// reach a dedicated handler rather than being demultiplexed inside
+    /// `ingest_http`. `dispatch_provider_route` invokes
+    /// `descriptor.provider_op` verbatim.
+    #[test]
+    fn a_declared_second_path_keeps_its_own_provider_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack_with_declared_routes(
+            &pack,
+            "messaging-slack",
+            &["messaging.slack.api"],
+            &[("/webhook/slack/interactivity", "ingest_interactivity")],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+        let declared = routes
+            .iter()
+            .find(|r| r.pattern == "/webhook/slack/interactivity")
+            .expect("declared interactivity route discovered");
+        assert_eq!(
+            declared.provider_op, "ingest_interactivity",
+            "the declared provider_op must survive discovery — it is what \
+             dispatch_provider_route invokes on the component",
+        );
+        assert_eq!(
+            declared.provider_type.as_deref(),
+            Some("messaging.slack.api"),
+            "a non-default provider_op must not cost the route its inherited provider_type",
+        );
+    }
+
+    /// The ambiguity carve-out, stated as a decision rather than an accident:
+    /// with two `ingest_http` providers in one pack there is no single right
+    /// answer, so the declared route stays unstamped and 501s at dispatch
+    /// instead of being silently wired to whichever provider was listed first.
+    #[test]
+    fn a_declared_path_stays_unstamped_when_the_pack_has_two_ingest_http_providers() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("ambiguous.gtpack");
+        write_provider_pack_with_declared_routes(
+            &pack,
+            "ambiguous-pack",
+            &["messaging.slack.api", "messaging.telegram.bot"],
+            &[("/webhook/slack/interactivity", INGEST_HTTP_OP)],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+        let declared = routes
+            .iter()
+            .find(|r| r.pattern == "/webhook/slack/interactivity")
+            .expect("declared route still discovered");
+        assert!(
+            declared.provider_type.is_none(),
+            "two ingest_http providers is unresolvable at discovery time; guessing one would \
+             route a second inbound path to the wrong component",
+        );
+    }
+
+    /// The operational caveat a pack author has to know: deployment
+    /// `path_prefixes` are applied to SYNTHESIZED webhooks only. A declared
+    /// pattern is mounted verbatim, so under a prefix-bound deployment the
+    /// event webhook moves and the declared second path does not.
+    #[test]
+    fn a_declared_second_path_does_not_inherit_the_deployment_path_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack_with_declared_routes(
+            &pack,
+            "messaging-slack",
+            &["messaging.slack.api"],
+            &[("/webhook/slack/interactivity", INGEST_HTTP_OP)],
+        );
+
+        let scope = RevisionScope {
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("acme-bundle"),
+            revision_id: RevisionId::new(),
+        };
+        let routes = discover_revision_routes(&[pack], &scope, &["/acme".to_string()]);
+        let patterns: Vec<&str> = routes.iter().map(|r| r.pattern.as_str()).collect();
+        assert!(
+            patterns.contains(&"/acme/webhook/slack-api"),
+            "synthesized webhooks are mounted under the deployment prefix",
+        );
+        assert!(
+            patterns.contains(&"/webhook/slack/interactivity"),
+            "declared patterns are mounted verbatim — a pack author who wants a second path \
+             under a prefixed deployment must declare the prefix themselves",
+        );
+        assert!(
+            !patterns.contains(&"/acme/webhook/slack/interactivity"),
+            "nothing rewrites a declared pattern; asserting the absence keeps this caveat \
+             from being discovered in production",
+        );
+    }
+
+    #[test]
+    fn supports_typing_follows_declared_ops() {
+        let dir = tempfile::tempdir().unwrap();
+        let with = dir.path().join("tg.gtpack");
+        write_provider_pack(
+            &with,
+            "tg",
+            "messaging.telegram.bot",
+            &["ingest_http", "send_payload", "send_typing"],
+        );
+        let without = dir.path().join("sl.gtpack");
+        write_provider_pack(
+            &without,
+            "sl",
+            "messaging.slack.api",
+            &["ingest_http", "send_payload"],
+        );
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let routes = discover_revision_routes(&[with, without], &scope, &[]);
+        let by_type = |t: &str| {
+            routes
+                .iter()
+                .find(|r| r.provider_type.as_deref() == Some(t))
+                .unwrap()
+        };
+        assert!(by_type("messaging.telegram.bot").supports_typing);
+        assert!(
+            !by_type("messaging.slack.api").supports_typing,
+            "a provider that does not declare send_typing is never invoked for it"
+        );
+    }
+
+    #[test]
+    fn declared_route_inherits_supports_typing_from_its_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("wc.gtpack");
+        write_provider_pack_with_declared_routes_and_ops(
+            &pack,
+            "messaging-webchat-gui",
+            &["messaging.webchat-gui"],
+            &[
+                "ingest_http",
+                "directline_http",
+                "send_payload",
+                "send_typing",
+            ],
+            &[(
+                "/v3/directline/conversations/{id}/activities",
+                "directline_http",
+            )],
+        );
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+        let declared = routes
+            .iter()
+            .find(|r| r.provider_op == "directline_http")
+            .unwrap();
+        assert!(declared.supports_typing);
+    }
+
+    #[test]
+    fn declared_route_without_the_op_does_not_claim_typing() {
+        let dir = tempfile::tempdir().unwrap();
+        let pack = dir.path().join("slack.gtpack");
+        write_provider_pack_with_declared_routes(
+            &pack,
+            "messaging-slack",
+            &["messaging.slack.api"],
+            &[("/webhook/slack/interactivity", INGEST_HTTP_OP)],
+        );
+        let scope = scope_for(DeploymentId::new(), RevisionId::new());
+        let routes = discover_revision_routes(&[pack], &scope, &[]);
+        assert!(routes.iter().all(|r| !r.supports_typing));
+    }
+
+    #[test]
+    fn legacy_routes_never_claim_typing() {
+        assert!(!descriptor_for_test("/x", &["POST"], Domain::Messaging, None).supports_typing);
     }
 }

@@ -36,6 +36,13 @@ pub struct AppFlowInfo {
     /// (`event_router::select_target_flows`); the default-flow router
     /// (`route_events_to_default_flow`) ignores it.
     pub subscribes_to: Vec<String>,
+    /// Ids of the nodes this flow declares, resolved through the manifest's
+    /// `symbols.node_ids` table.
+    ///
+    /// The demo messaging host consults this to decide whether a card-nav
+    /// target is a FLOW NODE (hand it to the flow, so the node runs and can
+    /// attach the user's answers) or only a card asset (render it directly).
+    pub node_ids: Vec<String>,
 }
 
 pub fn resolve_app_pack_path(
@@ -241,6 +248,7 @@ Fix the pack manifest by marking one flow as id `default`, or by making exactly 
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn run_app_flow(
     runner_host: &DemoRunnerHost,
     bundle: &Path,
@@ -249,6 +257,7 @@ pub fn run_app_flow(
     pack_id: &str,
     flow_id: &str,
     envelope: &ChannelMessageEnvelope,
+    entry_node: Option<&str>,
 ) -> Result<Vec<ChannelMessageEnvelope>> {
     let mut envelope_for_flow = envelope.clone();
     inject_pack_setup_answers(
@@ -275,6 +284,7 @@ pub fn run_app_flow(
             "correlation_id": ctx.correlation_id,
         }),
         dist_offline: true,
+        entry_node: entry_node.map(str::to_string),
     };
 
     let output = runner_exec::run_provider_pack_flow(request)?;
@@ -286,8 +296,9 @@ pub fn run_app_flow(
     operator_log::info(
         module_path!(),
         format!(
-            "[messaging_app] run_app_flow completed run_dir={} target_node={} status={:?} failures={}",
+            "[messaging_app] run_app_flow completed run_dir={} entry_node={} target_node={} status={:?} failures={}",
             output.run_dir.display(),
+            entry_node.unwrap_or("<entrypoint>"),
             target_node.map(String::as_str).unwrap_or("<none>"),
             output.result.status,
             output.result.failures.len(),
@@ -663,8 +674,10 @@ fn extract_flows(value: &CborValue) -> Vec<AppFlowInfo> {
     if let CborValue::Map(map) = value {
         let flows_key = CborValue::Text("flows".to_string());
         if let Some(CborValue::Array(entries)) = map.get(&flows_key) {
+            let node_ids_table = symbol_table_array(map, "node_ids");
             for entry in entries {
-                if let Some(flow) = parse_flow_entry(entry) {
+                if let Some(mut flow) = parse_flow_entry(entry) {
+                    flow.node_ids = extract_flow_node_ids(entry, node_ids_table.map(Vec::as_slice));
                     flows.push(flow);
                 }
             }
@@ -760,7 +773,42 @@ fn parse_flow_entry(value: &CborValue) -> Option<AppFlowInfo> {
         id,
         kind: kind.unwrap_or_else(|| "messaging".to_string()),
         subscribes_to,
+        node_ids: Vec::new(),
     })
+}
+
+/// Resolve the node ids a flow entry declares, through `symbols.node_ids`.
+///
+/// The canonical encoder symbol-indexes each node id as an integer; an inline
+/// text id is also accepted for non-canonical encodings.
+fn extract_flow_node_ids(entry: &CborValue, node_ids_table: Option<&[CborValue]>) -> Vec<String> {
+    let CborValue::Map(entry_map) = entry else {
+        return Vec::new();
+    };
+    let Some(CborValue::Map(flow_map)) = entry_map.get(&CborValue::Text("flow".to_string())) else {
+        return Vec::new();
+    };
+    let Some(CborValue::Array(nodes)) = flow_map.get(&CborValue::Text("nodes".to_string())) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for node in nodes {
+        let CborValue::Map(node_map) = node else {
+            continue;
+        };
+        match node_map.get(&CborValue::Text("id".to_string())) {
+            Some(CborValue::Text(id)) => out.push(id.clone()),
+            Some(CborValue::Integer(idx)) => {
+                if let Some(CborValue::Text(id)) =
+                    node_ids_table.and_then(|table| table.get(*idx as usize))
+                {
+                    out.push(id.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    out
 }
 
 /// Extract a `Vec<String>` from a CBOR map field holding a text array;
@@ -1199,6 +1247,47 @@ pub(crate) fn parse_envelopes(
             format!(
                 "[messaging_app] parse_envelopes path=renderedCard title={} shape={}",
                 reply.text.as_deref().unwrap_or("Adaptive Card"),
+                summarize_output_shape(value)
+            ),
+        );
+        return Ok(vec![reply]);
+    }
+    // greentic-runner-host's `dw.agent` node output contract:
+    // `{"reply": "...", "trail": [...], "terminated_by": "..."}`. None of the
+    // shapes above matches it and none of the text fallbacks below reads
+    // `reply`, so before this branch existed every Designer-authored agentic
+    // worker turn logged `parse_envelopes failed` and the env-path caller
+    // (`revision_serve::build_reply_envelopes`) swallowed the Err and delivered
+    // nothing — the agent's answer was dropped silently.
+    //
+    // Deliberately NOT gated on `terminated_by`: `reply` alone is the signal,
+    // and a turn may carry the text without the terminator. An empty or
+    // whitespace-only `reply` FALLS THROUGH instead of producing a blank
+    // bubble — such a turn can still carry a `renderedCard` (handled above) or
+    // a `metadata.error_kind` (handled below), and either must win.
+    if let Some(text) = value
+        .get("reply")
+        .and_then(JsonValue::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        // `base_reply_envelope`, not a raw clone: this is a runner node output,
+        // so the reply needs the same fresh id / cleared inbound fields the
+        // text-fallback branch below gives every other runner-shaped reply.
+        let mut reply = base_reply_envelope(ingress_envelope);
+        reply.text = Some(text.to_string());
+        copy_directline_passthrough(value, &mut reply);
+        // AFTER the passthrough, so a runner-supplied `channelData` is already
+        // on the envelope and the provenance merges into it. The text bubble
+        // above is untouched either way: provenance rides on `channelData`
+        // only, and is absent entirely when the trail records neither a tool
+        // that ran nor a citable knowledge retrieval.
+        crate::agent_provenance::attach_provenance(value, &mut reply);
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[messaging_app] parse_envelopes path=agent_reply text_len={} shape={}",
+                text.len(),
                 summarize_output_shape(value)
             ),
         );
@@ -1662,11 +1751,13 @@ mod tests {
                     id: "alternate".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "default".to_string(),
                     kind: "workflow".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1680,11 +1771,13 @@ mod tests {
                     id: "notify".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "wizard".to_string(),
                     kind: "setup".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1706,16 +1799,19 @@ mod tests {
                     id: "main".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "on_message".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "order_tracking_flow".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1738,16 +1834,19 @@ mod tests {
                     id: "main".to_string(),
                     kind: "workflow".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "alpha".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "beta".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1769,11 +1868,13 @@ mod tests {
                     id: "one".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
                 AppFlowInfo {
                     id: "two".to_string(),
                     kind: "messaging".to_string(),
                     subscribes_to: vec![],
+                    node_ids: vec![],
                 },
             ],
             capabilities: Vec::new(),
@@ -1827,6 +1928,61 @@ mod tests {
                 .expect("default kind flow")
                 .kind,
             "messaging"
+        );
+    }
+
+    #[test]
+    fn extract_flows_resolves_each_flow_s_node_ids_through_the_symbol_table() {
+        // A card id that is ALSO a flow node must be handed to the flow, not
+        // rendered from the card asset — only a node that actually runs can
+        // attach the user's submitted answers for later nodes to read. That
+        // decision needs the flow's node ids, which the canonical encoder
+        // symbol-indexes as integers.
+        let manifest = CborValue::Map(BTreeMap::from([
+            (
+                CborValue::Text("symbols".to_string()),
+                CborValue::Map(BTreeMap::from([(
+                    CborValue::Text("node_ids".to_string()),
+                    CborValue::Array(vec![
+                        CborValue::Text("welcome".to_string()),
+                        CborValue::Text("quote_page1".to_string()),
+                        CborValue::Text("cap_company_name".to_string()),
+                    ]),
+                )])),
+            ),
+            (
+                CborValue::Text("flows".to_string()),
+                CborValue::Array(vec![CborValue::Map(BTreeMap::from([
+                    cbor_text("id", "main"),
+                    (
+                        CborValue::Text("flow".to_string()),
+                        CborValue::Map(BTreeMap::from([
+                            cbor_text("kind", "messaging"),
+                            (
+                                CborValue::Text("nodes".to_string()),
+                                CborValue::Array(vec![
+                                    CborValue::Map(BTreeMap::from([(
+                                        CborValue::Text("id".to_string()),
+                                        CborValue::Integer(0),
+                                    )])),
+                                    CborValue::Map(BTreeMap::from([(
+                                        CborValue::Text("id".to_string()),
+                                        CborValue::Integer(2),
+                                    )])),
+                                ]),
+                            ),
+                        ])),
+                    ),
+                ]))]),
+            ),
+        ]));
+
+        let flows = extract_flows(&manifest);
+        assert_eq!(flows.len(), 1);
+        assert_eq!(flows[0].node_ids, vec!["welcome", "cap_company_name"]);
+        assert!(
+            !flows[0].node_ids.iter().any(|n| n == "quote_page1"),
+            "only the nodes this flow declares may be listed"
         );
     }
 
@@ -2567,6 +2723,185 @@ mod tests {
     }
 
     #[test]
+    fn parse_envelopes_shapes_the_agent_reply_node_output() {
+        // greentic-runner-host's `dw.agent` node-output contract. Before the
+        // `reply` arm existed this shape matched nothing and every turn of a
+        // Designer-authored agentic worker was dropped with a
+        // `parse_envelopes failed` warning.
+        let ingress = envelope();
+        let output = json!({
+            "reply": "The order shipped on Tuesday.",
+            "trail": [{"node": "agent", "took_ms": 812}],
+            "terminated_by": "final_answer",
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].text.as_deref(),
+            Some("The order shipped on Tuesday.")
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_is_not_gated_on_terminated_by() {
+        // `reply` alone is the signal — a turn may carry text without the
+        // terminator, and gating on it would resurrect the silent drop.
+        let ingress = envelope();
+        let replies = parse_envelopes(&json!({ "reply": "  spaced answer  " }), &ingress)
+            .expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0].text.as_deref(),
+            Some("spaced answer"),
+            "reply text is trimmed"
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_blank_agent_reply_lets_the_rendered_card_win() {
+        // An empty `reply` must FALL THROUGH rather than emit a blank bubble:
+        // the same turn can still carry a card, which is the real answer.
+        let ingress = envelope();
+        let card = json!({
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [{"type": "TextBlock", "text": "card body"}]
+        });
+        let output = json!({
+            "reply": "   ",
+            "renderedCard": card.clone(),
+            "terminated_by": "final_answer",
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("renderedCard branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].text, None, "card branch sets no text bubble");
+        assert_eq!(
+            replies[0].extensions.get(ext_keys::ADAPTIVE_CARD),
+            Some(&card)
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_blank_agent_reply_lets_the_flow_error_win() {
+        // Same fall-through, against the last-resort error branch: a failed
+        // agent turn carries no reply text but must still surface the
+        // categorized error rather than being shaped as an empty reply.
+        let ingress = envelope();
+        let output = json!({
+            "reply": "",
+            "metadata": {
+                "error_kind": "flow_node_failed",
+                "error_message": "component weatherapi_current failed: MCP_TOOL_ERROR: 401 API key required",
+            }
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("flow_error branch");
+        assert_eq!(replies.len(), 1);
+        assert_eq!(
+            replies[0]
+                .metadata
+                .get("error_category")
+                .map(String::as_str),
+            Some("service_auth"),
+            "an empty reply must not preempt the flow-error branch"
+        );
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_forwards_directline_passthrough() {
+        let ingress = envelope();
+        let output = json!({
+            "reply": "here you go",
+            "terminated_by": "final_answer",
+            "channelData": {"directline": {"conversationId": "c-1"}},
+            "entities": [{"type": "mention", "text": "@user"}],
+            "suggestedActions": {"actions": [{"type": "imBack", "title": "More", "value": "more"}]},
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(reply.text.as_deref(), Some("here you go"));
+        assert!(reply.extensions.contains_key(ext_keys::CHANNEL_DATA));
+        assert!(reply.extensions.contains_key(ext_keys::ENTITIES));
+        assert!(reply.extensions.contains_key(ext_keys::SUGGESTED_ACTIONS));
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_carries_trail_provenance_on_channel_data() {
+        // The `trail` shape is `greentic_aw_runtime::AgentStep`, serialised
+        // with `#[serde(tag = "kind", rename_all = "snake_case")]`. Mapping
+        // lives in `crate::agent_provenance`; this asserts only that the reply
+        // arm reaches it and that the text bubble is unaffected.
+        let ingress = envelope();
+        let output = json!({
+            "reply": "Refunds are accepted within 30 days.",
+            "terminated_by": "final_reply",
+            "trail": [
+                {
+                    "kind": "tool_call",
+                    "name": "rag_search",
+                    "call_id": "call_1",
+                    "result": {"citations": [{
+                        "doc": "Refund policy",
+                        "source_file": "policies/refunds.pdf",
+                        "excerpt": "Refunds are accepted within 30 days.",
+                        "relevance_score": 0.96
+                    }]}
+                },
+                {"kind": "reply", "text": "Refunds are accepted within 30 days."}
+            ],
+        });
+
+        let replies = parse_envelopes(&output, &ingress).expect("agent_reply branch");
+        assert_eq!(replies.len(), 1);
+        let reply = &replies[0];
+        assert_eq!(
+            reply.text.as_deref(),
+            Some("Refunds are accepted within 30 days."),
+            "provenance must not change the text bubble"
+        );
+        let provenance = reply
+            .extensions
+            .get(ext_keys::CHANNEL_DATA)
+            .and_then(|data| data.get(crate::agent_provenance::CHANNEL_DATA_KEY))
+            .expect("provenance on channelData");
+        assert_eq!(provenance["tools"], json!(["rag_search"]));
+        assert_eq!(provenance["citations"][0]["doc"], json!("Refund policy"));
+    }
+
+    #[test]
+    fn parse_envelopes_agent_reply_is_identical_with_and_without_a_trail() {
+        // Provenance is additive: the same reply text, metadata and extension
+        // set either way — `channel_data` is the ONLY difference. A GUI that
+        // ignores provenance must see exactly the pre-existing envelope.
+        let ingress = envelope();
+        let bare = json!({"reply": "same answer", "terminated_by": "final_reply"});
+        let with_trail = json!({
+            "reply": "same answer",
+            "terminated_by": "final_reply",
+            "trail": [{"kind": "tool_call", "name": "rag_search", "call_id": "c1", "result": {}}],
+        });
+
+        let bare = parse_envelopes(&bare, &ingress).expect("agent_reply branch");
+        let with_trail = parse_envelopes(&with_trail, &ingress).expect("agent_reply branch");
+        assert_eq!(bare[0].text, with_trail[0].text);
+        assert_eq!(bare[0].metadata, with_trail[0].metadata);
+        assert!(
+            !bare[0].extensions.contains_key(ext_keys::CHANNEL_DATA),
+            "a reply with no trail keeps PR #566's behaviour exactly"
+        );
+        let extra: Vec<&String> = with_trail[0]
+            .extensions
+            .keys()
+            .filter(|key| !bare[0].extensions.contains_key(*key))
+            .collect();
+        assert_eq!(extra, vec![&ext_keys::CHANNEL_DATA.to_string()]);
+    }
+
+    #[test]
     fn load_app_pack_info_reads_manifest_pack_id_and_flows() {
         let dir = tempdir().expect("tempdir");
         let pack_path = dir.path().join("app.gtpack");
@@ -2913,6 +3248,7 @@ mod tests {
             "weatherapi-pack",
             "default",
             &env,
+            None,
         )
     }
 

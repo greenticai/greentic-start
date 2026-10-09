@@ -846,6 +846,58 @@ impl RevisionDispatcher {
         Some((entry.bundle_id.clone(), revision_id))
     }
 
+    /// Return the revision a conversation is pinned to, establishing a pin on
+    /// the CURRENT routable revision when none is live.
+    ///
+    /// This is the lazy re-pin used when a conversation outlives the pin store
+    /// that held its pin (a restart, a redeploy, another replica, a pin TTL):
+    /// the durable conversation state is still there, the in-memory
+    /// conversation -> revision pin is not.
+    ///
+    /// Rules, all inherited from [`RevisionPinStore::try_pin`] rather than
+    /// re-implemented here:
+    /// - a live pin to a routable revision is returned untouched, a draining
+    ///   revision included — an old revision still serving traffic during a
+    ///   rolling deploy keeps its conversations;
+    /// - otherwise a weighted healthy revision is chosen and written
+    ///   insert-if-absent, so two racing callers end up on the same revision and
+    ///   exactly one pin is stored;
+    /// - a store that declines to persist (`Skipped`) still routes this one
+    ///   call.
+    ///
+    /// The CALLER must have authenticated the request and proven the
+    /// conversation exists before calling: nothing here checks either, and a
+    /// pin is bounded only by the store's own caps and TTL.
+    ///
+    /// `None` when the deployment is unknown or has no healthy revision.
+    pub async fn establish_pin<R: Rng + ?Sized>(
+        &self,
+        tenant: &str,
+        deployment_id: DeploymentId,
+        hint: &str,
+        rng: &mut R,
+    ) -> Option<(BundleId, RevisionId)> {
+        if let Some(found) = self.lookup_pin(tenant, deployment_id, hint).await {
+            return Some(found);
+        }
+        let snap = self.snapshot.load();
+        let entry = snap.deployments.get(&deployment_id)?;
+        let selected = weighted_pick_healthy(&entry.revisions, &entry.draining, rng).ok()?;
+        let key = self.pin_key_raw(self.env_id.as_str(), deployment_id, tenant, hint);
+        let revision_id = match self
+            .pin_store
+            .try_pin(key, selected, entry.generation, self.pin_ttl)
+            .await
+        {
+            PinOutcome::Inserted { revision_id } | PinOutcome::Skipped { revision_id } => {
+                revision_id
+            }
+            PinOutcome::Existing { revision_id } if has_revision(entry, revision_id) => revision_id,
+            PinOutcome::Existing { .. } => selected,
+        };
+        Some((entry.bundle_id.clone(), revision_id))
+    }
+
     /// Single [`PinKey`] construction site so the lookup, try_pin, and
     /// commit_pin call sites can't drift on field order or selection.
     fn pin_key_raw<'a>(
@@ -2553,6 +2605,96 @@ mod tests {
         assert_eq!(
             result, None,
             "lookup_pin must return None when no pin exists"
+        );
+    }
+
+    #[tokio::test]
+    async fn establish_pin_creates_a_pin_when_none_is_live() {
+        let dep_id = dep();
+        let rev_id = rev();
+        let d = dispatcher_with(dep_id, vec![entry(rev_id, 10_000)]);
+        assert_eq!(d.lookup_pin("t1", dep_id, "webchat:c").await, None);
+        let mut rng = StdRng::seed_from_u64(1);
+        let got = d.establish_pin("t1", dep_id, "webchat:c", &mut rng).await;
+        assert_eq!(got.map(|(_, r)| r), Some(rev_id));
+        assert_eq!(
+            d.lookup_pin("t1", dep_id, "webchat:c")
+                .await
+                .map(|(_, r)| r),
+            Some(rev_id),
+            "the pin must now be stored, so the next lookup (the WS path) finds it"
+        );
+    }
+
+    #[tokio::test]
+    async fn establish_pin_never_replaces_a_live_pin() {
+        // A conversation pinned to an older revision that is still serving
+        // (still weighted, or draining during a rolling deploy) stays there.
+        let dep_id = dep();
+        let old = rev();
+        let new = rev();
+        let d = dispatcher_with(dep_id, vec![entry(old, 5_000), entry(new, 5_000)]);
+        d.commit_pin("t1", dep_id, "webchat:c", old).await;
+        let mut rng = StdRng::seed_from_u64(2);
+        for _ in 0..16 {
+            let got = d.establish_pin("t1", dep_id, "webchat:c", &mut rng).await;
+            assert_eq!(got.map(|(_, r)| r), Some(old));
+        }
+    }
+
+    #[tokio::test]
+    async fn establish_pin_is_scoped_to_tenant_and_conversation() {
+        let dep_id = dep();
+        let r = rev();
+        let d = dispatcher_with(dep_id, vec![entry(r, 10_000)]);
+        let mut rng = StdRng::seed_from_u64(3);
+        d.establish_pin("t1", dep_id, "webchat:a", &mut rng).await;
+        assert_eq!(d.lookup_pin("t1", dep_id, "webchat:b").await, None);
+        assert_eq!(d.lookup_pin("t2", dep_id, "webchat:a").await, None);
+    }
+
+    #[tokio::test]
+    async fn establish_pin_is_none_for_an_unknown_deployment() {
+        let d = dispatcher_with(dep(), vec![entry(rev(), 10_000)]);
+        let mut rng = StdRng::seed_from_u64(4);
+        assert_eq!(
+            d.establish_pin("t1", dep(), "webchat:c", &mut rng).await,
+            None
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_establish_pin_calls_converge_on_one_revision() {
+        let dep_id = dep();
+        let r1 = rev();
+        let r2 = rev();
+        let d = std::sync::Arc::new(dispatcher_with(
+            dep_id,
+            vec![entry(r1, 5_000), entry(r2, 5_000)],
+        ));
+        let mut tasks = Vec::new();
+        for i in 0..64u64 {
+            let d = std::sync::Arc::clone(&d);
+            tasks.push(tokio::spawn(async move {
+                let mut rng = StdRng::seed_from_u64(i);
+                d.establish_pin("t1", dep_id, "webchat:race", &mut rng)
+                    .await
+                    .map(|(_, r)| r)
+            }));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for t in tasks {
+            seen.insert(t.await.expect("task").expect("a revision"));
+        }
+        assert_eq!(seen.len(), 1, "every racer must see the same revision");
+        let stored = d
+            .lookup_pin("t1", dep_id, "webchat:race")
+            .await
+            .map(|(_, r)| r);
+        assert_eq!(
+            stored,
+            seen.into_iter().next(),
+            "and that is the stored pin"
         );
     }
 }

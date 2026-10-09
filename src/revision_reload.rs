@@ -411,6 +411,7 @@ pub(crate) fn default_rebuild(
     pin_store: Arc<dyn RevisionPinStore>,
     activation_rt: tokio::runtime::Handle,
     revision_stores: revision_boot::RevisionStores,
+    durable: crate::durable_state::DurableStorage,
     initial: Option<(LoadedRuntimeConfig, Environment)>,
 ) -> impl FnMut() -> Result<ReloadOutcome> + Send + 'static {
     // Seed the dedup snapshot with the inputs the COLD-START activation was
@@ -431,6 +432,7 @@ pub(crate) fn default_rebuild(
             &pin_store,
             &activation_rt,
             &revision_stores,
+            &durable,
             &mut last,
         )
     }
@@ -483,6 +485,7 @@ fn rebuild_once(
     pin_store: &Arc<dyn RevisionPinStore>,
     activation_rt: &tokio::runtime::Handle,
     revision_stores: &revision_boot::RevisionStores,
+    durable: &crate::durable_state::DurableStorage,
     last: &mut Option<LastReloadInputs>,
 ) -> Result<ReloadOutcome> {
     let (mut rc, mut environment) = load_reload_inputs(store_root, env_id)?;
@@ -595,6 +598,7 @@ fn rebuild_once(
             Arc::clone(runtime_ref_resolver),
             Arc::clone(pin_store),
             revision_stores,
+            durable,
         ))?;
     *last = Some(LastReloadInputs {
         rc,
@@ -611,6 +615,7 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc as std_mpsc;
+    use std::time::Instant;
 
     /// A counting rebuild closure suitable for unit tests. Returns
     /// `Unchanged` always (no real activation is built) but increments a
@@ -699,6 +704,8 @@ mod tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 app_packs: Default::default(),
+                triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -722,6 +729,8 @@ mod tests {
                 updates_enabled: false,
                 auto_restart_enabled: false,
                 exe_path: None,
+                public_base_url: None,
+                public_url_capture: None,
             })
             .expect("placeholder server"),
         )
@@ -893,32 +902,104 @@ mod tests {
             .expect("watcher must fire after the runtime-config is deleted");
     }
 
-    #[test]
-    fn watcher_coalesces_burst_writes_into_one_rebuild() {
+    /// Outcome of one attempt of the coalescing burst below.
+    enum BurstAttempt {
+        /// The burst landed inside one debouncer tick; carries how many
+        /// rebuild batches the watcher fired for it.
+        Rebuilds(usize),
+        /// The machine was too slow to land the burst inside one tick, so the
+        /// attempt never exercised coalescing; carries the burst it measured.
+        BurstTooSlow(Duration),
+    }
+
+    /// Writes five runtime-configs back to back under a watcher debounced at
+    /// `debounce`, and reports how many rebuild batches came back.
+    ///
+    /// `notify-debouncer-full` expires each event `debounce` after that
+    /// event's own timestamp, and only sweeps on a tick boundary (tick =
+    /// debounce/4 when unset). A burst therefore collapses into one batch
+    /// only while it fits inside a single tick: spread it wider and the early
+    /// writes expire in an earlier sweep than the late ones, which is a
+    /// legitimate second rebuild rather than a coalescing bug. So the burst is
+    /// timed against the tick — not against the whole debounce — and a burst
+    /// that overruns it is reported back for a wider window instead of being
+    /// read as a broken debouncer.
+    fn burst_rebuilds(debounce: Duration) -> BurstAttempt {
+        let tick = debounce / 4;
+
         let env = fresh_env_dir();
-        let counter = Arc::new(AtomicUsize::new(0));
+        let (tx, rx) = std_mpsc::channel();
         let _handle = spawn_runtime_config_watcher(
             env.path().to_path_buf(),
-            Duration::from_millis(200),
+            debounce,
             Duration::ZERO,
             placeholder_server(),
-            counting_rebuild(Arc::clone(&counter)),
+            channel_rebuild(tx),
             |_: &Activation| {},
             || {},
         )
         .expect("spawn watcher");
 
-        // Five back-to-back writes well within the 200ms debounce window.
+        let burst_started = Instant::now();
         for i in 0..5 {
             write_runtime_config(env.path(), &format!(r#"{{"i":{i}}}"#));
         }
+        let burst = burst_started.elapsed();
+        if burst > tick {
+            return BurstAttempt::BurstTooSlow(burst);
+        }
 
-        // Wait past the debounce window plus a safety margin.
-        std::thread::sleep(Duration::from_millis(800));
-        let observed = counter.load(Ordering::SeqCst);
-        assert!(
-            (1..=2).contains(&observed),
-            "burst of 5 writes must coalesce to ~1 rebuild (saw {observed})"
+        // Await the flush; do NOT sleep a fixed margin past the debounce.
+        // The sweep carrying the burst lands anywhere in
+        // `[debounce, debounce + tick]` depending on how the burst aligns
+        // with the tick the debouncer thread is already sleeping in, so wait
+        // on the channel with a ceiling well past that instead.
+        rx.recv_timeout(debounce + Duration::from_secs(3))
+            .expect("burst of 5 writes must produce a rebuild");
+
+        // Coalescing is the actual claim: the other four writes must not each
+        // produce a rebuild of their own. A burst inside one tick can still
+        // straddle a sweep boundary, so one straggler batch is allowed — it
+        // arrives at most `debounce + tick` after the first, which two
+        // debounces of quiet cover with margin.
+        let mut rebuilds = 1;
+        while rx.recv_timeout(debounce * 2).is_ok() {
+            rebuilds += 1;
+        }
+        BurstAttempt::Rebuilds(rebuilds)
+    }
+
+    #[test]
+    fn watcher_coalesces_burst_writes_into_one_rebuild() {
+        // Coalescing only means anything relative to the debounce window, and
+        // five small writes are not reliably fast on a shared runner — CI has
+        // stretched them to ~200ms. Widen the window until the burst fits
+        // inside one tick instead of failing on how loaded the machine was;
+        // only a machine that cannot manage even the widest window fails, and
+        // it says so as a machine problem rather than as "did not coalesce".
+        const DEBOUNCES: [Duration; 3] = [
+            Duration::from_millis(200),
+            Duration::from_millis(800),
+            Duration::from_millis(3_200),
+        ];
+
+        let mut slowest_burst = Duration::ZERO;
+        for debounce in DEBOUNCES {
+            match burst_rebuilds(debounce) {
+                BurstAttempt::Rebuilds(rebuilds) => {
+                    assert!(
+                        rebuilds <= 2,
+                        "burst of 5 writes must coalesce to ~1 rebuild (saw {rebuilds} at a {debounce:?} debounce)"
+                    );
+                    return;
+                }
+                BurstAttempt::BurstTooSlow(burst) => {
+                    slowest_burst = slowest_burst.max(burst);
+                }
+            }
+        }
+        panic!(
+            "burst of 5 writes took up to {slowest_burst:?}, overrunning the tick of every debounce in {DEBOUNCES:?} — this machine is too slow to exercise coalescing"
         );
     }
 

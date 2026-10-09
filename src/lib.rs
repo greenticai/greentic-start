@@ -7,6 +7,11 @@ use clap::error::ErrorKind;
 
 mod admin_certs;
 mod admin_server;
+mod agent_provenance;
+// `pub` (doc-hidden) so `tests/approval_rail_live_broker.rs` can drive the
+// bridge against a real NATS without a bundle or a Slack workspace.
+#[doc(hidden)]
+pub mod approval_rail;
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
@@ -28,11 +33,13 @@ mod discovery;
 mod doctor;
 mod doctor_env;
 mod domains;
+mod durable_state;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
 mod gtunnel;
 mod gtunnel_agent;
+mod sorla_state;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
 // `select_target_flows` and the event-routing types directly.
 #[doc(hidden)]
@@ -46,9 +53,11 @@ mod http_ingress;
 mod http_routes;
 mod identify_payload;
 mod ingress;
+mod ingress_auth;
 mod ingress_dispatch;
 #[doc(hidden)]
 pub mod ingress_types;
+mod interop;
 mod llm;
 #[doc(hidden)]
 pub mod messaging_app;
@@ -64,6 +73,7 @@ mod offers;
 mod onboard;
 mod operator_i18n;
 mod operator_log;
+pub(crate) mod otlp_status;
 mod otlp_telemetry;
 #[doc(hidden)]
 pub mod perf_harness;
@@ -72,13 +82,16 @@ mod post_ingress_hooks;
 mod project;
 mod provider_auth;
 pub mod provider_config_envelope;
+mod provider_webhook_verify;
 mod qa_persist;
 mod redis_tls;
+mod request_span;
 mod revision_boot;
 mod revision_dispatcher;
 mod revision_drain;
 pub mod revision_health_gate;
 mod revision_pin;
+mod revision_provider_config;
 mod revision_pull;
 mod revision_reload;
 mod revision_secrets;
@@ -97,13 +110,17 @@ mod secret_requirements;
 mod secret_value;
 mod secrets_backend;
 mod secrets_client;
+mod secrets_door;
 mod secrets_gate;
 mod secrets_manager;
 mod secrets_provider_binding;
 mod secrets_setup;
+mod seed_copy;
+mod seed_pointer;
 mod services;
 mod session_hint_extractor;
 mod setup_input;
+mod setup_surface;
 mod setup_to_formspec;
 mod startup_contract;
 mod state_layout;
@@ -114,6 +131,7 @@ mod subscriptions_universal;
 pub mod supervisor;
 #[cfg(test)]
 mod test_fixtures;
+mod triggers;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive `poll_once`
 // and the config/state/eval types directly, the same way `ws_test_support`
 // and `perf_harness` are exposed for their own integration tests.
@@ -121,8 +139,10 @@ mod test_fixtures;
 pub mod threshold_watcher;
 mod timer_scheduler;
 mod topic_match;
+mod trace_stderr;
 mod tunnel_prompt;
 mod tunnel_state;
+mod typing;
 mod warmup;
 mod webchat_routing;
 mod webhook_secret_resolver;
@@ -138,6 +158,7 @@ pub use cli_args::{
     CloudflaredModeArg, GtunnelModeArg, NatsModeArg, NgrokModeArg, RestartTarget, StartRequest,
     StopRequest,
 };
+pub use seed_copy::seed_env_store_from;
 
 /// Tenant assumed when the operator names none.
 ///
@@ -469,6 +490,13 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
     }
 
+    // Init-container-less platforms (Cloud Run, ACA, Fargate) inject the
+    // env-store seed as a read-only mount; copy it into the writable,
+    // $HOME-rooted store before `bootstrap_local_environment` opens it
+    // write+flock. No-op unless GREENTIC_SEED_DIR is set. Must run before the
+    // first store access.
+    seed_copy::maybe_seed_env_store()?;
+
     bootstrap_local_environment()?;
 
     // N1.2: bundle-less cold start. When launched without `--bundle` / `--config`,
@@ -481,9 +509,17 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     // an embedded runner host, run requests through the revision dispatcher.
     if bundle_less {
         let env_id = resolve_env(request.env.as_deref());
-        let rc = runtime_config::load_or_empty(&env_id)?;
-        let store_root = greentic_deployer::environment::LocalFsStore::default_root()
+        // `--store-root` overrides the home-rooted default so an operator can
+        // serve an env home staged at an arbitrary path — which is how
+        // greentic-deployer's `op` provisions one per environment. Without the
+        // flag this is byte-for-byte the previous behaviour.
+        let store_root = runtime_config::env_store_root(request.store_root.as_deref())
             .context("cannot determine the default environment store root (no home directory)")?;
+        // Read the config from the SAME root we serve from. `env_dir_in` already
+        // takes the root explicitly; reading the config from any other root
+        // would silently load the default store's config while serving the
+        // overridden store's revisions.
+        let rc = runtime_config::load_or_empty_in(&store_root, &env_id)?;
         let env_dir = runtime_config::env_dir_in(&store_root, &env_id)?;
 
         // P7e: capture the exe path ONCE, before any binary swap can
@@ -734,8 +770,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             .tenant_org_id
             .as_deref()
             .unwrap_or(crate::rollout_telemetry::LOCAL_TENANT_FALLBACK);
+        // The env dir's ORIGIN decides which dev store this reads. An operator
+        // who passed `--store-root` staged secrets under it with
+        // `op --store-root <root> secrets put`; without this the reader
+        // resolves the home-rooted store instead and every credentialed read
+        // misses with nothing red anywhere. See `dev_store_path`.
+        let env_dir_origin = request.env_dir_origin();
         let (secrets, secrets_tenant_scope) =
-            crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant)?;
+            crate::secrets_gate::resolve_serve_secrets_manager(&env_dir, tenant, env_dir_origin)?;
         // Clone for the runtime-config watcher's rebuild closure (N2.2): it
         // needs the same backend to rebuild activations after the deployer
         // rewrites `runtime-config.json`. `DynSecretsManager` is `Arc<dyn ...>`,
@@ -750,27 +792,94 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // activation serves real revisions instead of probes only. A worker
         // whose packs already sit on a persisted volume has a non-empty
         // runtime-config and skips the pull.
+        //
+        // On a per-revision workload (`GREENTIC_REVISION_ID` set — Cloud Run
+        // units, K8s workers) a sibling unit's broken bundle is skipped rather
+        // than taking this process down with it; see
+        // `revision_pull::pull_and_materialize_bundle_revisions`.
         let rc = if rc.revisions.is_empty() {
+            let own_revision = revision_pull::own_revision_from_env();
             let pulled = revision_pull::pull_and_materialize_bundle_revisions(
                 &env_store,
                 &env_typed,
                 &env_dir,
                 &environment,
+                own_revision.as_deref(),
             )?;
-            if pulled > 0 {
+            if pulled.wrote_runtime_config() {
                 operator_log::info(
                     module_path!(),
                     format!(
-                        "materialized {pulled} revision(s) from bundle sources for env `{env_id}`"
+                        "materialized {} revision(s) from bundle sources for env `{env_id}` \
+                         ({} foreign revision(s) skipped)",
+                        pulled.materialized,
+                        pulled.skipped.len()
                     ),
                 );
-                runtime_config::load_or_empty(&env_id)?
+                // Same root the pull wrote to. This used to be the
+                // root-implicit `load_or_empty`, which read the DEFAULT store
+                // under `--store-root` and so booted zero revisions there.
+                runtime_config::load_or_empty_in(&store_root, &env_id)?
             } else {
                 rc
             }
         } else {
             rc
         };
+
+        // F3: adopt a bundle-shipped component cache from the first materialized
+        // revision that carries one, eliminating Cranelift recompilation on every
+        // cold start. A bundle without `.cache/v1/` is a silent no-op, and an
+        // explicitly-set `GREENTIC_CACHE_DIR` takes precedence.
+        //
+        // This runs before the multi-thread tokio runtime is built, but NOT
+        // before the process is multi-threaded: `init_trace_log` above installs
+        // a `tracing_appender::non_blocking` writer, which spawns a worker
+        // thread. `set_var` therefore does not meet its documented
+        // single-threaded precondition. The adoption cannot simply move earlier
+        // — it needs `rc.revisions`, which only exists after the revision pull
+        // above. Removing the env-var channel entirely (threading the resolved
+        // cache root into `CacheConfig`) is the real fix; tracked in #430.
+        {
+            let rev_ids: Vec<&str> = rc
+                .revisions
+                .iter()
+                .map(|r| r.revision_id.as_str())
+                .collect();
+            let probed = crate::warmup::adopt_env_revision_cache(&env_dir, &rev_ids);
+            // Log the resolved cache outcome so operators can tell whether the
+            // cache was found, pre-set, or absent. Hit/miss counters
+            // (`CacheManager::metrics()`) are not exposed here because the
+            // CacheManager lives inside PackRuntime as a private field —
+            // surfacing it would require changes to greentic-runner-host.
+            match std::env::var("GREENTIC_CACHE_DIR") {
+                Ok(dir) => {
+                    operator_log::info(
+                        module_path!(),
+                        format!("component cache: GREENTIC_CACHE_DIR={dir}"),
+                    );
+                    crate::warmup::log_cache_profile_check(&crate::warmup::check_cache_profile(
+                        dir.as_ref(),
+                    ));
+                }
+                Err(_) => operator_log::info(
+                    module_path!(),
+                    format!(
+                        "component cache: none (no bundle-shipped .cache/v1/ found; \
+                         components will be compiled from WASM on first use). Probed: {}",
+                        if probed.is_empty() {
+                            "no materialized revisions".to_string()
+                        } else {
+                            probed
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        }
+                    ),
+                ),
+            }
+        }
 
         // C5: open the env's runtime.json snapshot once and share it across
         // every activation rebuild + the `runtime://` resolver every loaded
@@ -810,6 +919,14 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
         let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // Where a parked conversation lives. Resolved ONCE, logged once, and
+        // — unlike the pin store above — a configured-but-unreachable backend
+        // is a boot failure rather than a fall back to memory. See
+        // `durable_state::DurableStorage::resolve` for why the two differ.
+        let durable = durable_state::DurableStorage::resolve(&env_id)?;
+        durable.ensure_reachable()?;
+        durable.log_once();
+        durable.warn_if_no_revision_affinity();
         // Per-revision session/state stores, likewise shared between the
         // cold-start activation and every reload-rebuilt one. A reload builds a
         // whole new `RunnerHost`, and the host owns these stores; without the
@@ -837,6 +954,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             std::sync::Arc::clone(&runtime_ref_resolver),
             std::sync::Arc::clone(&pin_store),
             &revision_stores,
+            &durable,
         ))?;
 
         // Execution bridge: serve the activated revisions over a slim HTTP
@@ -941,6 +1059,25 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 bind_addr.port().saturating_add(1),
             )
         });
+        // Configured public base URL known WITHOUT a tunnel (env-store then
+        // `PUBLIC_BASE_URL`). Resolved before the server starts so it can gate
+        // capture arming; on Cloud Run there is no tunnel, so this is the whole
+        // boot-time URL. A tunnel (if any) is layered on top below.
+        let boot_configured_url = startup_contract::resolve_public_base_url(&environment)?;
+        // Cloud Run deferred public-URL capture: arm ONLY when revisions are
+        // loaded, K_SERVICE is set (Cloud Run), AND no URL is configured at
+        // boot. Gating on `is_none()` means an operator-configured URL (env-store
+        // / PUBLIC_BASE_URL) always wins and can never be overridden by a
+        // captured one (including on reload). Pinned to K_SERVICE so only this
+        // service's own `<service>-*.run.app` URL is ever captured.
+        let cloud_run_capture: Option<std::sync::Arc<revision_serve::PublicUrlCapture>> =
+            (boot_configured_url.is_none()
+                && !rc.revisions.is_empty()
+                && startup_contract::running_on_cloud_run())
+            .then(|| {
+                let service = std::env::var("K_SERVICE").unwrap_or_default();
+                std::sync::Arc::new(revision_serve::PublicUrlCapture::new(service))
+            });
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
@@ -950,6 +1087,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             updates_enabled: !request.no_updates,
             auto_restart_enabled: auto_restart,
             exe_path: Some(own_exe.clone()),
+            public_base_url: boot_configured_url.clone(),
+            public_url_capture: cloud_run_capture.clone(),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -1109,36 +1248,75 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         }
 
         // Phase D: auto-register provider webhooks for the served revisions.
-        // Gated on a public_base_url — with none, registration is skipped
-        // (register manually). Detached: the server is already listening, and
-        // a slow or stuck provider API call must not delay the watcher spawn
-        // or Ctrl+C handling; each invocation is bounded by
-        // `SETUP_WEBHOOK_TIMEOUT`.
+        // Detached: the server is already listening, and a slow or stuck
+        // provider API call must not delay the watcher spawn or Ctrl+C
+        // handling; each invocation is bounded by `SETUP_WEBHOOK_TIMEOUT`.
         //
         // Precedence: tunnel-discovered URL (always wins) > env-store > env
         // var — the same chain as the legacy bundle arm. The env-derived tail
         // is delegated to the canonical helper in `startup_contract` so this
         // path stays in lockstep with the reload path in
         // `revision_webhook_register`.
+        //
+        // Three-arm matrix:
+        //   Some(url)      → register immediately (unchanged).
+        //   None + capture → deferred: await the first GFE request, then register.
+        //   None + no cap  → skip + log (unchanged — no untrusted header trust).
         let public_base_url = match &tunnel_url {
             Some(url) => Some(url.clone()),
-            None => startup_contract::resolve_public_base_url(&environment)?,
+            None => boot_configured_url,
         };
         // Captured before `environment` is moved into the webhook-registration
         // task below; consumed by the watcher's `default_rebuild` further down.
         let reload_seed = Some((rc.clone(), environment.clone()));
         if revision_count > 0 {
             let boot_activation = std::sync::Arc::clone(&activation);
-            let boot_url = public_base_url.clone();
-            let boot_env = environment;
-            activation_rt.spawn(async move {
-                revision_webhook_register::register_new_model_webhooks(
-                    &boot_activation,
-                    &boot_env,
-                    boot_url.as_deref(),
-                )
-                .await;
-            });
+            let boot_env = environment.clone();
+            match (public_base_url.clone(), cloud_run_capture.clone()) {
+                (Some(url), _) => {
+                    activation_rt.spawn(async move {
+                        revision_webhook_register::register_new_model_webhooks(
+                            &boot_activation,
+                            &boot_env,
+                            Some(&url),
+                        )
+                        .await;
+                    });
+                }
+                (None, Some(cap)) => {
+                    // Deferred path: wait for the first GFE-fronted public
+                    // request to deliver the Host header, then register.
+                    // Uses the boot activation (decision 4 in the plan):
+                    // a hot-reload that lands before the first public
+                    // request self-heals via the reload path (decision 3).
+                    activation_rt.spawn(async move {
+                        let url = cap.captured().await;
+                        operator_log::info(
+                            module_path!(),
+                            format!(
+                                "captured public URL from Cloud Run request: {url}; \
+                                 registering webhooks"
+                            ),
+                        );
+                        revision_webhook_register::register_new_model_webhooks(
+                            &boot_activation,
+                            &boot_env,
+                            Some(&url),
+                        )
+                        .await;
+                    });
+                }
+                (None, None) => {
+                    activation_rt.spawn(async move {
+                        revision_webhook_register::register_new_model_webhooks(
+                            &boot_activation,
+                            &boot_env,
+                            None,
+                        )
+                        .await;
+                    });
+                }
+            }
         }
         // The server holds its own `Arc<Activation>`; release ours so a later
         // reload can free the superseded activation after its drain window.
@@ -1177,6 +1355,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 std::sync::Arc::clone(&pin_store),
                 activation_rt.handle().clone(),
                 std::sync::Arc::clone(&revision_stores),
+                durable.clone(),
                 // Seed the reload dedup with what cold start activated, so the
                 // first config change of the process can take the cheap
                 // routing-only path instead of rebuilding the whole host.
@@ -1198,6 +1377,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 env_id.clone(),
                 activation_rt.handle().clone(),
                 tunnel_url,
+                cloud_run_capture,
             ),
             // C5 snapshot-reload arm: pure `store.reload()` call.
             move || snapshot_store_for_watcher.reload(),
@@ -1223,6 +1403,10 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &shutdown_paths,
             if auto_restart { Some(&server) } else { None },
         ))?;
+        operator_log::info(
+            module_path!(),
+            format!("runtime shutdown requested via {}", reason.as_str()),
+        );
         if matches!(reason, ShutdownReason::AdminStop) {
             runtime_state::clear_stop_request(&shutdown_paths)?;
             let line = operator_i18n::tr(
@@ -1258,6 +1442,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 );
             }
         }
+        // Flush and shut down the OTLP providers now, while the activation
+        // runtime and everything else this arm owns is still alive — not at
+        // scope exit, after `activation_rt` and friends have been torn down.
+        // Also covers the binary-update `exec` below, which never returns.
+        drop(_trace_guard);
 
         #[cfg(unix)]
         if matches!(reason, ShutdownReason::BinaryUpdateRestart) {
@@ -1268,8 +1457,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                     own_exe.display(),
                 ),
             );
-            // Drop the trace guard to flush logs before exec.
-            drop(_trace_guard);
+            // The trace guard was already dropped (flushed) above.
             exec_into_self(&own_exe)?;
             // exec_into_self does not return on success.
         }
@@ -1339,6 +1527,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let state_dir = demo_paths.state_dir.clone();
 
     crate::warmup::adopt_bundle_cache_dir(&config_dir);
+    crate::warmup::log_cache_profile_check(&crate::warmup::check_cache_profile(
+        &config_dir.join(".cache"),
+    ));
 
     let resolved_log_dir = config_dir.join("logs");
     if request.log_dir.is_none() && resolved_log_dir != log_dir {
@@ -1693,6 +1884,33 @@ fn build_trace_filter(bundle_level: Option<&str>) -> tracing_subscriber::EnvFilt
     })
 }
 
+/// Holds the file-appender's `WorkerGuard` for the process lifetime and, when
+/// telemetry resolved to OTLP, the exporter provider handles too — so that
+/// dropping this guard flushes and shuts down the OTLP tracer/logger/meter
+/// providers instead of leaving up to `scheduled_delay` worth of buffered
+/// spans/logs stranded on process exit.
+///
+/// In `run_start` it is dropped explicitly on the `--store-root` arm right
+/// after `server.stop()` (which also precedes the binary-update `exec`), and
+/// on the `--bundle` path at scope exit of `run_start`. Either way it only runs if the process gets
+/// that far: an unhandled SIGTERM would kill it first, which is why
+/// [`wait_for_shutdown_inner`] handles SIGTERM on unix.
+pub(crate) struct TraceGuard {
+    _file: tracing_appender::non_blocking::WorkerGuard,
+    otlp: Option<otlp_telemetry::OtlpProviders>,
+}
+
+impl Drop for TraceGuard {
+    fn drop(&mut self) {
+        if let Some(providers) = &self.otlp {
+            // Cloud Run gives ~10s after SIGTERM; bound each provider's
+            // shutdown well under that so flushing telemetry cannot eat into
+            // the window the rest of shutdown needs.
+            providers.shutdown(std::time::Duration::from_secs(3));
+        }
+    }
+}
+
 /// Install a `tracing` subscriber writing to `<log_dir>/system.log`. When
 /// `telemetry` resolves to OTLP, an additional OpenTelemetry tracer + meter
 /// + logger layer is composed alongside the file appender.
@@ -1700,7 +1918,7 @@ fn init_trace_log(
     log_dir: &std::path::Path,
     telemetry: Option<&bundle_config::BundleTelemetryConfig>,
     fallback_service_name: &str,
-) -> Option<tracing_appender::non_blocking::WorkerGuard> {
+) -> Option<TraceGuard> {
     use std::fs::OpenOptions;
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
@@ -1733,39 +1951,63 @@ fn init_trace_log(
         }));
 
     let resolved = otlp_telemetry::resolve(telemetry, fallback_service_name);
-    let otlp_layer = resolved
-        .as_ref()
-        .and_then(|r| match otlp_telemetry::install_layer(r) {
-            Ok(layer) => Some(layer),
+    // `(layer, providers, exporter name)`. The exporter is recorded as
+    // installed only once the subscriber carrying its layer is actually
+    // installed below — `install_layer` succeeding is not enough.
+    let (otlp_layer, otlp_providers, otlp_exporter_name) = match resolved.as_ref() {
+        Some(r) => match otlp_telemetry::install_layer(r) {
+            Ok((layer, providers)) => {
+                let exporter_name = match r.exporter {
+                    otlp_telemetry::ExporterKind::OtlpGrpc => "otlp-grpc",
+                    otlp_telemetry::ExporterKind::OtlpHttp => "otlp-http",
+                };
+                (Some(layer), Some(providers), Some(exporter_name))
+            }
             Err(err) => {
+                // The endpoint can carry userinfo; never log it raw.
                 operator_log::warn(
                     module_path!(),
                     format!(
-                        "OTLP exporter init failed (endpoint={}); file logging only: {err:#}",
-                        r.endpoint
+                        "OTLP exporter init failed (endpoint={}); file logging only: {}",
+                        otlp_status::redact(&r.endpoint),
+                        otlp_status::redact(&format!("{err:#}"))
                     ),
                 );
-                None
+                otlp_status::record_init_error(&format!("{err:#}"));
+                (None, None, None)
             }
-        });
+        },
+        None => (None, None, None),
+    };
     let otlp_summary = resolved
         .as_ref()
-        .map(|r| format!("{:?} endpoint={}", r.exporter, r.endpoint))
+        .map(|r| {
+            format!(
+                "{:?} endpoint={}",
+                r.exporter,
+                otlp_status::redact(&r.endpoint)
+            )
+        })
         .unwrap_or_else(|| "none".to_string());
 
     let init_result = match otlp_layer {
         Some(layer) => tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(trace_stderr::layer())
             .with(layer)
             .try_init(),
         None => tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
+            .with(trace_stderr::layer())
             .try_init(),
     };
     match init_result {
         Ok(()) => {
+            if let Some(exporter_name) = otlp_exporter_name {
+                otlp_status::record_installed(exporter_name);
+            }
             operator_log::info(
                 module_path!(),
                 format!(
@@ -1788,10 +2030,20 @@ fn init_trace_log(
                     "tracing subscriber try_init failed (another subscriber already installed?): {err}"
                 ),
             );
+            // The OTLP layer never reached a subscriber, so nothing will ever
+            // export through these providers: report it, and stop their
+            // batch/periodic workers rather than leaking them.
+            if let Some(providers) = otlp_providers {
+                otlp_status::record_init_error("tracing subscriber already installed");
+                providers.shutdown(std::time::Duration::from_secs(3));
+            }
             return None;
         }
     }
-    Some(guard)
+    Some(TraceGuard {
+        _file: guard,
+        otlp: otlp_providers,
+    })
 }
 
 /// Idempotently auto-create the `local` Environment on first `gtc start`.
@@ -2431,8 +2683,14 @@ pub(crate) fn advertise_webchat_urls(
     advert
 }
 
+#[derive(Debug)]
 enum ShutdownReason {
     CtrlC,
+    /// SIGTERM — how Cloud Run, Kubernetes, ECS, `docker stop` and the
+    /// designer's own child supervision stop the process. Handled exactly
+    /// like [`Self::CtrlC`]; unix only (never constructed on Windows).
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Terminate,
     AdminStop,
     BinaryUpdateRestart,
 }
@@ -2441,6 +2699,7 @@ impl ShutdownReason {
     fn as_str(&self) -> &'static str {
         match self {
             Self::CtrlC => "ctrl_c",
+            Self::Terminate => "sigterm",
             Self::AdminStop => "admin_stop",
             Self::BinaryUpdateRestart => "binary_update_restart",
         }
@@ -2464,11 +2723,25 @@ async fn wait_for_shutdown_inner(
     paths: &runtime_state::RuntimePaths,
     auto_restart_check: Option<&std::sync::Arc<revision_serve::RevisionServer>>,
 ) -> anyhow::Result<ShutdownReason> {
+    // Without this handler SIGTERM's default action kills the process on the
+    // spot, so `TraceGuard` never drops and the buffered OTLP batch is lost —
+    // in every production lane, since they all stop with SIGTERM. Registered
+    // once, before the loop, so a signal arriving between two 250 ms polls is
+    // not missed.
+    //
+    // Once registered, tokio keeps the handler installed for the rest of the
+    // process: a SECOND SIGTERM during a slow shutdown is swallowed, not
+    // fatal. That is acceptable — the platform follows up with SIGKILL when
+    // its grace period runs out, and the flush is bounded well inside it.
+    let mut terminate = TerminateSignal::new()?;
     loop {
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result.map_err(|err| anyhow!("failed to wait for Ctrl+C: {err}"))?;
                 return Ok(ShutdownReason::CtrlC);
+            }
+            () = terminate.recv() => {
+                return Ok(ShutdownReason::Terminate);
             }
             _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
                 if runtime_state::read_stop_request(paths)?.is_some() {
@@ -2481,6 +2754,42 @@ async fn wait_for_shutdown_inner(
                 }
             }
         }
+    }
+}
+
+/// SIGTERM listener for [`wait_for_shutdown_inner`]. On non-unix targets
+/// there is no SIGTERM, and `recv` never completes (Windows keeps Ctrl+C only).
+struct TerminateSignal {
+    #[cfg(unix)]
+    inner: tokio::signal::unix::Signal,
+}
+
+impl TerminateSignal {
+    #[cfg(unix)]
+    fn new() -> anyhow::Result<Self> {
+        let inner = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .map_err(|err| anyhow!("failed to install SIGTERM handler: {err}"))?;
+        Ok(Self { inner })
+    }
+
+    #[cfg(not(unix))]
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {})
+    }
+
+    /// Resolves when SIGTERM arrives. If the signal stream ever closes (it
+    /// does not while the runtime is alive), stays pending rather than
+    /// reporting a SIGTERM that never happened.
+    #[cfg(unix)]
+    async fn recv(&mut self) {
+        if self.inner.recv().await.is_none() {
+            std::future::pending::<()>().await;
+        }
+    }
+
+    #[cfg(not(unix))]
+    async fn recv(&mut self) {
+        std::future::pending::<()>().await;
     }
 }
 
@@ -3232,6 +3541,8 @@ mod tests {
             bundle_index,
             flow_index: crate::webchat_routing::FlowIndex::default(),
             app_packs: Default::default(),
+            triggers: Default::default(),
+            runtime_metered: Default::default(),
         }
     }
 
@@ -3527,6 +3838,7 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
             env: None,
             tenant: None,
             team: None,
@@ -3566,6 +3878,7 @@ mod tests {
         let mut config = config::DemoConfig::default();
         let args = StartRequest {
             bundle: None,
+            store_root: None,
             env: None,
             tenant: None,
             team: None,
@@ -3674,6 +3987,7 @@ mod tests {
     fn make_start_request(bundle: &Path) -> StartRequest {
         StartRequest {
             bundle: Some(bundle.display().to_string()),
+            store_root: None,
             env: None,
             tenant: None,
             team: None,
@@ -4043,6 +4357,58 @@ mod tests {
     // --- P7e: ShutdownReason + auto-restart tests ---
 
     #[test]
+    fn shutdown_reason_terminate_as_str() {
+        assert_eq!(ShutdownReason::Terminate.as_str(), "sigterm");
+    }
+
+    /// SIGTERM must end the wait with `Terminate` — without a handler the
+    /// default action kills the process and the OTLP flush never runs.
+    #[cfg(unix)]
+    #[test]
+    fn wait_for_shutdown_returns_terminate_on_sigterm() {
+        // The SIGTERM goes to the whole test process: hold the env lock so no
+        // `run_start_request` test is inside its own shutdown wait (it would
+        // read our signal as its own and skip its stop-request path).
+        let _env_guard = test_env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let paths = runtime_state::RuntimePaths::new(dir.path(), "demo", "default");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("runtime");
+        let reason = runtime.block_on(async {
+            // Register a process-wide handler FIRST, so a SIGTERM that lands
+            // before the waiter's own handler is registered is still caught
+            // by tokio instead of killing the test binary.
+            let _guard = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("guard SIGTERM handler");
+            let waiter = tokio::spawn(async move { wait_for_shutdown_inner(&paths, None).await });
+            // Let the waiter register its listener; tokio delivers a signal
+            // only to listeners that existed when it arrived, so retry until
+            // the waiter reports.
+            for _ in 0..50 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                // SAFETY: getpid/kill are async-signal-safe libc calls with no
+                // memory preconditions.
+                let rc = unsafe { libc::kill(libc::getpid(), libc::SIGTERM) };
+                assert_eq!(rc, 0, "kill(getpid(), SIGTERM) failed");
+                if waiter.is_finished() {
+                    break;
+                }
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                .await
+                .expect("waiter finished")
+                .expect("waiter joined")
+        });
+        assert!(
+            matches!(reason, Ok(ShutdownReason::Terminate)),
+            "expected Terminate, got {reason:?}"
+        );
+    }
+
+    #[test]
     fn shutdown_reason_binary_update_restart_as_str() {
         assert_eq!(
             ShutdownReason::BinaryUpdateRestart.as_str(),
@@ -4192,6 +4558,92 @@ mod tests {
         assert!(
             should_clear,
             "stale marker from a different lineage must be cleared"
+        );
+    }
+
+    // ---- TraceGuard flushes OTLP providers on drop ----
+
+    /// A minimal `SpanExporter` that appends every exported batch into a
+    /// shared `Vec` and never clears it. `opentelemetry_sdk`'s own
+    /// `InMemorySpanExporter` resets its buffer inside `shutdown()` by
+    /// default (verified against `opentelemetry_sdk` 0.32.1's
+    /// `in_memory_exporter.rs`: `InMemorySpanExporterBuilder::new()` sets
+    /// `reset_on_shutdown: true`, and the only way to disable that,
+    /// `keep_records_on_shutdown()`, is `#[cfg(test)] pub(crate)` inside
+    /// that crate and unreachable from here) — so asserting "the exporter
+    /// still holds the span" *after* a full `TraceGuard` drop (which flushes
+    /// then shuts down) would always read empty regardless of whether the
+    /// flush happened. This exporter captures on `export` and leaves
+    /// `shutdown`/`shutdown_with_timeout` at the trait's no-op defaults, so
+    /// the captured spans are exactly what was flushed.
+    #[derive(Debug, Clone, Default)]
+    struct CapturingSpanExporter {
+        spans: std::sync::Arc<std::sync::Mutex<Vec<opentelemetry_sdk::trace::SpanData>>>,
+    }
+
+    impl opentelemetry_sdk::trace::SpanExporter for CapturingSpanExporter {
+        fn export(
+            &self,
+            mut batch: Vec<opentelemetry_sdk::trace::SpanData>,
+        ) -> impl std::future::Future<Output = opentelemetry_sdk::error::OTelSdkResult> + Send
+        {
+            let spans = self.spans.clone();
+            async move {
+                spans
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .append(&mut batch);
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn trace_guard_drop_flushes_pending_otlp_spans() {
+        use opentelemetry::trace::{Span as _, Tracer as _, TracerProvider as _};
+
+        let exporter = CapturingSpanExporter::default();
+        let captured = exporter.spans.clone();
+
+        let tracer_provider = opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_batch_exporter(exporter)
+            .build();
+        let logger_provider = opentelemetry_sdk::logs::SdkLoggerProvider::builder().build();
+        let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder().build();
+
+        let providers = otlp_telemetry::OtlpProviders {
+            tracer: tracer_provider,
+            logger: logger_provider,
+            meter: meter_provider,
+        };
+
+        let tracer = providers.tracer.tracer("t");
+        let mut span = tracer.start("test-span");
+        span.end();
+
+        assert!(
+            captured
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty(),
+            "the batch processor must not have exported yet: it waits for its \
+             scheduled interval, which this test relies on TraceGuard's drop \
+             to preempt"
+        );
+
+        let (_writer, file_guard) = tracing_appender::non_blocking(std::io::sink());
+        let guard = TraceGuard {
+            _file: file_guard,
+            otlp: Some(providers),
+        };
+        drop(guard);
+
+        let spans = captured.lock().unwrap_or_else(|p| p.into_inner());
+        assert_eq!(
+            spans.len(),
+            1,
+            "TraceGuard::drop must flush the OTLP batch processor instead of \
+             waiting for its interval"
         );
     }
 }

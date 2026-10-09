@@ -111,9 +111,21 @@ fn kill_host(child: &mut Child) {
 
 /// Run the routing host. `Err` carries a short, operator-readable reason
 /// (spawn failure, non-zero exit, unparseable stdout) — never message text.
+#[cfg(test)]
 pub fn invoke_routing_host_detailed(
     host_bin: &Path,
     input: &Fast2FlowHookInV1,
+) -> Result<Fast2FlowHookOutV1, String> {
+    invoke_routing_host_with_env(host_bin, input, &[])
+}
+
+/// [`invoke_routing_host_detailed`] with `extra_env` set on the host process
+/// after the inherited environment, so a per-pack value (the routing threshold)
+/// wins over what the process happened to inherit.
+pub fn invoke_routing_host_with_env(
+    host_bin: &Path,
+    input: &Fast2FlowHookInV1,
+    extra_env: &[(String, String)],
 ) -> Result<Fast2FlowHookOutV1, String> {
     let payload = serde_json::to_vec(input).map_err(|err| format!("encode host input: {err}"))?;
 
@@ -123,6 +135,7 @@ pub fn invoke_routing_host_detailed(
     let mut command = Command::new(host_bin);
     command
         .envs(std::env::vars())
+        .envs(extra_env.iter().map(|(k, v)| (k, v)))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -222,6 +235,38 @@ mod tests {
             &format!("cat > /dev/null\nprintf '%s' '{body}'\n"),
         );
         (dir, path)
+    }
+
+    #[test]
+    fn extra_env_reaches_the_host_and_beats_the_inherited_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("echo-env-host.sh");
+        crate::fast2flow::test_script::write_executable_script(
+            &bin,
+            "cat > /dev/null\nprintf '{\"directive\":{\"type\":\"respond\",\"message\":\"%s\"}}' \"$F2F_TEST_THRESHOLD\"\n",
+        );
+        // The inherited value is what the host would see without the override.
+        // SAFETY: a variable only this test reads.
+        unsafe { std::env::set_var("F2F_TEST_THRESHOLD", "inherited") };
+        let out = invoke_routing_host_with_env(
+            &bin,
+            &sample_input(),
+            &[("F2F_TEST_THRESHOLD".to_string(), "0.2".to_string())],
+        )
+        .expect("parsed");
+        assert_eq!(
+            out.directive,
+            RoutingDirective::Respond {
+                message: "0.2".to_string()
+            }
+        );
+        let out = invoke_routing_host_with_env(&bin, &sample_input(), &[]).expect("parsed");
+        assert_eq!(
+            out.directive,
+            RoutingDirective::Respond {
+                message: "inherited".to_string()
+            }
+        );
     }
 
     #[test]

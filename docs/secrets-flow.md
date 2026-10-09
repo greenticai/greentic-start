@@ -89,6 +89,89 @@ before a user hits a silent "missing secret." Changing the scheme requires a new
 plan verified on **both binaries** (setup + start), **both backends** (local
 dev-store + cloud vault), and public.
 
+## Secrets hydrated from the admin (`secrets_door`)
+
+A unit whose staged ingress document (`secrets://<env>/<tenant>/_/ingress/<bundle>`)
+carries `"secrets_door": true` keeps its credentials in the admin rather than in
+the shipped dev store (Cloud Run caps that store at 64 KiB). At revision
+activation, after the document is read, start calls the admin door once and
+writes the answer into the dev store it already serves from:
+
+- `POST <metering.endpoint with worker-usage → secrets>/read-all`, bearer = the
+  unit's metering token, body `{}`, optional `If-None-Match`.
+- `200 {"secrets":[{"path":"<team>/<category>/<name>","value","encoding":"utf8|base64"}],"etag"}`;
+  each entry lands at `secrets://<env>/<tenant>/<path>`, path verbatim, with
+  `<env>` chosen per secret by its category (see the env rule below).
+- A flagged unit **fails closed**: an unreachable, unauthorised (401/403) or
+  absent (404) door, or a flag with no usable `metering` block, fails the
+  activation (cold start and reload) after 4 attempts with 0.5 s doubling
+  backoff. Absent or `false` flag: no call, no change.
+- Retries cover only transient failures (transport errors, 5xx, 408, 429).
+  401, 403, 404, any other 4xx and an unusable body fail at once. 403's message
+  says the token probably lacks the `secrets` purpose (PATCH purposes). One
+  60 s retry budget is shared by all units of an activation; `Retry-After`
+  (seconds) is honoured on 429 within it.
+- A flagged unit whose door answers 200 with an EMPTY set fails (no ETag is
+  recorded). An ingress document the store cannot read (an error other than
+  not-found) fails the activation, since the flag is then unknowable; a document
+  that is absent or unparseable counts as "no flag" (the parser warns).
+- On a reload, if an ETag is already known and the door is transiently down, the
+  unit keeps the secrets already hydrated (warning logged). A cold start does
+  not get this, and neither does a 401/403/404.
+- Values are never logged or put in an error; a malformed entry writes nothing.
+- A rotation takes effect on the next activation; a `304` on a reload skips the
+  write. Paths written on one hydration but absent from the next answer are
+  deleted from the dev store for real: `SecretsClient::delete` rewrites the store
+  file without the entry (`DevStore::copy_excluding`, under the store's lock,
+  published by atomic rename; no ciphertext survives), serialised against this
+  process's own writes. Another process writing the same file is not covered.
+- **Values may be encrypted by the designer before the admin stores them.** A
+  value (after `encoding` is decoded) starting `gtcenc1:` is
+  `gtcenc1:` + base64(`nonce(12) || AES-256-GCM ciphertext+tag`), opened with the
+  32-byte key (base64) the unit's dev store holds at
+  `secrets://<ingress env>/<tenant>/_/door/key` first (the deployer's `op secrets put
+  default/_/door/key` writes the `door` category into the store's own env, `local`),
+  then `secrets://default/<tenant>/_/door/key` (read through the host's secrets
+  manager before anything is written). AAD =
+  `"gtc-door-v1\0" tenant "\0" unit "\0" path`. **Start does not know the
+  designer's environment id** (neither the door answer nor the staged ingress
+  document carries it), so the env id is not in the AAD; the designer must seal
+  without it. The door does not say whether a row is unit-scoped or
+  environment-shared, so start tries the unit's bundle id, then `_env`. A value
+  without the prefix is written as is. A missing or malformed key, a wrong
+  scope/path/tenant or a tampered value fails the activation and nothing is
+  written; messages name the key's address and the secret's path, never a key or
+  value. AES-GCM comes from `ring` (already in the tree via rustls); `aes-gcm`
+  is not.
+- **The env follows the category** (`env_for_path`), because the runner reads
+  the two families at different envs:
+  - `mcp`, `a2a`, `llm`, `knowledge`, `sorla` (the middle path segment) are read
+    at env `default` (`greentic_aw_runtime::scoped_secrets`, `ENV_SEGMENT`), so
+    they are written at `default`.
+  - EVERY other category — a pack segment such as `<pack>`,
+    `<pack>_unit_<unit>_<hash>` or a channel pack id, holding an extension
+    node's or tool's credential or a channel secret — is read at the revision's
+    own env, `$GREENTIC_ENV` (`local` when unset), which is the env the ingress
+    document is read under (`resolve_env`); it is written there.
+  Evidence at `greentic-runner-host 1.2.0-dev.37554921045`: node secrets are read
+  by `read_pack_secret_blocking` (`pack.rs:483`) through
+  `scoped_secret_path_for_pack` (`secrets.rs:536-558`, env = `ctx.env`), where
+  the ctx comes from `HostConfig::tenant_ctx` (`config.rs:351-352`,
+  `GREENTIC_ENV` else `local`); tool secrets by `StoreToolSecretsBackend`
+  (`runner/agent_node.rs:916-1000`) through `agent_tool_secret_uri`
+  (`secrets.rs:494-511`) with env = `GREENTIC_ENV`. One caveat there: that
+  tool backend falls back to env `dev`, not `local`, when `GREENTIC_ENV` is
+  unset or blank; start resolves an unset env to `local` (and aliases `dev` to
+  `local`), so a deployed unit must have `GREENTIC_ENV` set. The generated
+  webchat `jwt_signing_key` is minted by start into the store at boot and is
+  not a door secret. Stale-removal tracking records the full address written,
+  so a removed secret is deleted from the env it was written to.
+
+Code: `src/secrets_door.rs`. A start predating the field ignores it (the
+ingress parser does not reject unknown fields), so the designer must not stop
+writing a unit's secrets to the store until the unit's runtime is known to
+hydrate.
+
 ## Diagnosing a "missing secret"
 
 1. Grep the runtime log for `WASM secrets read` — the requested URI, each

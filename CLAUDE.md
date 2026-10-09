@@ -20,10 +20,10 @@ Keep the public-facing overview in [README.md](README.md) focused on humans.
 bash ci/local_check.sh
 
 # Standard commands
-cargo build -p greentic-start --all-features
-cargo test -p greentic-start --all-features
+cargo build -p greentic-start
+cargo test -p greentic-start
 cargo fmt -p greentic-start -- --check
-cargo clippy -p greentic-start --all-targets --all-features -- -D warnings
+cargo clippy -p greentic-start --all-targets -- -D warnings
 
 # Run a single test
 cargo test -p greentic-start -- test_name_here
@@ -37,20 +37,20 @@ git config core.hooksPath .githooks
 
 Enables the pre-commit hook that runs `rustfmt` on staged Rust files and `cargo clippy --workspace -- -D warnings`. See `.githooks/README.md`.
 
-Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is committed.
+Crate version 1.2.0-dev.0, edition 2024, Rust 1.95.0 (pinned via `rust-toolchain.toml`). Cargo.lock is committed.
 
 ## Release Flow
 
 1. Bump `version` in `Cargo.toml`
-2. Create and push tag `vX.Y.Z` (must match Cargo.toml)
-3. Tag push triggers `.github/workflows/publish.yml` (needs `CARGO_REGISTRY_TOKEN`)
+2. Merge the bump to `main` — `tag-on-version-bump.yml` creates and pushes tag `vX.Y.Z` automatically (a manually pushed matching tag also works)
+3. The tag triggers `.github/workflows/release-binaries.yml` (release binaries). There is no `publish.yml`; crates.io dev publishing runs separately via `dev-publish.yml` on the nightly train
 
 ## Architecture
 
 ### Entry Points
 
 - `src/main.rs` — trivial: calls `greentic_start::run_from_env()`
-- `src/lib.rs` — CLI parsing (clap derive), arg normalization (strips legacy `demo` subcommand prefix), dispatches to `run_start`, `run_restart_request`, `run_stop_request`
+- `src/lib.rs` — CLI parsing (clap derive), arg normalization (strips legacy `demo` subcommand prefix), dispatches to `run_start_request`, `run_restart_request`, `run_stop_request`
 - Public API: `StartRequest`, `StopRequest`, `run_start_request()`, `run_restart_request()`, `run_stop_request()`, `run_from_env()`
 - Public modules: `config`, `notifier`, `perf_harness`, `provider_config_envelope`, `revision_health_gate`, `runtime`, `runtime_state`, `supervisor`, `ws_test_support`
 
@@ -68,7 +68,8 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 | Secrets | `secrets_*.rs`, `secret_*.rs` | Backend selection (pack vs dev-store), secret URI handling, missing secret seeding. **Read side of the setup↔start secret contract — see [docs/secrets-flow.md](docs/secrets-flow.md).** |
 | Services | `services/` | Individual service components: NATS, runner, components |
 | Subscriptions | `subscriptions_universal/` | Universal subscription runtime and persistence (e.g., Microsoft Graph) |
-| Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~13k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
+| Conversation state | `durable_state.rs` | Resolves the session/flow-state backends at boot (in-memory by default, Redis when configured) and mints a per-revision keyspace. **Fails the boot when a named backend is unreachable — see [docs/durable-conversation-state.md](docs/durable-conversation-state.md).** |
+| Revision engine | `revision_boot.rs`, `revision_serve.rs`, `revision_dispatcher.rs`, `revision_drain.rs`, `revision_pull.rs`, `revision_reload.rs`, `revision_pin.rs`, `revision_webhook_register.rs`, `revision_health_gate.rs` | Multi-revision hot-reload runtime (~20k LOC): boots revisions from env-store, dispatches ingress traffic to the active revision, drains old revisions, pulls remote bundles at startup, registers webhooks, and gates readiness |
 | Fast2Flow | `fast2flow/` | Chat-to-flow routing subsystem (gate, host_process, llm_router, mapper, contracts, config) — routes inbound chat messages to the matching flow via BM25 + optional LLM fallback |
 | LLM integration | `llm/` | Provider-agnostic LLM layer consumed by fast2flow and other subsystems; wraps `greentic-llm` crate |
 | OAuth engine | `oauth_engine.rs`, `oauth_secret_bridge.rs`, `oauth_state.rs` | Broker-side OAuth flow for provider connections: token exchange, secret bridging, per-provider state |
@@ -101,7 +102,33 @@ Rust 1.95.0, edition 2024, pinned via `rust-toolchain.toml`. Cargo.lock is commi
 - **Error handling**: `anyhow::Result<T>` with `.context()`
 - **i18n**: Source catalog at `i18n/en.json`. Translate via `tools/i18n.sh` (defaults: `LANGS=all`, `BATCH_SIZE=200`). Never hardcode user-facing strings.
 - **Docker**: `Dockerfile.distroless` builds a musl-static binary into a `gcr.io/distroless/static-debian12:nonroot` image (uid 65532, no shell; Chainguard is the optional hardened upgrade). The image is **ELF-only**: it ships no shell or interpreters, so bundle-supplied service helpers (gateway/egress/subscriptions/runner) must be statically-linked ELF binaries, not `#!`-scripts. `build_service_spec` preflights helper shebangs and fails with an actionable error when the interpreter is absent.
-- **Floor-pinned deps**: Cross-repo Greentic deps use `>=M.m.p-dev.RUNID, <M.(m+1).0-0` ranges with inline rationale comments in `Cargo.toml`. Bump the floor when a new publish adds a surface this crate consumes; the comment must explain which PR/feature the floor targets.
+- **Floor-pinned deps**: Cross-repo Greentic deps use `>=M.m.p-dev.RUNID, <M.(m+1).0-0` ranges with inline rationale comments in `Cargo.toml`. Bump the floor when a new publish adds a surface this crate consumes; the comment must explain which PR/feature the floor targets. **A bare `>=M.m.p-dev` is not a floor** — it means `>=M.m.p-dev.0`, i.e. the whole lane back to its first publish, and it reads as one. Two things follow. (1) A RUNID may legitimately be *the publish this tree resolves and was verified against* rather than the publish an API first appeared in: on a lane that stamps a run id per develop push, a run id is a position in a sequence and nobody can honestly claim it marks an API without bisecting the registry. Say which kind it is; the comment must still name the surfaces the requirement exists for. (2) Run ids are **not comparable across crates** — each repo's lane advances at its own rate, so a lower number elsewhere is not "behind". (3) The upper bound `<M.(m+1).0-0` does **not** exclude a `M.m.p-research.N` line: pre-release identifiers compare as strings and `dev` sorts below `research`, so such a publish would be PREFERRED over any dev one. See the note above `[patch.crates-io]` in `Cargo.toml` for the current state of that.
+
+## Key Environment Variables
+
+| Variable | Purpose |
+|----------|---------|
+| `GREENTIC_ENV` | Active environment id; flag > env > `local` |
+| `PORT` | HTTP listen port for the revision-serve path |
+| `PUBLIC_BASE_URL` | Public URL for webhook auto-registration (tunnel > env-store > this) |
+| `GREENTIC_EVENTS_NATS_URL` | NATS bus URL; enables SoRX event subscriptions |
+| `GREENTIC_TRIGGER_REDIS_URL` | Shared store for flow triggers (one firer per cron tick, webhook idempotency, hourly budget). Falls back to `GREENTIC_REVISION_PIN_REDIS_URL`; without either, the in-memory store is correct for ONE replica only. See [docs/triggers.md](docs/triggers.md) |
+| `GREENTIC_APPROVAL_NATS_URL` | NATS bus URL for the approval rail; enables the approval bridge. Deliberately separate from the events bus — the approval subjects need their own per-tenant read authorization. See [docs/approval-rail-bridge.md](docs/approval-rail-bridge.md) |
+| `GREENTIC_APPROVAL_DESTINATION` | Conversation approval requests are delivered to (a DM or a private approver channel). No default: the bridge fails closed without one |
+| `GREENTIC_LLM_API_KEY` | LLM provider key for fast2flow routing; keyless for Ollama |
+| `GREENTIC_CACHE_DIR` | Component cache root (set automatically by warmup) |
+| `GREENTIC_SEED_DIR` | Read-only env-store seed copied into the writable store at boot (Cloud Run). A seed `environment.json` may be a pointer to an OCI artifact to escape the 64 KiB secret cap; see [docs/seed-pointer.md](docs/seed-pointer.md) |
+| `GREENTIC_DEV_SECRETS_PATH` | Override path for dev-mode secrets store |
+| `GREENTIC_ADMIN_LISTEN` | Admin-relay listen address |
+| `GREENTIC_DIRECTLINE_TOKEN_TTL_SECS` | DirectLine session-token base TTL (seconds, clamped `[60, 604800]`, default `1800`) |
+| `GREENTIC_PROVIDER_CORE_ONLY` | Set to `0` by default in start; `1` enforces provider-core-only mode |
+| `GREENTIC_RUNNER_SESSION_BACKEND` | `memory` (default) or `redis` — where a parked conversation lives. See [docs/durable-conversation-state.md](docs/durable-conversation-state.md) |
+| `GREENTIC_RUNNER_STATE_BACKEND` | `memory` (default) or `redis` — where per-session flow state lives. NOT revision-scoped; the boot warns |
+| `GREENTIC_RUNNER_REDIS_URL` | Connection URL for both stores above. A URL alone switches nothing on — a backend has to be named |
+| `GREENTIC_RUNNER_SESSION_NAMESPACE` | Session keyspace prefix; defaults to `greentic:session:<env>`. Per-environment namespacing is the operator's job |
+| `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` | How long a parked conversation survives (default `86400`; `0` disables expiry) |
+| `GREENTIC_REVISION_PIN_REDIS_URL` | Revision affinity. Set it whenever durable sessions are on and more than one revision serves traffic |
+| `GREENTIC_TYPING_SIGNAL` | Channel "is typing" signal via the optional provider op `send_typing`. Default on; `0`/`false`/`no`/`off` disable it. See [docs/typing-signal.md](docs/typing-signal.md) |
 
 ## Git Conventions
 

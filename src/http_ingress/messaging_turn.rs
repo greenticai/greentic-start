@@ -29,12 +29,9 @@ impl FlowRun {
     }
 }
 
-/// Runs a flow of the app pack from its entry: `(flow, envelope)`.
-///
-/// Backport note: greentic-runner 1.1.x has no `RunOptions::entry_node`, so a
-/// card-navigation target cannot enter the flow at a node on this line; it
-/// renders the card asset or runs the flow from its entry, as 1.1.41 did.
-pub(super) type RunFlow<'a> = dyn FnMut(&app::AppFlowInfo, &ChannelMessageEnvelope) -> FlowRun + 'a;
+/// Runs a flow of the app pack: `(flow, envelope, entry_node)`.
+pub(super) type RunFlow<'a> =
+    dyn FnMut(&app::AppFlowInfo, &ChannelMessageEnvelope, Option<&str>) -> FlowRun + 'a;
 
 #[allow(clippy::too_many_arguments)]
 pub(super) fn turn_outputs<'p>(
@@ -57,7 +54,14 @@ pub(super) fn turn_outputs<'p>(
     let text_len = envelope.text.as_deref().map(str::len).unwrap_or(0);
 
     let run = if let Some(route_to_card) = card_nav_target(envelope) {
-        match read_card_from_pack(app_pack_path, route_to_card) {
+        // A target that names a FLOW NODE goes to the flow even when a card
+        // asset of the same name exists. Rendering the asset directly is
+        // faster but leaves the flow with no record of the card, so the
+        // node never runs, never parks awaiting the submit, and never
+        // attaches the user's `answers` — which every capture node
+        // downstream reads as `{{node.<card>.answers.<field>}}`.
+        let flow_node = flow.node_ids.iter().any(|n| n == route_to_card);
+        match read_card_from_pack(app_pack_path, route_to_card).filter(|_| !flow_node) {
             Some(card_json) => FlowRun::ok(vec![render_card_asset(
                 ctx,
                 pack_info,
@@ -67,13 +71,26 @@ pub(super) fn turn_outputs<'p>(
                 card_json,
             )]),
             None => {
-                operator_log::warn(
+                // Enter the flow at the named node rather than restarting
+                // at the entrypoint. A restart means the capture nodes
+                // chained between two cards never run and the journey never
+                // advances. This drives only the FIRST hop into the flow —
+                // once a card has parked, the runner resumes it instead.
+                let entry_node = route_to_card.clone();
+                operator_log::info(
                     module_path!(),
                     format!(
-                        "[demo messaging] card routing: {route_to_card} -> card asset NOT found, using app flow"
+                        "[demo messaging] card routing: {entry_node} -> entering the app \
+                         flow at that node (flow_node={flow_node})"
                     ),
                 );
-                run_flow(flow, envelope)
+                // The nav directive must not travel into the flow: the
+                // adaptive-card component prefers an inbound nextCardId
+                // over its node's own card asset, so leaving it in makes
+                // the next card node fail with AC_ASSET_NOT_FOUND.
+                let mut flow_envelope = envelope.clone();
+                strip_card_nav_keys(&mut flow_envelope);
+                run_flow(flow, &flow_envelope, Some(&entry_node))
             }
         }
     } else if let Some(reply) = turn.fixed_reply.clone() {
@@ -101,7 +118,7 @@ pub(super) fn turn_outputs<'p>(
                 ),
             );
         }
-        run_flow(flow, envelope)
+        run_flow(flow, envelope, None)
     };
 
     let signal = match (&turn.route, run.failed) {

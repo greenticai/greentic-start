@@ -38,26 +38,27 @@ use greentic_deploy_spec::{
     RevisionId,
 };
 use greentic_deployer::path_safety::normalize_under_root;
-use greentic_runner_host::runtime::{RevisionPackRef, TenantRuntime};
+use greentic_runner_host::runtime::{RevisionLoad, RevisionPackRef, TenantRuntime};
 use greentic_runner_host::runtime_refs::RuntimeRefResolver;
-use greentic_runner_host::storage::{
-    new_session_store, new_state_store, session_host_from, state_host_from,
-};
+use greentic_runner_host::storage::{session_host_from, state_host_from};
 use greentic_runner_host::{HostBuilder, HostConfig, RunnerHost, TenantBindings};
 use serde_json::Value;
 
 use crate::deployment_routes::{
     DeploymentRouteTable, RevisionIngressRouting, deployment_config_overrides_from_environment,
 };
+use crate::durable_state::{DurableStorage, isolation_suffix};
 use crate::endpoint_admit::EndpointAdmit;
 use crate::fast2flow::revision_packs::{AppPackInfoCache, RevisionAppPacks};
 use crate::http_routes::{
     HttpRouteDescriptor, HttpRouteTable, RevisionScope, discover_revision_routes,
 };
+use crate::operator_log;
 use crate::revision_dispatcher::{RevisionDispatcher, RevisionDispatcherConfig, parse_ulid};
 use crate::revision_pin::RevisionPinStore;
 use crate::runtime_config::{LoadedRuntimeConfig, env_dir_in};
 use crate::secrets_gate::DynSecretsManager;
+use crate::sorla_state::{PROVIDER_PACK_ID, select as select_sorla_state};
 use crate::static_routes::{
     ActiveRouteTable, ReservedRouteSet, StaticRoutePlan, discover_revision_static_routes,
 };
@@ -120,7 +121,15 @@ pub(crate) type RevisionStores = Arc<
 /// forward across reloads only when ALL identity fields match — so a tenant,
 /// team, or customer change on the same deployment/revision mints fresh stores
 /// rather than leaking the previous identity's sessions.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+///
+/// `Serialize`/`Deserialize` are here for ONE reason and it is not persistence:
+/// nothing writes this key anywhere. They let
+/// `every_revision_store_key_field_changes_the_namespace` enumerate the fields
+/// from the struct instead of from a hand-written list, so a seventh field is
+/// covered by that test the moment it is added rather than whenever someone
+/// remembers to extend an array. The struct is `pub(crate)` and has no wire
+/// contract, so the derives cost nothing else.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RevisionStoreKey {
     pub deployment_id: String,
     pub revision_id: String,
@@ -150,6 +159,63 @@ fn revision_store_key(
         customer_id: meta.customer_id.clone(),
         bundle_id: block.bundle_id.clone(),
     }
+}
+
+/// One revision's slice of a durable session keyspace.
+///
+/// Every field of [`RevisionStoreKey`] goes in, in a fixed order, because the
+/// key is exactly the identity the in-memory registry uses to decide that two
+/// stores may be shared — and a durable keyspace that dropped one of them would
+/// merge two isolation domains that the in-memory path keeps apart, silently
+/// and only on the deployment that configured durability.
+///
+/// The revision id leads so `SCAN` output stays readable; the digest behind it
+/// is what actually separates them.
+fn revision_namespace_suffix(key: &RevisionStoreKey) -> String {
+    // Destructured EXHAUSTIVELY, with no `..`: reading the fields through `key.`
+    // would let a seventh field be added to `RevisionStoreKey` — and therefore
+    // to what the in-memory registry treats as a separate isolation domain —
+    // while the durable keyspace silently went on ignoring it. That is the exact
+    // failure this function's own doc comment forbids, and nothing would have
+    // reported it. As written, a new field is an E0027 right here.
+    let RevisionStoreKey {
+        deployment_id,
+        revision_id,
+        tenant,
+        team,
+        customer_id,
+        bundle_id,
+    } = key;
+    isolation_suffix(&[
+        revision_id.as_str(),
+        deployment_id.as_str(),
+        tenant.as_str(),
+        team.as_str(),
+        customer_id.as_str(),
+        bundle_id.as_str(),
+    ])
+}
+
+/// The revision-independent suffix for `state-sorla`'s opt-in
+/// `stable_component_state`: every field of the store key EXCEPT the revision id.
+///
+/// Destructured exhaustively for the same reason as [`revision_namespace_suffix`].
+fn stable_namespace_suffix(key: &RevisionStoreKey) -> String {
+    let RevisionStoreKey {
+        deployment_id,
+        revision_id: _,
+        tenant,
+        team,
+        customer_id,
+        bundle_id,
+    } = key;
+    crate::durable_state::stable_suffix(&[
+        deployment_id.as_str(),
+        tenant.as_str(),
+        team.as_str(),
+        customer_id.as_str(),
+        bundle_id.as_str(),
+    ])
 }
 
 /// A fresh, empty [`RevisionStores`] registry. One per running server, created
@@ -197,6 +263,7 @@ pub(crate) async fn activate_runtime_config(
     runtime_ref_resolver: Arc<dyn RuntimeRefResolver>,
     pin_store: Arc<dyn RevisionPinStore>,
     revision_stores: &RevisionStores,
+    durable: &DurableStorage,
 ) -> anyhow::Result<RuntimeConfigActivation> {
     // `env_dir_in` validates `rc.env_id` as a safe directory segment via
     // `EnvId::new`; no separate `EnvId::new` call is needed.
@@ -278,6 +345,24 @@ pub(crate) async fn activate_runtime_config(
         }
     }
 
+    // Units whose staged ingress document sets `secrets_door` keep their
+    // credentials in the admin: pull them into the dev store this host reads
+    // BEFORE anything can ask for one. A flagged unit that cannot be served
+    // fails the activation (cold start and reload alike); an unflagged one
+    // costs nothing.
+    crate::secrets_door::hydrate_for_activation(
+        secrets.as_ref(),
+        &crate::resolve_env(None),
+        rc.revisions.iter().filter_map(|block| {
+            deployments
+                .get(block.deployment_id.as_str())
+                .map(|meta| (meta.tenant.as_str(), meta.bundle_id.as_str()))
+        }),
+        &crate::secrets_door::DoorPolicy::default(),
+    )
+    .await
+    .context("hydrating deployed secrets from the admin secrets door")?;
+
     // One minimal HostConfig per tenant. Flow-type bindings (routing) are not
     // needed to load + key packs into ActivePacks — they get enriched when the
     // ingress consumer lands (B3). The secrets backend is supplied by the caller
@@ -311,11 +396,17 @@ pub(crate) async fn activate_runtime_config(
     // ingress matches against these via `match_request_for_revision` once the
     // dispatcher picks a revision.
     let mut scoped_routes: Vec<HttpRouteDescriptor> = Vec::new();
+    let mut trigger_entries: Vec<crate::triggers::table::LoadedTrigger> = Vec::new();
+    let mut trigger_prefixes: std::collections::HashMap<
+        greentic_deploy_spec::DeploymentId,
+        Vec<String>,
+    > = std::collections::HashMap::new();
     // Revision-scoped static routes, parallel to `scoped_routes`. Accumulated
     // as a `StaticRoutePlan` so validation results (blocking_failures, warnings)
     // propagate to the caller the same way `discover_from_bundle` does on the
     // bundle path.
     let mut static_plan = StaticRoutePlan::default();
+    let mut setup_surfaces = crate::setup_surface::SetupSurfaceTable::default();
     let reserved_routes = ReservedRouteSet::operator_defaults();
 
     // Webchat flow index (bundle_id -> flow ids, deduped per bundle) and the
@@ -335,6 +426,13 @@ pub(crate) async fn activate_runtime_config(
     let mut retained = HashMap::with_capacity(rc.revisions.len());
 
     let configs = host.tenant_configs();
+    // Phase 2 unit usage: which units get the runner's worker-usage meter.
+    // Read per unit (not per revision) and against the SAME env the serve
+    // path reads the staged interop config with, so the interop reporter's
+    // "tokens come from the runtime" decision matches what was installed.
+    let secrets_env = crate::resolve_env(None);
+    let mut meter_decisions =
+        crate::interop::metering::runtime_meter::UnitMeterDecisions::default();
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
         // block's deployment is present, and registered a host config for its
@@ -380,15 +478,33 @@ pub(crate) async fn activate_runtime_config(
             revision_id,
         };
         let pack_paths: Vec<PathBuf> = pack_refs.iter().map(|r| r.path.clone()).collect();
-        scoped_routes.extend(discover_revision_routes(
+        let mut revision_routes =
+            discover_revision_routes(&pack_paths, &scope, &meta.path_prefixes);
+        // Carry each pack's deploy-time setup answers onto its routes so
+        // provider dispatch can put them in `HttpInV1.config` (#585) — the
+        // runner host only reaches them through the runtime-config import,
+        // which a provider's `ingest_http` does not read.
+        for route in &mut revision_routes {
+            route.pack_non_secret = non_secret_by_pack_id.get(&route.pack_id).cloned();
+        }
+        scoped_routes.extend(revision_routes);
+        // Flow triggers (`assets/triggers.json`). Loaded per revision like the
+        // routes above; a broken declaration logs and contributes nothing
+        // rather than failing the activation.
+        trigger_entries.extend(crate::triggers::load_revision_triggers(
             &pack_paths,
             &scope,
-            &meta.path_prefixes,
+            &meta.tenant,
         ));
+        trigger_prefixes.insert(scope.deployment_id, meta.path_prefixes.clone());
         static_plan.merge(discover_revision_static_routes(
             &pack_paths,
             &scope,
             &reserved_routes,
+        ));
+        setup_surfaces.extend(crate::setup_surface::discover_revision_setup_surfaces(
+            &pack_paths,
+            &scope,
         ));
 
         // Webchat flow index (deduped per bundle) and the Fast2Flow
@@ -411,10 +527,75 @@ pub(crate) async fn activate_runtime_config(
         // above intact: it is isolation between revisions, not across reloads of
         // one revision.
         let store_key = revision_store_key(meta, block);
-        let (session_store, state_store) = carried
-            .get(&store_key)
-            .cloned()
-            .unwrap_or_else(|| (new_session_store(), new_state_store()));
+        // A durable backend keys on the SAME identity the registry does, folded
+        // into the keyspace prefix, so a restart re-opens the keyspace this
+        // revision parked into — and no other revision's. See
+        // `crate::durable_state`.
+        let (session_store, state_store) = match carried.get(&store_key).cloned() {
+            Some(pair) => pair,
+            None => {
+                // `state-sorla` is selected by the revision carrying that pack's
+                // config; its token and door come from the unit's staged
+                // `metering` block. A selection that cannot be resolved fails
+                // the activation: the backend was named.
+                let pack_ids = read_revision_pack_ids(&revision_id, &block.pack_list_refs)
+                    .with_context(|| {
+                        format!(
+                            "reading the pinned pack ids of revision `{}`",
+                            block.revision_id
+                        )
+                    })?;
+                let carries_sorla = pack_ids.contains(PROVIDER_PACK_ID)
+                    || non_secret_by_pack_id.contains_key(PROVIDER_PACK_ID);
+                let metering = if carries_sorla {
+                    meter_decisions
+                        .metering_for(
+                            host.secrets_manager().as_ref(),
+                            &secrets_env,
+                            &meta.tenant,
+                            &meta.bundle_id,
+                        )
+                        .await
+                } else {
+                    None
+                };
+                let sorla = select_sorla_state(
+                    &pack_ids,
+                    non_secret_by_pack_id
+                        .get(PROVIDER_PACK_ID)
+                        .map(|m| m.as_ref()),
+                    metering.as_ref(),
+                )
+                .with_context(|| {
+                    format!(
+                        "resolving the state-sorla backend for revision `{}`",
+                        block.revision_id
+                    )
+                })?;
+                if let Some(selection) = &sorla {
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "conversation state for revision `{}`: state-sorla door `{}`",
+                            block.revision_id, selection.door.base_url
+                        ),
+                    );
+                }
+                durable
+                    .stores_for(
+                        &revision_namespace_suffix(&store_key),
+                        &stable_namespace_suffix(&store_key),
+                        sorla.as_ref(),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "opening the conversation stores for revision `{}`",
+                            block.revision_id
+                        )
+                    })?
+            }
+        };
         retained.insert(
             store_key,
             (Arc::clone(&session_store), Arc::clone(&state_store)),
@@ -422,23 +603,46 @@ pub(crate) async fn activate_runtime_config(
         let session_host = session_host_from(Arc::clone(&session_store));
         let state_host = state_host_from(Arc::clone(&state_store));
 
-        let runtime = TenantRuntime::load_revision(
-            &pack_refs,
-            config,
-            None,
-            host.wasi_policy(),
-            session_host,
-            session_store,
-            state_store,
-            state_host,
-            host.secrets_manager(),
-            deployment_id,
-            bundle_id.clone(),
-            revision_id,
-            Some(meta.customer_id.clone()),
-            &non_secret_by_pack_id,
-            &runtime_refs_by_pack_id,
-            Some(Arc::clone(&runtime_ref_resolver)),
+        // The unit's staged `metering` block, when present, also installs the
+        // runner's per-unit worker-usage meter and run-outcome sink (the
+        // deployed run audit) for this revision; absent (or unbuildable) means
+        // default options, i.e. today's `load_revision`.
+        //
+        // Keyed on the DEPLOYMENT's bundle id (`meta.bundle_id`, from the same
+        // `Environment` entry the route table's `dep.bundle_id` comes from), so
+        // boot and the serve path name the unit from ONE value. It equals
+        // `block.bundle_id` by the cross-check in the validation loop above.
+        let unit_options = meter_decisions
+            .options_for_revision(
+                host.secrets_manager().as_ref(),
+                &secrets_env,
+                &meta.tenant,
+                deployment_id,
+                &meta.bundle_id,
+                revision_id,
+            )
+            .await;
+
+        let runtime = TenantRuntime::load_revision_with(
+            RevisionLoad {
+                pack_refs: &pack_refs,
+                config,
+                mocks: None,
+                wasi_policy: host.wasi_policy(),
+                session_host,
+                session_store,
+                state_store,
+                state_host,
+                secrets_manager: host.secrets_manager(),
+                deployment_id,
+                bundle_id: bundle_id.clone(),
+                revision_id,
+                customer_id: Some(meta.customer_id.clone()),
+                runtime_configs_by_pack_id: &non_secret_by_pack_id,
+                runtime_refs_by_pack_id: &runtime_refs_by_pack_id,
+                runtime_ref_resolver: Some(Arc::clone(&runtime_ref_resolver)),
+            },
+            unit_options,
         )
         .await
         .with_context(|| format!("loading revision `{}`", block.revision_id))?;
@@ -481,10 +685,13 @@ pub(crate) async fn activate_runtime_config(
         deployment_routes,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
         deployment_config_overrides: Arc::new(deployment_config_overrides_from_environment(env)),
-        static_routes: ActiveRouteTable::from_plan(&static_plan),
+        static_routes: ActiveRouteTable::from_plan(&static_plan)
+            .with_setup_surfaces(setup_surfaces),
         bundle_index,
         flow_index: pack_indexing.flow_index,
         app_packs: pack_indexing.app_packs,
+        triggers: crate::triggers::TriggerTable::build(trigger_entries, &trigger_prefixes),
+        runtime_metered: meter_decisions.into_metered(),
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
@@ -594,6 +801,8 @@ pub(crate) fn reactivate_routing_only(
         static_routes: prev.static_routes.clone(),
         flow_index: prev.flow_index.clone(),
         app_packs: prev.app_packs.clone(),
+        triggers: prev.triggers.clone(),
+        runtime_metered: prev.runtime_metered.clone(),
         deployment_routes,
         bundle_index,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
@@ -695,6 +904,33 @@ fn deployment_index(env: &Environment) -> HashMap<String, DeploymentMeta> {
 /// `lock_paths` are the already-resolved absolute lock paths from B0. The lock's
 /// own `revision_id` must match `expected` so a misplaced or cross-revision lock
 /// is rejected rather than silently activated.
+/// The manifest pack ids pinned by a revision's `pack-list.lock` files.
+///
+/// Unlike the per-pack configs, this does not depend on a pack having answered
+/// any question, so it is what "the revision carries pack X" is read from.
+fn read_revision_pack_ids(
+    expected: &RevisionId,
+    lock_paths: &[PathBuf],
+) -> anyhow::Result<std::collections::BTreeSet<String>> {
+    let mut ids = std::collections::BTreeSet::new();
+    for lock_path in lock_paths {
+        let bytes = std::fs::read(lock_path)
+            .with_context(|| format!("reading pack-list.lock `{}`", lock_path.display()))?;
+        let lock: PackListLock = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parsing pack-list.lock `{}`", lock_path.display()))?;
+        if &lock.revision_id != expected {
+            bail!(
+                "pack-list.lock `{}` pins revision `{}` but is referenced by revision `{}`",
+                lock_path.display(),
+                lock.revision_id,
+                expected
+            );
+        }
+        ids.extend(lock.packs.iter().map(|pack| pack.pack_id.to_string()));
+    }
+    Ok(ids)
+}
+
 fn read_revision_pack_refs(
     env_dir: &Path,
     expected: &RevisionId,
@@ -887,6 +1123,8 @@ fn key_from_bytes(bytes: &[u8], path: &Path) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greentic_runner_host::storage::{new_session_store, new_state_store};
+
     use greentic_deploy_spec::{
         BundleDeployment, BundleDeploymentStatus, CustomerId, EnvironmentHostConfig, LockedPack,
         PackId, PartyId, RevenueShareEntry, RouteBinding, SchemaVersion, TenantSelector,
@@ -924,6 +1162,7 @@ mod tests {
         status: BundleDeploymentStatus,
     ) -> BundleDeployment {
         BundleDeployment {
+            pack_name: None,
             schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
             deployment_id,
             env_id: env_id(),
@@ -1260,6 +1499,30 @@ mod tests {
         assert_eq!(refs.len(), 1);
         assert_eq!(refs[0].path, pack_abs.canonicalize().unwrap());
         assert_eq!(refs[0].digest, "sha256:deadbeef");
+    }
+
+    #[test]
+    fn pack_ids_come_from_the_lock_not_from_pack_configs() {
+        let dir = tempdir().unwrap();
+        let env_dir = dir.path();
+        let rev = RevisionId::new();
+        let lock = PackListLock {
+            schema: SchemaVersion::new(SchemaVersion::PACK_LIST_LOCK_V1),
+            revision_id: rev,
+            packs: ["messaging-webchat-gui", "state-sorla"]
+                .iter()
+                .map(|id| LockedPack {
+                    pack_id: PackId::new(*id),
+                    path: PathBuf::from(format!("packs/{id}.gtpack")),
+                    digest: "sha256:00".to_string(),
+                })
+                .collect(),
+        };
+        let lock_path = write_lock(env_dir, "revisions/r/pack-list.lock", &lock);
+        let ids = read_revision_pack_ids(&rev, std::slice::from_ref(&lock_path)).unwrap();
+        assert!(ids.contains("state-sorla"), "{ids:?}");
+        assert!(ids.contains("messaging-webchat-gui"));
+        assert!(read_revision_pack_ids(&RevisionId::new(), &[lock_path]).is_err());
     }
 
     #[test]
@@ -1655,6 +1918,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1682,6 +1946,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1715,6 +1980,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1746,6 +2012,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail"),
             Err(e) => e,
@@ -1780,6 +2047,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail at pack reading"),
             Err(e) => e,
@@ -1790,6 +2058,67 @@ mod tests {
         assert!(
             chain.contains("no pinned packs"),
             "expected to reach pack reading (host built with provided secrets), got: {chain}"
+        );
+    }
+
+    #[test]
+    fn activate_fails_when_a_flagged_unit_cannot_reach_its_secrets_door() {
+        // A unit whose staged ingress document sets `secrets_door` keeps its
+        // credentials in the admin. With the door unreachable, activation must
+        // fail BEFORE any pack is read, naming the door — not run keyless.
+        let dir = tempdir().unwrap();
+        seed_env_dir(dir.path());
+        let dep_id = DeploymentId::new();
+        let env = make_env(vec![make_deployment(
+            dep_id,
+            "acme",
+            "cust",
+            "fast2flow",
+            BundleDeploymentStatus::Active,
+        )]);
+        let rc = single_revision_rc(&dep_id);
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let doc = serde_json::json!({
+            "v": 1,
+            "tenant_slug": "acme",
+            "secrets_door": true,
+            "metering": {
+                "endpoint": format!("http://127.0.0.1:{port}/api/v1/ingest/worker-usage"),
+                "token": "gtm_activation-test",
+            },
+        });
+        let uri =
+            crate::ingress_auth::ingress_secret_uri(&crate::resolve_env(None), "acme", "fast2flow");
+        let secrets: DynSecretsManager = Arc::new(crate::test_fixtures::FakeSecrets(
+            std::collections::HashMap::from([(uri, doc.to_string().into_bytes())]),
+        ));
+
+        let err = match block_on(activate_runtime_config(
+            dir.path(),
+            &rc,
+            secrets,
+            None,
+            &env,
+            dummy_resolver(),
+            dummy_pin_store(),
+            &new_revision_stores(),
+            &DurableStorage::in_memory(),
+        )) {
+            Ok(_) => panic!("expected activation to fail at the secrets door"),
+            Err(e) => e,
+        };
+        let chain = format!("{err:#}");
+        assert!(chain.contains("secrets door"), "got: {chain}");
+        assert!(
+            !chain.contains("gtm_activation-test"),
+            "token leaked: {chain}"
+        );
+        assert!(
+            !chain.contains("no pinned packs"),
+            "must fail before pack reading: {chain}"
         );
     }
 
@@ -1816,6 +2145,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         ))
         .expect("empty rc activates");
         assert_eq!(activation.routing.dispatcher.deployment_count(), 0);
@@ -1879,6 +2209,7 @@ mod tests {
                 dummy_resolver(),
                 dummy_pin_store(),
                 &stores,
+                &DurableStorage::in_memory(),
             ))
             .is_err(),
             "activation must fail at pack reading (the rc pins no packs)"
@@ -1930,6 +2261,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &stores,
+            &DurableStorage::in_memory(),
         ))
         .expect("empty rc activates");
 
@@ -2027,6 +2359,123 @@ mod tests {
         );
     }
 
+    /// The stable (opt-in) suffix ignores the revision id and nothing else, and
+    /// is never equal to the per-revision suffix.
+    #[test]
+    fn the_stable_suffix_ignores_only_the_revision() {
+        let base = RevisionStoreKey {
+            deployment_id: "dep-01".to_string(),
+            revision_id: "rev-01".to_string(),
+            tenant: "acme".to_string(),
+            team: "general".to_string(),
+            customer_id: "cust-01".to_string(),
+            bundle_id: "Support-Bot.v1".to_string(),
+        };
+        let next_revision = RevisionStoreKey {
+            revision_id: "rev-02".to_string(),
+            ..base.clone()
+        };
+        assert_eq!(
+            stable_namespace_suffix(&base),
+            stable_namespace_suffix(&next_revision)
+        );
+        assert_ne!(
+            revision_namespace_suffix(&base),
+            revision_namespace_suffix(&next_revision)
+        );
+        assert_ne!(
+            stable_namespace_suffix(&base),
+            revision_namespace_suffix(&base)
+        );
+        for mutant in [
+            RevisionStoreKey {
+                deployment_id: "dep-02".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                tenant: "other".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                team: "ops".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                customer_id: "cust-02".into(),
+                ..base.clone()
+            },
+            RevisionStoreKey {
+                bundle_id: "Other.v1".into(),
+                ..base.clone()
+            },
+        ] {
+            assert_ne!(
+                stable_namespace_suffix(&base),
+                stable_namespace_suffix(&mutant)
+            );
+        }
+    }
+
+    /// The durable keyspace has to separate exactly what the in-memory registry
+    /// separates, on EVERY field — a field the registry treats as identity and
+    /// the keyspace ignores is two isolation domains sharing one set of parked
+    /// conversations, visible only on a deployment that configured durability.
+    ///
+    /// The cases are ENUMERATED FROM THE STRUCT, not from a list written here:
+    /// the baseline is serialized, every field of the resulting object is
+    /// mutated in turn, and the mutant is deserialized back. A seventh field is
+    /// therefore covered the moment it is added. A hand-written array would
+    /// stay green while the field it forgot went unprotected, which is the same
+    /// shape of hole `revision_namespace_suffix`'s exhaustive destructure
+    /// closes on the production side — one of the two alone is not enough:
+    /// the destructure would force someone to ADD the field to the digest, and
+    /// this proves the digest actually reacts to it.
+    ///
+    /// A non-`String` field makes this FAIL rather than skip, naming the field:
+    /// the mutation below only knows how to perturb a JSON string, and quietly
+    /// passing over what it cannot perturb is how a list stops covering things.
+    ///
+    /// MUTATION PROOF: drop any field from `revision_namespace_suffix`'s
+    /// destructured digest input and this fails, naming it.
+    #[test]
+    fn every_revision_store_key_field_changes_the_namespace() {
+        let baseline = RevisionStoreKey {
+            deployment_id: "dep-01".to_string(),
+            revision_id: "rev-01".to_string(),
+            tenant: "acme".to_string(),
+            team: "general".to_string(),
+            customer_id: "cust-01".to_string(),
+            bundle_id: "Support-Bot.v1".to_string(),
+        };
+        let baseline_suffix = revision_namespace_suffix(&baseline);
+        let serde_json::Value::Object(fields) =
+            serde_json::to_value(&baseline).expect("the key serializes")
+        else {
+            panic!("RevisionStoreKey must serialize as an object");
+        };
+        assert!(!fields.is_empty(), "the key must have fields to enumerate");
+
+        for name in fields.keys() {
+            let mut mutant = fields.clone();
+            let slot = mutant.get_mut(name).expect("field present");
+            let Some(current) = slot.as_str() else {
+                panic!(
+                    "`{name}` is not a string, so this test cannot perturb it —                      extend the mutation below rather than letting the field go                      uncovered"
+                );
+            };
+            *slot = serde_json::Value::String(format!("{current}-changed"));
+            let mutated: RevisionStoreKey =
+                serde_json::from_value(serde_json::Value::Object(mutant))
+                    .expect("the mutated key deserializes");
+
+            assert_ne!(
+                revision_namespace_suffix(&mutated),
+                baseline_suffix,
+                "changing `{name}` must change the durable keyspace; as written, two                  revisions the registry keeps apart would share one set of parked                  conversations"
+            );
+        }
+    }
+
     /// Same argument for the tenant. `SessionKey` is an opaque generated id and
     /// `get_session` resolves it with no tenant check, so a key still held by
     /// the previous tenant's client would resolve against the new tenant.
@@ -2111,6 +2560,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to fail closed on a foreign tenant"),
             Err(e) => e,
@@ -2147,6 +2597,7 @@ mod tests {
             dummy_resolver(),
             dummy_pin_store(),
             &new_revision_stores(),
+            &DurableStorage::in_memory(),
         )) {
             Ok(_) => panic!("expected activation to pass the scope guard and reach pack reading"),
             Err(e) => e,
@@ -2212,6 +2663,8 @@ mod tests {
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: index.flow_index,
             app_packs: index.app_packs,
+            triggers: Default::default(),
+            runtime_metered: Default::default(),
         };
         let next = reactivate_routing_only(&prev, &env);
         let got = next.app_packs.get("fast2flow", rev).expect("carried");

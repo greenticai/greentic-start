@@ -510,9 +510,9 @@ pub(super) async fn parked_flow(
         super::envelope_to_activity(ingress, scope.tenant, scope.endpoint_id, None, None);
     for flow_id in flows {
         let envelope = resume_lookup_envelope(&activity, scope.tenant, &app.pack_id, flow_id);
-        // greentic-runner-host 1.1.x: `fetch` is synchronous.
         if resume
             .fetch(&envelope)
+            .await
             .map_err(|err| anyhow::anyhow!("{err}"))?
             .is_some()
         {
@@ -535,6 +535,7 @@ pub(super) fn resume_lookup_envelope(
     flow_id: &str,
 ) -> IngressEnvelope {
     IngressEnvelope {
+        entry_node: None,
         tenant: tenant.to_string(),
         env: std::env::var("GREENTIC_ENV").ok(),
         pack_id: Some(pack_id.to_string()),

@@ -149,6 +149,7 @@ pub(super) fn flow(id: &str) -> AppFlowInfo {
         id: id.to_string(),
         kind: "messaging".to_string(),
         subscribes_to: vec![],
+        node_ids: vec![],
     }
 }
 
@@ -489,6 +490,7 @@ fn wait_in(flow_id: &str) -> FlowWait {
             flow_id: flow_id.into(),
             next_flow: None,
             next_node: "ask".into(),
+            awaiting_submit: true,
             state,
         },
     }
@@ -506,6 +508,7 @@ async fn park(store: &DynSessionStore, fx: &Fixture, flow_id: &str) {
     let env = resume_lookup_envelope(&activity, TENANT, PACK, flow_id);
     FlowResumeStore::new(Arc::clone(store))
         .save(&env, &wait_in(flow_id))
+        .await
         .expect("park");
 }
 
@@ -530,9 +533,9 @@ async fn a_park_is_only_found_under_the_flow_it_was_parked_in() {
         same.reply_scope.as_ref().map(|s| s.conversation.as_str()),
         Some("pipeline_flow")
     );
-    assert!(resume.fetch(&same).expect("fetch").is_some());
+    assert!(resume.fetch(&same).await.expect("fetch").is_some());
     assert!(
-        resume.fetch(&other).expect("fetch").is_none(),
+        resume.fetch(&other).await.expect("fetch").is_none(),
         "pinning another flow would strand the parked one"
     );
 }
@@ -614,6 +617,8 @@ pub(super) fn activation_with(
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index,
             app_packs,
+            triggers: Default::default(),
+            runtime_metered: Default::default(),
         }),
     }
 }

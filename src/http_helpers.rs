@@ -142,7 +142,10 @@ pub(crate) fn handle_builtin_health_request(
         "/readyz" => Some(json_response(StatusCode::OK, json!({ "status": "ready" }))),
         "/status" => Some(json_response(
             StatusCode::OK,
-            json!({ "status": "running" }),
+            json!({
+                "status": "running",
+                "telemetry": crate::otlp_status::snapshot_json(),
+            }),
         )),
         _ => None,
     }

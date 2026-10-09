@@ -1,0 +1,294 @@
+# Durable conversation state
+
+A conversation that is waiting on the person — a card awaiting its submit, a
+`session.wait` — is a snapshot in the runner host's **session store**. By
+default that store is in memory, so it dies with the process.
+
+For a desktop run that is right. For a deployed worker it is not: a revision
+rollout, a pod restart or a Cloud Run cold start throws every parked
+conversation away, and **nothing reports it**. The deploy succeeds, `/livez`
+answers, and the person's next message lands on the entry card as though they
+had never typed anything. The only party who sees the failure is the user.
+
+This page is how an operator turns that off.
+
+## What an operator sets
+
+| Variable | Values | Default | What it does |
+|---|---|---|---|
+| `GREENTIC_RUNNER_SESSION_BACKEND` | `memory` \| `redis` | `memory` | Where parked conversations live. **This is the one that matters.** |
+| `GREENTIC_RUNNER_STATE_BACKEND` | `memory` \| `redis` | `memory` | Where per-session flow state lives. Optional; read the caveat below. |
+| `GREENTIC_RUNNER_REDIS_URL` | `redis://…` / `rediss://…` | — | The connection URL for both stores. Required once either backend is `redis`. |
+| `GREENTIC_RUNNER_SESSION_NAMESPACE` | a keyspace prefix | `greentic:session:<env>` | The prefix every session key of this deployment is written under. |
+| `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS` | seconds, or `0` | `86400` (24 h) | How long a parked conversation survives before Redis expires it. `0` disables expiry. |
+| `GREENTIC_REVISION_PIN_REDIS_URL` | `redis://…` | — | Revision affinity. **Set this too** — see "Affinity" below. |
+
+The minimum for a Cloud Run deployment:
+
+```bash
+GREENTIC_RUNNER_SESSION_BACKEND=redis
+GREENTIC_RUNNER_REDIS_URL=rediss://default:<password>@<host>:<port>
+GREENTIC_REVISION_PIN_REDIS_URL=rediss://default:<password>@<host>:<port>
+GREENTIC_ENV=<your environment id>        # or --env; it derives the keyspace
+```
+
+Naming neither backend leaves the binary byte-for-byte on the behaviour it had
+before this feature existed. A Redis URL **alone** switches nothing on: the
+backend has to be named, so a URL that is in the environment for some other
+reason (the pin store's, say) cannot silently move a deployment's conversations.
+
+## What is stored, and for how long
+
+Only the parked snapshot: which flow, which node it stopped at, and the
+execution state that node needs to continue. No message history, no rendered
+card, no credential.
+
+Each parked conversation carries a 24-hour TTL by default. The number is a
+judgement between two bounds:
+
+- **Long enough that the feature works.** The conversation this exists to
+  preserve is one a human parked. Someone who answers the next morning has to
+  still resume.
+- **Short enough that abandonment is bounded.** Without expiry, every
+  parked-and-never-resumed conversation is a permanent key, accumulating for as
+  long as the deployment runs, with nothing reporting the growth.
+
+Raise or lower it with `GREENTIC_RUNNER_SESSION_WAIT_TTL_SECS`. `0` means no
+expiry, which is a real choice for a deployment that archives its own keys — but
+it is not the default, because the failure it produces is invisible.
+
+## A shared Redis is a shared blast radius
+
+Every key this writes is under one prefix, and **choosing that prefix is the
+operator's job.**
+
+Be precise about how much risk that is, because the answer changed once this
+feature landed and over-warning is its own kind of wrong. greentic-start does
+not write under the prefix you configure; it writes under
+`<your prefix>:<revision id>-<digest of deployment, revision, tenant, team,
+customer and bundle>`. Two deployments can only land in the same keyspace when
+**all six** of those agree. In practice that means two environments sharing one
+namespace collide only when they are serving the same bundle, at the same
+revision, for the same tenant, team and customer — a staging and a production
+environment both running `Support-Bot.v2` revision `01JB…` for tenant `acme`,
+say. Different environments running different revisions do not collide at all.
+
+What makes the collision worth avoiding rather than shrugging at is what it
+does when it happens. A greentic-session entry key carries the tenant, provider,
+channel, conversation and user but **not the environment**, so a lookup that
+finds the other environment's context does not return it — it drops the entry
+and returns nothing. Two colliding deployments therefore *evict each other's
+parked conversations* rather than leaking them: no disclosure, but conversations
+that restart intermittently, under load, with nothing red anywhere.
+
+It is cheap to remove entirely, so do:
+
+- give every environment its own `GREENTIC_RUNNER_SESSION_NAMESPACE`, or
+- give every environment its own `GREENTIC_ENV` (the default keyspace is
+  `greentic:session:<env>`), or
+- give every environment its own Redis database or instance.
+
+The revision-level scoping is the one piece the binary does for you; the
+environment boundary is yours.
+
+The same Redis may be shared with `GREENTIC_REVISION_PIN_REDIS_URL` and with
+`GREENTIC_AW_REDIS_URL`; those use their own prefixes.
+
+## Affinity: durable sessions alone are half a configuration
+
+greentic-start gives every pack revision its **own** session keyspace, on
+purpose. Two revisions serving the same tenant/user/conversation must not resume
+each other's snapshot against a different flow graph.
+
+That isolation and durability are not in tension — a per-revision keyspace still
+survives a restart, which is the whole point — but it does mean a resumed turn
+has to reach the revision it parked on. Interop callers (`/a2a`, `/mcp`) carry
+no stickiness cookie at all, so `GREENTIC_REVISION_PIN_REDIS_URL` is the only
+affinity mechanism on that path. Configured without it, a resumed turn can be
+weighted onto another revision, find nothing under that revision's keyspace, and
+restart the conversation: the same symptom the operator just configured Redis to
+remove, now intermittent instead of certain.
+
+The binary **warns loudly at boot** when durable sessions are configured and the
+pin URL is not, naming both variables. It does not refuse, because a
+single-replica, single-revision deployment is a legitimate configuration in
+which pinning buys nothing.
+
+## Flow state is a separate switch, and it is not revision-scoped
+
+`GREENTIC_RUNNER_STATE_BACKEND=redis` makes the per-session flow state (what a
+flow's `state` operations read and write) durable too. One caveat, which
+greentic-start warns about at boot rather than leaving you to find:
+
+`greentic-state` composes its own key
+(`greentic:state:<env>:<tenant>[:<team>][:<user>]:runner:pack/<pack>/flow/<flow>/session/<hint>`)
+and its Redis store takes no namespace, so there is nowhere to fold a revision
+in. A durable flow-state store is therefore **shared between two live revisions
+of one pack**. That is a smaller hazard than a shared resume snapshot — the two
+revisions are the same flow, and the key carries pack, flow and session — but it
+is a real difference from the in-memory default.
+
+Parked **sessions** stay isolated per revision either way.
+
+## Resuming a WebChat conversation re-establishes its revision pin
+
+The conversation -> revision pin is a routing hint held in memory (or in Redis
+with `GREENTIC_REVISION_PIN_REDIS_URL`). It is created by `POST /conversations`
+and is gone after a restart, a redeploy, its TTL, or when another replica takes
+the request, while the conversation's durable state (see `state-sorla`) is not.
+The WebSocket stream used to answer `404 no revision pin for this conversation`
+in that situation, so a page that resumed a saved chat rendered an empty
+transcript and left new messages at "Sending", although every REST call worked.
+
+A pin is now re-established, lazily and idempotently, by two paths:
+
+* **WebSocket upgrade** (`.../conversations/{id}/stream?t=...`). The token is
+  verified first (signature, expiry, tenant, and a `conv` claim equal to the
+  path id; a conversation-less token is refused). Then the pin is created on a
+  weighted healthy revision of the CURRENT activation
+  (`RevisionDispatcher::establish_pin`).
+* **REST resume and posts** (`GET /conversations/{id}`, `POST`/`GET
+  .../activities`). After the provider answered 2xx for a caller whose token was
+  already bound to that conversation, the pin is committed with the same
+  insert-if-absent write. A conversation-less token never pins.
+
+Rules, inherited from the pin store's `try_pin`:
+
+* A live pin is never replaced. A conversation pinned to an older revision that
+  is still serving (a rolling deploy) stays on it.
+* Racing resumes converge on one revision and one stored pin.
+* Every write needs a verified token, a refused request leaves nothing behind,
+  and the store's own cardinality caps and TTL still bound memory.
+* With a shared pin store (Redis) any replica can establish the pin. With the
+  in-memory store each replica establishes its own on first contact, which is
+  harmless because the conversation's state is in the durable store.
+* The pin is on the *current* revision. With `stable_component_state: false`
+  that revision has a new keyspace, so a resumed conversation is a new one (the
+  documented default); with it on, the component state (the WebChat history)
+  carries over.
+
+Unchanged: a `GET` for a conversation the provider does not know still answers
+the provider's `404`, and nothing is pinned.
+
+## Failure behaviour
+
+Two rules, and they differ deliberately:
+
+- **A backend that was named and cannot be reached is a boot failure.** The
+  store is probed at construction (`redis::Client::open` parses the URL and
+  opens no socket, so construction alone proves nothing), and an unreachable
+  Redis aborts the boot with a message naming which store failed. It never
+  degrades to memory. An operator who configured durability and silently got
+  memory would have a worker that boots, serves, passes every probe, and
+  restarts every parked conversation — the exact failure this feature removes.
+- **A store that degrades later keeps serving.** A Redis that goes away
+  mid-flight surfaces as a turn-level error, not a crash.
+
+This is the opposite of `GREENTIC_REVISION_PIN_REDIS_URL`, which fails **open**:
+a pin is a routing hint, and losing one re-picks a revision for a conversation
+that still works. Losing conversation state is not a hint — it is the
+conversation.
+
+## Verifying it
+
+```bash
+# 1. The boot line names the backend (and never the URL):
+#    conversation state: sessions redis (namespace 'greentic:session:prod',
+#    wait ttl 86400s), flow state in-memory (parked conversations survive a restart)
+
+# 2. Park a conversation, then look for its key:
+redis-cli --scan --pattern 'greentic:session:prod:*' | head
+
+# 3. Restart the process and send the next turn on the same conversation id.
+#    It must continue, not greet.
+```
+
+The automated version of step 3 is
+`durable_state::tests::a_parked_conversation_survives_a_restart`, which is
+`#[ignore]`d because it needs a real Redis:
+
+```bash
+docker run -d --name start-durable-redis -p 127.0.0.1:6398:6379 redis:7-alpine
+GREENTIC_DURABLE_TEST_REDIS_URL=redis://127.0.0.1:6398 \
+  cargo test -p greentic-start --lib durable_state::tests -- --ignored --nocapture
+```
+
+## Requirements
+
+`greentic-runner-host` must be built with its `session-redis` feature, which is
+on by its default feature set and therefore on in this binary. A build without
+it **refuses** a Redis session backend rather than falling back to memory.
+
+## `state-sorla`: component state through the admin's HTTP door
+
+The WIT `greentic:state/state-store` import a provider such as WebChat uses, and
+the flow `state` operations, are served by one [`StateStore`] inside
+runner-host. `state-sorla` is a third backend for it, beside memory and Redis:
+a key/value client of the admin's state door, so a deployed worker holds no
+database credential at all.
+
+A revision selects it by **carrying the `state-sorla` pack** in its pinned
+pack list (`pack-list.lock`), whether or not the pack has any config: the loader
+keeps a pack config only when it is non-empty, so the list is what is read. An
+empty or absent config means all defaults. A revision with the pack and no
+`metering` block refuses activation. Naming nothing leaves the
+behaviour above untouched. It overrides `GREENTIC_RUNNER_STATE_BACKEND` for that
+revision. It does **not** replace the session store: parked-conversation
+snapshots stay on `GREENTIC_RUNNER_SESSION_BACKEND`, because the session trait
+needs wait indices and per-user listing that a key/value door cannot answer.
+
+| Config field | Default | Meaning |
+|---|---|---|
+| `endpoint` | derived | Door base URL. Absent: the unit's staged `metering.endpoint` with `worker-usage` swapped for `state`. https, or http on loopback only. |
+| `key_prefix` | `greentic-state` | Front of every door key; the revision's isolation suffix follows it. |
+| `default_ttl_seconds` | none | TTL on a write that names none. |
+| `request_timeout_ms` | `5000` | Per-request timeout (100 to 60000). |
+| `cache_max_entries` | `1024` | Bounded LRU read cache; `0` disables it. |
+| `stable_component_state` | `false` | Boolean (`true`/`false`, or the same strings). Opt-in: component state (WIT `state-store` keys that are not flow-shaped) is keyed per environment/unit instead of per revision, so it survives a redeploy. See "Surviving a redeploy". |
+
+The credential is the unit's `metering.token` (`gtm_`), never a config field,
+and no type here prints it. Wire contract: `POST {door}/read|write|delete` with
+`{"key"}` / `{"key","value":"<b64>","ttl_secs"?}`, `read` answering
+`200 {"value":"<b64>"}` or `404`.
+
+Rules: a named backend that cannot be built, or whose door fails the activation
+probe (a read of a key that is never written), **fails the revision activation**.
+A door error on a write, or on a read the cache cannot answer, fails that
+operation. A cached read is served past its 30 s freshness window for up to 10
+minutes while the door is down, with a warning. Writes are never buffered. Keys
+are scoped per revision.
+
+### Atomic claims
+
+`StateStore::set_json_if_absent` (the WIT `state-store@1.1.0` `write-if-absent`)
+is a `POST {door}/write` with `"if_absent": true`: `201` = claimed, `409
+{"error":{"code":"already_exists"}}` = a live value exists (`Ok(false)`, and the
+read cache is invalidated, never filled with our value). Any other outcome,
+including a `204` (an old door that ignored the flag and **overwrote** the key),
+is an error: a door failure is never "claimed" and never "exists". The read
+cache is never consulted for the decision.
+
+### Surviving a redeploy: `stable_component_state`
+
+The per-revision suffix is `<revision id>-<digest of deployment, revision,
+tenant, team, customer, bundle>`, so every redeploy (a new revision) starts with
+an empty keyspace even on a durable door. Setting `stable_component_state: true`
+in the `state-sorla` pack config (read in `sorla_state/config.rs`; default
+`false`; it reaches the store through `SorlaStateConfig`, with the stable suffix
+`stable-<digest of deployment, tenant, team, customer, bundle>` passed down from
+`revision_boot`) moves **component state only** to that revision-independent
+namespace. Flow state (keys the runner composes as `pack/<pack>/flow/<flow>/...`)
+stays per revision in either mode, because the new revision's flow graph may not
+understand a snapshot the old one wrote.
+
+Risks, stated plainly:
+
+* During a rolling deploy two revisions are live and now **share** component
+  keys. New component code reading state written by old code (or the reverse)
+  is not protected; keep component state formats forward and backward
+  compatible.
+* The split is by key shape. A component key that happens to start with `pack/`
+  is treated as flow state and stays per revision (the safe direction).
+* WebChat's shared history is safe because its activity slots are claimed with
+  the atomic `write-if-absent`: two revisions cannot both own a slot. Plain
+  read-modify-write component state has no such guarantee.

@@ -97,8 +97,13 @@ pub fn normalise_route(path: &str) -> String {
             continue;
         }
         let bytes = seg.as_bytes();
-        let looks_like_id = bytes.iter().all(|b| b.is_ascii_hexdigit() || *b == b'-')
+        let looks_like_hex_id = bytes.iter().all(|b| b.is_ascii_hexdigit() || *b == b'-')
             && (seg.len() >= 16 || seg.contains('-'));
+        // A purely numeric segment (`/orders/12345`) is a row id, never a
+        // route literal; left in, every id mints a new span name and a new
+        // metric series.
+        let looks_like_numeric_id = bytes.iter().all(u8::is_ascii_digit);
+        let looks_like_id = looks_like_hex_id || looks_like_numeric_id;
         if looks_like_id {
             out.push_str(":id");
         } else {
@@ -121,6 +126,20 @@ mod tests {
         assert_eq!(
             normalise_route("/v1/web/webchat/demo/sessions/edbd06e4-5a10-40db-b226-38deb55ea0bd"),
             "/v1/web/webchat/demo/sessions/:id"
+        );
+    }
+
+    #[test]
+    fn collapses_all_digit_segments() {
+        assert_eq!(normalise_route("/nope/12345"), "/nope/:id");
+        assert_eq!(
+            normalise_route("/orders/7/items/42"),
+            "/orders/:id/items/:id"
+        );
+        // Digits mixed with letters are not an id on their own.
+        assert_eq!(
+            normalise_route("/v3/directline/conversations"),
+            "/v3/directline/conversations"
         );
     }
 

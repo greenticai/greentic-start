@@ -4,6 +4,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::DEFAULT_TEAM;
 use crate::DEFAULT_TENANT;
+use crate::dev_store_path::EnvDirOrigin;
 use crate::runtime::NatsMode;
 
 #[derive(Parser)]
@@ -58,6 +59,14 @@ pub(crate) struct DoctorArgs {
     /// Restrict checks to one diagnostic stage.
     #[arg(long, value_enum, default_value_t = DoctorStageArg::All)]
     pub(crate) stage: DoctorStageArg,
+    /// Environment home to check, instead of the default `~/.greentic/
+    /// environments`. Same meaning and spelling as `start --store-root`, and
+    /// it must be: every env-mode check (trust root, endpoint linkage,
+    /// runtime-config, secret refs) is scoped to this root, so a doctor run
+    /// without it reports on a store the runtime never opens when the runtime
+    /// was started with one.
+    #[arg(long)]
+    pub(crate) store_root: Option<PathBuf>,
 }
 
 impl DoctorArgs {
@@ -66,6 +75,15 @@ impl DoctorArgs {
     /// target was given (mirroring the bundle-less `greentic-start` boot).
     pub(crate) fn env_mode(&self) -> bool {
         self.env.is_some() || self.bundle.is_none()
+    }
+
+    /// Whether the env dir being checked was NAMED by the operator, which is
+    /// what decides the dev store doctor reads — the same question, answered
+    /// by the same rule, as [`StartRequest::env_dir_origin`]. Doctor's whole
+    /// value here is that its verdict matches the runtime's, so the two must
+    /// not each carry their own copy of this.
+    pub(crate) fn env_dir_origin(&self) -> EnvDirOrigin {
+        EnvDirOrigin::of_store_root(self.store_root.as_deref())
     }
 }
 
@@ -113,6 +131,9 @@ pub(crate) struct ResolveSecretArgs {
 pub(crate) struct StartArgs {
     #[arg(long)]
     bundle: Option<String>,
+    /// Boot from a greentic-deployer environment home instead of a bundle.
+    #[arg(long)]
+    store_root: Option<PathBuf>,
     /// Environment id whose persisted state the bundle-less boot serves.
     /// Wins over `$GREENTIC_ENV`; defaults to `local`. Ignored (with a
     /// warning) on the legacy `--bundle` / `--config` path, which has no
@@ -263,6 +284,9 @@ pub enum RestartTarget {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StartRequest {
     pub bundle: Option<String>,
+    /// Root of the environment store to serve. `None` falls back to
+    /// `LocalFsStore::default_root()`.
+    pub store_root: Option<PathBuf>,
     /// Environment id override for the bundle-less boot (flag >
     /// `$GREENTIC_ENV` > `local` — precedence lives in `resolve_env`).
     pub env: Option<String>,
@@ -305,6 +329,25 @@ pub struct StartRequest {
     pub tunnel_explicit: bool,
 }
 
+impl StartRequest {
+    /// Whether the bundle-less serve loop's env dir was NAMED by the operator,
+    /// which is what decides the dev store it reads (see
+    /// [`crate::dev_store_path`]).
+    ///
+    /// A method rather than an inline `match` at the one call site because its
+    /// regression is silent in both directions and neither is caught by
+    /// anything else: a boot that answers `Default` while `--store-root` was
+    /// given reads the `$HOME` store, so every credentialed read misses while
+    /// the deploy succeeds, the process boots and `/livez` stays green; one
+    /// that answers `Explicit` without the flag would move the store out from
+    /// under the `gtc setup` ↔ `gtc start` rendezvous. Keeping the rule here,
+    /// beside the field it reads, is what lets a test drive it from the real
+    /// CLI.
+    pub(crate) fn env_dir_origin(&self) -> EnvDirOrigin {
+        EnvDirOrigin::of_store_root(self.store_root.as_deref())
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StopRequest {
     pub bundle: Option<String>,
@@ -319,6 +362,7 @@ pub struct StopRequest {
 pub(crate) fn start_request_from_args(args: StartArgs, tunnel_explicit: bool) -> StartRequest {
     StartRequest {
         bundle: args.bundle,
+        store_root: args.store_root,
         env: args.env,
         tenant: args.tenant,
         team: args.team,
@@ -495,6 +539,7 @@ pub(crate) fn restart_name(target: &RestartTarget) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// `start` and `stop` must land in the same tenant every other tool in
     /// the fleet defaults to. This was `demo` while greentic-deployer and
@@ -692,5 +737,129 @@ mod tests {
         };
         let req = start_request_from_args(args, false);
         assert!(req.open_webchat.is_none());
+    }
+
+    /// `--store-root` parses onto `start` and reaches `StartRequest`.
+    ///
+    /// The flag is what lets a caller serve an env home staged somewhere other
+    /// than `~/.greentic` — greentic-designer spawns exactly this argv, one
+    /// store root per operator environment.
+    #[test]
+    fn start_root_flag_reaches_the_request() {
+        let cli = Cli::try_parse_from([
+            "greentic-start",
+            "start",
+            "--store-root",
+            "/srv/envhome",
+            "--env",
+            "local",
+        ])
+        .expect("start --store-root parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+        let req = start_request_from_args(args, false);
+        assert_eq!(req.store_root.as_deref(), Some(Path::new("/srv/envhome")));
+        assert_eq!(req.env.as_deref(), Some("local"));
+    }
+
+    /// Omitting it stays `None`, which is what keeps the default-root boot
+    /// byte-for-byte unchanged for every existing caller.
+    #[test]
+    fn without_the_flag_the_store_root_is_none() {
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).expect("start parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+        assert!(start_request_from_args(args, false).store_root.is_none());
+    }
+
+    /// The flag landing on the request is only half the chain. The other half
+    /// is the ORIGIN it produces, which is what `dev_store_path` orders its
+    /// candidates by — and a regression there is silent: the runtime reads the
+    /// `$HOME` store, every credentialed read misses, and the deploy succeeds
+    /// with `/livez` green. Both tests drive the real parser so the whole
+    /// chain (argv → `StartRequest::store_root` → `EnvDirOrigin`) is covered,
+    /// not just a mapping over an `Option`.
+    #[test]
+    fn the_store_root_flag_makes_the_env_dir_origin_explicit() {
+        let cli = Cli::try_parse_from([
+            "greentic-start",
+            "start",
+            "--store-root",
+            "/srv/envhome",
+            "--env",
+            "local",
+        ])
+        .expect("start --store-root parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+
+        assert_eq!(
+            start_request_from_args(args, false).env_dir_origin(),
+            EnvDirOrigin::Explicit,
+            "an operator who named an env home must get its own dev store",
+        );
+    }
+
+    /// The other direction, and it is not symmetric bookkeeping: answering
+    /// `Explicit` with no flag would move the store out from under the
+    /// `gtc setup` ↔ `gtc start` rendezvous that the `$HOME`-first order
+    /// exists for.
+    #[test]
+    fn without_the_flag_the_env_dir_origin_is_the_default() {
+        let cli = Cli::try_parse_from(["greentic-start", "start"]).expect("start parses");
+        let Command::Start(args) = cli.command else {
+            panic!("did not parse as start");
+        };
+
+        assert_eq!(
+            start_request_from_args(args, false).env_dir_origin(),
+            EnvDirOrigin::Default,
+        );
+    }
+
+    /// `doctor --store-root` parses and produces the same origin `start` does.
+    ///
+    /// Until #620 `doctor` had no such flag at all, so a caller could not
+    /// point it at the env home their runtime serves from even in principle:
+    /// every env-mode check was hardcoded to `LocalFsStore::default_root()`.
+    /// Fixing the dev-store read order alone would not have helped — the env
+    /// dir it ordered candidates against was still derived from `$HOME`.
+    #[test]
+    fn the_doctor_store_root_flag_makes_the_env_dir_origin_explicit() {
+        let cli = Cli::try_parse_from([
+            "greentic-start",
+            "doctor",
+            "--store-root",
+            "/srv/envA",
+            "--env",
+            "local",
+        ])
+        .expect("doctor --store-root parses");
+        let Command::Doctor(args) = cli.command else {
+            panic!("did not parse as doctor");
+        };
+
+        assert_eq!(args.store_root.as_deref(), Some(Path::new("/srv/envA")));
+        assert_eq!(
+            args.env_dir_origin(),
+            EnvDirOrigin::Explicit,
+            "doctor must report on the store the operator named, not on $HOME",
+        );
+    }
+
+    /// Omitting it keeps doctor on the home-rooted default, which is what
+    /// makes this fix additive for every existing invocation.
+    #[test]
+    fn without_the_flag_the_doctor_env_dir_origin_is_the_default() {
+        let cli = Cli::try_parse_from(["greentic-start", "doctor"]).expect("doctor parses");
+        let Command::Doctor(args) = cli.command else {
+            panic!("did not parse as doctor");
+        };
+
+        assert!(args.store_root.is_none());
+        assert_eq!(args.env_dir_origin(), EnvDirOrigin::Default);
     }
 }

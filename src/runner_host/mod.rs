@@ -6,6 +6,9 @@ mod hooks;
 mod token_validation;
 mod types;
 
+pub(crate) use dispatch::{
+    IngressExtensionCall, invoke_pack_ingress_extension, read_provider_ingress_extension,
+};
 pub use helpers::primary_provider_type;
 // RunnerExecutionMode is re-exported because it is a public field of FlowOutcome.
 #[allow(unused_imports)]
@@ -426,6 +429,25 @@ impl DemoRunnerHost {
         Ok(outcome)
     }
 
+    /// Every lookup key registered for `domain`, sorted for determinism.
+    ///
+    /// The catalog registers each pack under its provider type, its pack id and
+    /// its short aliases, so this returns more entries than there are packs;
+    /// callers that resolve one provider (rather than enumerate packs) should
+    /// pair it with [`DemoRunnerHost::supports_op`] and take the first match.
+    /// Sorted rather than `HashMap`-ordered so a bundle with two capable packs
+    /// picks the same one on every boot.
+    pub fn provider_ids(&self, domain: Domain) -> Vec<String> {
+        let mut ids: Vec<String> = self
+            .catalog
+            .keys()
+            .filter(|(key_domain, _)| *key_domain == domain)
+            .map(|(_, provider)| provider.clone())
+            .collect();
+        ids.sort();
+        ids
+    }
+
     pub fn supports_op(&self, domain: Domain, provider_type: &str, op_id: &str) -> bool {
         self.catalog
             .get(&(domain, provider_type.to_string()))
@@ -437,7 +459,7 @@ impl DemoRunnerHost {
     }
 }
 
-fn secret_read_uris(
+pub(crate) fn secret_read_uris(
     env: &str,
     tenant: &str,
     team: Option<&str>,
@@ -459,7 +481,7 @@ fn secret_read_uris(
     }
 }
 
-fn is_secret_not_found(err: &impl std::fmt::Display) -> bool {
+pub(crate) fn is_secret_not_found(err: &impl std::fmt::Display) -> bool {
     let err_str = err.to_string();
     err_str.contains("not found")
         || err_str.contains("NotFound")

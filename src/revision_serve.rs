@@ -14,22 +14,26 @@
 //! runtime via [`RunnerHost::handle_activity_for_revision`], and serializes the
 //! reply activities back as a JSON array.
 //!
-//! This is the **generic-JSON vertical slice**: the body is treated as a generic
-//! JSON activity (a `text` field becomes a messaging activity, anything else a
-//! custom `http.request` activity routed to the pack's entry flow). Provider
-//! webhook parsing (Slack/Telegram signature-verified `ingest_http`), WebChat /
-//! DirectLine, WebSocket upgrades, and static-asset serving under revisions are
-//! deliberately out of scope and stay on the legacy ingress for now.
+//! Besides that generic-JSON path — where the body is treated as a generic JSON
+//! activity (a `text` field becomes a messaging activity, anything else a custom
+//! `http.request` activity routed to the pack's entry flow) — Phase D.3 added
+//! `dispatch_provider_route`, which serves pack-declared provider webhooks by
+//! invoking the provider component's own op
+//! (`RunnerHost::invoke_provider_for_revision`). A route with no
+//! `provider_type` is still refused (`501`) rather than run generically. Only
+//! `POST` requests to non-provider paths run the entry flow; everything else is
+//! `404` (no deployment bound) / `405` (wrong method). Caller-asserted identity
+//! (`x-greentic-user`/`-session`, body `user`/`session`) is honoured only from
+//! loopback peers, so a remote caller cannot impersonate a user/session or pin a
+//! chosen revision (see `caller_identity`).
 //!
-//! Because provider parsing is deferred, the slice is **fail-closed** rather than
-//! a catch-all: a request whose `(path, method)` matches the selected revision's
-//! declared provider route is refused (`501`) instead of being run generically —
-//! that would skip the provider's signature/token verification. Only `POST`
-//! requests to non-provider paths run the entry flow; everything else is `404`
-//! (no deployment bound) / `405` (wrong method) / `501` (provider path). Caller-
-//! asserted identity (`x-greentic-user`/`-session`, body `user`/`session`) is
-//! honoured only from loopback peers, so a remote caller cannot impersonate a
-//! user/session or pin a chosen revision (see `caller_identity`).
+//! Inbound provider webhooks are authenticated by two gates before the body is
+//! trusted: [`crate::provider_auth`] for a shared secret echoed in a header
+//! (Telegram), and [`crate::provider_webhook_verify`] for a signed request
+//! (Slack). Note this path does NOT run the pack's
+//! `messaging.provider_ingress.v1` component the way the legacy ingress does —
+//! it calls the provider op directly — so nothing a provider component would
+//! have checked on the legacy path is checked here implicitly.
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -61,6 +65,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
 use tokio::sync::{Notify, oneshot};
+use tracing::Instrument as _;
 
 use greentic_runner_host::{Activity, RunnerHost, WelcomeFlowHint};
 
@@ -74,6 +79,7 @@ use greentic_deployer::environment::{LocalFsStore, load_trust_root};
 use greentic_types::EnvId;
 use greentic_update::binswap;
 use greentic_update::plan::{plan_targets_env, select_binary, verify_update_plan};
+use greentic_update::staging::UpdatesRoot;
 use greentic_update::stream::{StreamError, build_stream_client, run_stream};
 
 use crate::deployment_routes::RevisionIngressRouting;
@@ -86,6 +92,7 @@ use crate::ingress_types::IngressHttpResponse;
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::provider_auth;
+use crate::provider_webhook_verify;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
 };
@@ -94,10 +101,83 @@ use crate::revision_drain::{
     RevisionTeardown,
 };
 
+/// Set-once latch for deferred public-URL capture on Cloud Run.
+///
+/// On Cloud Run, the runtime's own public URL is not known at boot time (no
+/// tunnel, no manifest `public_base_url`). The first inbound request through
+/// the Google Front End carries the real `Host` header, and this struct lets the
+/// request-path writer communicate the derived URL to the boot-side waiter
+/// (the deferred webhook-registration task).
+///
+/// - [`offer`](Self::offer): called from the hot request path; first writer
+///   wins (idempotent via `OnceLock`), then wakes the boot waiter.
+/// - [`captured`](Self::captured): awaited by the boot task; registers
+///   `notified()` before re-checking `get()` to avoid a missed notify.
+/// - [`get`](Self::get): non-async read for the reload path.
+#[derive(Debug, Default)]
+pub(crate) struct PublicUrlCapture {
+    url: std::sync::OnceLock<String>,
+    notify: tokio::sync::Notify,
+    /// K_SERVICE at boot. The derived `Host` must be this service's own
+    /// `<expected_service>-*.run.app` URL (see
+    /// [`crate::startup_contract::derive_public_base_url`]) — the anti-hijack
+    /// pin. Empty in the `Default` case (used only by tests that never
+    /// exercise derivation).
+    expected_service: String,
+}
+
+impl PublicUrlCapture {
+    /// Create an armed capture pinned to `expected_service` (the Cloud Run
+    /// `K_SERVICE`). Only a `Host` of the form `<expected_service>-*.run.app`
+    /// will be captured.
+    pub(crate) fn new(expected_service: String) -> Self {
+        Self {
+            url: std::sync::OnceLock::new(),
+            notify: tokio::sync::Notify::default(),
+            expected_service,
+        }
+    }
+
+    /// Offer a derived URL. Only the first call wins; subsequent calls are
+    /// no-ops (the `OnceLock` rejects them). After a successful set, wakes
+    /// the single boot waiter via `notify_one`.
+    pub(crate) fn offer(&self, url: String) {
+        if self.url.set(url).is_ok() {
+            self.notify.notify_one();
+        }
+    }
+
+    /// Non-async read of the captured URL. Used by the reload path to check
+    /// whether a URL was captured without awaiting.
+    pub(crate) fn get(&self) -> Option<&String> {
+        self.url.get()
+    }
+
+    /// Wait until a URL has been captured. The boot-side deferred registration
+    /// task calls this. Race-free for a single waiter: `notified()` is
+    /// registered BEFORE re-checking `get()`, so a concurrent `offer` between
+    /// the check and the await is not missed.
+    pub(crate) async fn captured(&self) -> String {
+        loop {
+            let waiting = self.notify.notified();
+            if let Some(u) = self.url.get() {
+                return u.clone();
+            }
+            waiting.await;
+        }
+    }
+}
+
 /// Largest request body the revision ingress accepts, in bytes. Even on the
 /// loopback / local posture a cap is required so one oversized POST cannot
 /// exhaust memory before the JSON parse rejects it.
-const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
+///
+/// `pub(crate)` because `/mcp` does NOT go through [`read_body_limited`] —
+/// the request is handed to `rmcp` whole and that transport reads its own
+/// body — so [`crate::interop::mcp::server::mcp_config`] configures itself
+/// from this same number. One constant, or the two surfaces of one ingress
+/// accept different-sized turns.
+pub(crate) const MAX_BODY_BYTES: usize = 1 << 20; // 1 MiB
 
 /// Activated host + routing as a single coherent unit. Requests bind to one
 /// `Arc<Activation>` at the top of [`serve`] and use the same `host` and
@@ -151,6 +231,15 @@ pub(crate) struct RevisionServeConfig {
     pub auto_restart_enabled: bool,
     /// Executable path captured at boot, before any swap.
     pub exe_path: Option<std::path::PathBuf>,
+    /// The public base URL resolved at boot, when one was configured
+    /// (env-store, then `PUBLIC_BASE_URL`). The interop agent card needs an
+    /// absolute HTTPS URL and must never derive one from the request's `Host`.
+    pub public_base_url: Option<String>,
+    /// Armed on Cloud Run when no boot-time `public_base_url` is available:
+    /// the first inbound request that passes the GFE trust gate sets the URL
+    /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
+    /// `None` = not on Cloud Run, or a URL was already known at boot.
+    pub public_url_capture: Option<Arc<PublicUrlCapture>>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -205,6 +294,14 @@ struct ServeState {
     /// new activities. Shared across all revisions so a REST POST that writes
     /// an activity on one revision wakes the WS pump watching that conversation.
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    /// Deferred public-URL capture for Cloud Run. When armed, the first
+    /// inbound request that passes the GFE trust gate writes the URL here
+    /// via [`PublicUrlCapture::offer`], waking the deferred registration
+    /// task in `lib.rs`. `None` = not armed.
+    public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// Worker-interop state: the Phase 0b escape hatch, and (in tests) the
+    /// turn override. Shared by every connection of this listener.
+    interop: crate::interop::InteropState,
     /// Test-only: override the activity source used by the WS pump. When
     /// `Some`, `handle_websocket_upgrade` substitutes this source instead of
     /// constructing a `RevisionActivitySource` that calls
@@ -505,6 +602,8 @@ impl RevisionServer {
             conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
             session_manager,
             notifier,
+            public_url_capture: config.public_url_capture,
+            interop: crate::interop::InteropState::from_env(config.public_base_url),
             #[cfg(test)]
             activity_source_override: None,
         });
@@ -532,6 +631,7 @@ impl RevisionServer {
             .flatten();
         let poll_state = Arc::clone(&state);
         let stream_state = Arc::clone(&state);
+        let trigger_state = Arc::clone(&state);
         // Wakes the poll loop out of its interval wait when a plan is published.
         let update_wake = Arc::new(Notify::new());
         let poll_wake = Arc::clone(&update_wake);
@@ -599,6 +699,20 @@ impl RevisionServer {
                     let update_stream_task = update_poll_root.map(|root| {
                         tokio::spawn(run_update_stream_loop(stream_state, root, update_wake))
                     });
+                    // Flow triggers: resolve the shared store once, then run
+                    // the cron loop for the server's life. It reads the live
+                    // activation on every tick, so reloads need no restart.
+                    crate::triggers::install_store(crate::triggers::store::resolve().await);
+                    let trigger_task = tokio::spawn(crate::triggers::scheduler::run(
+                        move || {
+                            let activation = trigger_state.current();
+                            (
+                                Arc::clone(&activation.host),
+                                Arc::clone(&activation.routing),
+                            )
+                        },
+                        crate::triggers::store(),
+                    ));
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
@@ -620,6 +734,7 @@ impl RevisionServer {
                                 if let Some(task) = &update_stream_task {
                                     task.abort();
                                 }
+                                trigger_task.abort();
                                 break;
                             }
                             // Main listener: the loopback gate + caller-asserted
@@ -992,25 +1107,102 @@ fn spawn_revision_connection(
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
+/// Cloud Run deferred public-URL capture, extracted from [`handle_connection`]
+/// so the decision is unit-testable without constructing a hyper
+/// `Request<Incoming>`. On the first inbound request whose headers pass the GFE
+/// trust gate AND match this service's own `<service>-*.run.app` URL, records
+/// the derived base URL and wakes the deferred webhook-registration task. A
+/// no-op once captured, and whenever the headers fail the gate.
+///
+/// NOTE: Cloud Run Host-forwarding is observed GFE behaviour, not a documented
+/// contract. See plan section 7 for the live acceptance test.
+fn try_capture_public_url(cap: &PublicUrlCapture, headers: &hyper::HeaderMap) {
+    if cap.get().is_none()
+        && let Some(url) =
+            crate::startup_contract::derive_public_base_url(headers, &cap.expected_service)
+    {
+        cap.offer(url);
+    }
+}
+
 /// infallible response hyper wants.
+///
+/// Opens the same `http.request` span the `--bundle` boot path
+/// (`http_ingress::handle_request`) opens, and records the same HTTP metrics
+/// via `crate::metrics::record_http_request` — this store-root path recorded
+/// neither before, which is why every env-canvas lane (all `--store-root`)
+/// exported no HTTP metrics and no traces.
 async fn handle_connection(
     mut req: Request<Incoming>,
     state: Arc<ServeState>,
     peer_is_loopback: bool,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    let started = std::time::Instant::now();
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let span = crate::request_span::request_span(&method, &path);
+
+    // Cloud Run deferred public-URL capture: on the first inbound request
+    // through the GFE, derive the public base URL from the Host header and
+    // wake the deferred webhook-registration task. Placed BEFORE the WS
+    // intercept so even WebSocket-first traffic triggers capture.
+    if let Some(cap) = state.public_url_capture.as_ref() {
+        try_capture_public_url(cap, req.headers());
+    }
+
     // A5: intercept WebSocket stream paths BEFORE `serve` so the upgrade
     // handshake can borrow the request mutably. The stream path is the WS
     // endpoint browsers open after creating a conversation over REST.
-    let path = req.uri().path().to_string();
-    if is_directline_stream_path(&path) {
+    let response = if is_directline_stream_path(&path) {
         let (Ok(response) | Err(response)) =
-            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state)).await;
-        return Ok(response);
-    }
+            handle_websocket_upgrade(&mut req, &path, Arc::clone(&state))
+                .instrument(span.clone())
+                .await;
+        response
+    } else {
+        // Resolved against the unit's mount, not the raw path: a unit at
+        // `/acme-echo` serves `/acme-echo/a2a`, and the exclusions below are
+        // what keep an authenticated turn runner off a browser page. This is
+        // its own activation snapshot because `req` is moved into `serve`
+        // below, which takes its own; a reload between the two would at worst
+        // decide CORS from the mount the request no longer has.
+        let cors = {
+            let activation = state.current();
+            let host = header_str(req.headers(), header::HOST.as_str());
+            path_allows_cors(
+                &path,
+                interop_request_path(&activation, host.as_deref(), &path),
+            )
+        };
+        let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback)
+            .instrument(span.clone())
+            .await;
+        if cors { with_cors(response) } else { response }
+    };
 
-    let cors = path_allows_cors(&path);
-    let (Ok(response) | Err(response)) = serve(req, state, peer_is_loopback).await;
-    Ok(if cors { with_cors(response) } else { response })
+    let status = response.status().as_u16();
+    crate::request_span::record_status(&span, status);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+    let route = crate::metrics::normalise_route(&path);
+    crate::metrics::record_http_request(&method, &route, status, elapsed_ms);
+    Ok(response)
+}
+
+/// The request path as the UNIT serving it sees it: the raw path with the
+/// unit's mount prefix stripped.
+///
+/// Every worker-interop path is reserved relative to the unit, because the
+/// env-canvas Cloud Run lane mounts each unit at `/<slug>`
+/// (`BundleRouting::PerUnit`). A request no deployment binds keeps its raw
+/// path — there is no unit to be relative to, and the interop matchers then
+/// decide exactly what they decided before, which is what keeps an unrouted
+/// request falling through to the same `404` it always produced.
+fn interop_request_path<'a>(activation: &Activation, host: Option<&str>, path: &'a str) -> &'a str {
+    activation
+        .routing
+        .deployment_routes
+        .resolve_mount(host, path)
+        .map_or(path, |mount| mount.remainder(path))
 }
 
 /// Paths that are never legitimately called cross-origin, and so must not
@@ -1032,8 +1224,18 @@ async fn handle_connection(
 /// **same-origin** (a relative `fetch('/workers/invoke')`, see `assets/chat.html`)
 /// and `greentic-gui` reaches it **server-side** via `HttpWorkerBackend`, where
 /// CORS does not apply.
-fn path_allows_cors(path: &str) -> bool {
+///
+/// `interop_path` is the request path BELOW the unit's mount (see
+/// [`crate::deployment_routes::RouteMount::remainder`]). It is what the
+/// interop exclusions are measured against, because a unit mounted at
+/// `/acme-echo` serves its JSON-RPC endpoint at `/acme-echo/a2a` — reading the
+/// raw path there would CORS-enable exactly the endpoint these exclusions
+/// exist to keep closed. For a unit at the service root the two are the same
+/// string.
+fn path_allows_cors(path: &str, interop_path: &str) -> bool {
     path != "/workers/invoke"
+        && !crate::interop::a2a::is_cors_excluded(interop_path)
+        && !crate::interop::mcp::is_cors_excluded(interop_path)
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -1053,7 +1255,13 @@ async fn serve(
     // turning the preflight into a 405 the browser treats as an opaque
     // CORS failure. Mirrors the legacy `http_ingress` short-circuit.
     if method == hyper::Method::OPTIONS {
-        if !path_allows_cors(&path) {
+        // The interop exclusions are per UNIT, so the mount has to be resolved
+        // even here. This branch always returns, so the snapshot it takes is
+        // still the one snapshot the request makes.
+        let activation = state.current();
+        let host = header_str(req.headers(), header::HOST.as_str());
+        let interop_path = interop_request_path(&activation, host.as_deref(), &path);
+        if !path_allows_cors(&path, interop_path) {
             return Ok(error_response(
                 StatusCode::METHOD_NOT_ALLOWED,
                 "cross-origin requests are not permitted on this path",
@@ -1162,6 +1370,12 @@ async fn serve(
     let session_header = header_str(req.headers(), "x-greentic-session");
     let endpoint_header = header_str(req.headers(), "x-greentic-messaging-endpoint-id");
     let flow_header = header_str(req.headers(), "x-greentic-flow");
+    // Phase 0b: read before the body consumes `req`. Only the generic-JSON
+    // branch reads it; provider routes carry their own verification.
+    let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
+    let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
+    let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
+    let mcp_method_header = header_str(req.headers(), crate::interop::mcp::MCP_METHOD_HEADER);
     // M1 IID.4d wrapper: collect routing-relevant request headers BEFORE
     // `read_body_limited` consumes `req`. The resolver uses these to give
     // header-discriminated providers (Telegram via secret-token) the same
@@ -1174,6 +1388,84 @@ async fn serve(
     // exact request the upstream sent.
     let request_headers = collect_forwarded_request_headers(req.headers());
     let query_string = req.uri().query().map(str::to_string);
+
+    // Which unit is this request addressed to, and what does the path look
+    // like from inside it? Resolved BEFORE the interop surfaces are matched,
+    // because those paths are reserved RELATIVE to the unit's mount: the
+    // env-canvas Cloud Run lane mounts every unit at `/<slug>`, so matching
+    // the raw path reserved them for a unit at `/` alone and the whole
+    // surface answered 404 (card) or 405 (everything else) on the one lane it
+    // ships on.
+    //
+    // The resolve is the same in-memory longest-prefix walk the generic
+    // ingress does below and costs nothing; the per-unit secrets read stays
+    // behind the route match, so a request that names no interop path still
+    // reads no config.
+    let interop_mount = activation
+        .routing
+        .deployment_routes
+        .resolve_mount(host_header.as_deref(), &path);
+    let interop_path = interop_mount.map_or(path.as_str(), |mount| mount.remainder(&path));
+
+    // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
+    // provider routing, and only for a unit whose staged config enables the
+    // feature — otherwise the path is NOT reserved and falls through to normal
+    // routing, exactly as before this shipped.
+    if let Some(mount) = interop_mount
+        && let Some(route) = crate::interop::a2a::route_for(interop_path)
+    {
+        match resolve_interop_unit(&state, &activation, &mount, InteropFeature::A2a).await {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_interop(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: a2a_version_header.as_deref(),
+                        query: query_string.as_deref(),
+                        if_none_match: if_none_match.as_deref(),
+                        mcp_method: None,
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
+    }
+
+    // The MCP surface, on the same terms: reserved only for a unit whose
+    // staged config enables it.
+    if let Some(mount) = interop_mount
+        && let Some(route) = crate::interop::mcp::route_for(interop_path)
+    {
+        match resolve_interop_unit(&state, &activation, &mount, InteropFeature::Mcp).await {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_mcp(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: None,
+                        query: query_string.as_deref(),
+                        if_none_match: None,
+                        mcp_method: mcp_method_header.as_deref(),
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
+    }
 
     // Webchat bundle routing: classify the path against the bundle/flow
     // indices BEFORE the generic deployment resolve. A classified request
@@ -1255,6 +1547,31 @@ async fn serve(
         deployment_id = resolved.0;
         tenant = resolved.1;
         effective_path = path.clone();
+    }
+
+    // Flow triggers (`<prefix>/trigger/<id>`, contract `greentic.triggers.v1`).
+    // Matched BEFORE the generic body read on purpose: a trigger carries its
+    // own body limit (up to 5 MiB, above this path's 1 MiB), must verify the
+    // raw bytes, and never goes through the session-hint and caller-identity
+    // steps below — it is not a conversation turn. A webchat path is never a
+    // trigger path, so the classifier branch cannot reach here with one.
+    if webchat_target.is_none()
+        && let Some(trigger_id) = activation
+            .routing
+            .triggers
+            .webhook_trigger_for(deployment_id, &effective_path)
+            .map(str::to_string)
+    {
+        return Ok(crate::triggers::webhook::handle(
+            req,
+            Arc::clone(&activation.host),
+            Arc::clone(&activation.routing),
+            crate::triggers::store(),
+            deployment_id,
+            &tenant,
+            &trigger_id,
+        )
+        .await);
     }
 
     let body_bytes = read_body_limited(req).await.map_err(|_| {
@@ -1361,24 +1678,7 @@ async fn serve(
         header_revision: None,
         cookie: cookie_value.as_deref(),
     };
-    // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
-    // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
-    let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = activation
-        .routing
-        .dispatcher
-        .dispatch(&dispatch_req, &mut rng)
-        .await
-        .map_err(|err| {
-            operator_log::warn(
-                module_path!(),
-                format!("revision dispatch for deployment {deployment_id} failed: {err:#}"),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "revision dispatch failed",
-            )
-        })?;
+    let outcome = dispatch_turn(&activation, &dispatch_req, "revision dispatch").await?;
 
     // Bind the dispatched revision tuple once. Both the resolver (below)
     // and `admit_request` (further down) consume it; sharing one binding
@@ -1389,6 +1689,32 @@ async fn serve(
         bundle_id: outcome.bundle_id.clone(),
         revision_id: outcome.revision_id,
     };
+
+    // Provider setup surface (`greentic.setup.web-component.v1`): the wizard
+    // page AND its API. Nothing here is signed by a platform, and the API can
+    // start a real action (a device-code login), so a non-loopback caller
+    // needs the unit's bearer — the same gate, credential and fail-closed
+    // rules as the generic JSON ingress. Checked BEFORE the static route and
+    // the provider-route arm so both are covered; webhook ingress paths are
+    // never declared by a setup descriptor and are untouched.
+    let is_setup_surface = activation
+        .routing
+        .static_routes
+        .setup_surfaces()
+        .match_request(&effective_path, Some(&scope))
+        .is_some();
+    if is_setup_surface {
+        gate_generic_ingress(
+            &state,
+            &activation,
+            &tenant,
+            scope.bundle_id.as_str(),
+            peer_is_loopback,
+            authorization_header.as_deref(),
+        )
+        .await
+        .map_err(crate::setup_surface::harden_response)?;
+    }
 
     // A3: revision-scoped static routes. Checked AFTER reserved operator
     // paths (probes, /chat, /workers/invoke, /v1/updates/notify) which all
@@ -1420,6 +1746,11 @@ async fn serve(
                 crate::static_handler::serve_static_route_from_pack(&route_match, &effective_path)
             }
         };
+        let response = if is_setup_surface {
+            crate::setup_surface::harden_response(response)
+        } else {
+            response
+        };
         return Ok(with_cors(response));
     }
 
@@ -1437,7 +1768,7 @@ async fn serve(
         &method,
     ) {
         Admission::ProviderRoute => {
-            return dispatch_provider_route(
+            let outcome = dispatch_provider_route(
                 Arc::clone(&activation),
                 Arc::clone(&state),
                 &tenant,
@@ -1455,6 +1786,14 @@ async fn serve(
                 flow_header.as_deref(),
             )
             .await;
+            return if is_setup_surface {
+                match outcome {
+                    Ok(response) => Ok(crate::setup_surface::harden_response(response)),
+                    Err(response) => Err(crate::setup_surface::harden_response(response)),
+                }
+            } else {
+                outcome
+            };
         }
         Admission::MethodNotAllowed => {
             return Err(error_response(
@@ -1464,6 +1803,21 @@ async fn serve(
         }
         Admission::Serve => {}
     }
+
+    // Phase 0b: the generic JSON branch runs a flow turn, so a non-loopback
+    // caller must present the unit's bearer credential. Checked AFTER
+    // dispatch because the credential is staged per UNIT and the unit is the
+    // dispatched revision's bundle; dispatch itself writes no pin for a
+    // non-loopback caller (`defer_pin`), so nothing is committed before this.
+    gate_generic_ingress(
+        &state,
+        &activation,
+        &tenant,
+        scope.bundle_id.as_str(),
+        peer_is_loopback,
+        authorization_header.as_deref(),
+    )
+    .await?;
 
     // Generic-JSON branch: NOW require the body to be valid JSON. Provider
     // routes already short-circuited above with the raw bytes.
@@ -1498,26 +1852,15 @@ async fn serve(
         welcome_hint,
     );
 
-    let replies = activation
-        .host
-        .handle_activity_for_revision(
-            &tenant,
-            deployment_id,
-            outcome.bundle_id.clone(),
-            outcome.revision_id,
-            activity,
-        )
-        .await
-        .map_err(|err| {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "revision execution failed for deployment {deployment_id} revision {}: {err:#}",
-                    outcome.revision_id
-                ),
-            );
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
-        })?;
+    let replies = execute_turn(
+        &state,
+        &activation,
+        &tenant,
+        &scope,
+        activity,
+        "revision execution",
+    )
+    .await?;
 
     let body = serde_json::to_vec(&replies)
         .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
@@ -1526,6 +1869,761 @@ async fn serve(
         apply_set_cookie(&mut response, &directive);
     }
     Ok(response)
+}
+
+/// One conversation turn's inputs for [`run_turn`]: what the dispatcher needs
+/// to pick a revision plus what [`build_activity`] needs to shape the turn.
+pub(crate) struct TurnSpec<'a> {
+    pub tenant: &'a str,
+    pub deployment_id: DeploymentId,
+    pub session_hint: Option<&'a str>,
+    /// See [`DispatchRequest::defer_pin`].
+    pub defer_pin: bool,
+    pub cookie: Option<&'a str>,
+    pub user: Option<&'a str>,
+    pub payload: &'a Value,
+}
+
+/// Read a unit's staged interop config, through the listener's short TTL
+/// cache.
+///
+/// Both gates need the config before they can decide anything, so without the
+/// cache every non-loopback POST paid a secrets read. Only the two SUCCESSFUL
+/// outcomes are cached — see [`crate::interop::config_cache`]; a read failure
+/// is retried on the next request rather than holding a `503` for a window
+/// after the store recovered.
+async fn load_unit_config_cached(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
+) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
+    if let Some(cached) = state.interop.configs.get(tenant, bundle_id) {
+        return Ok(cached);
+    }
+    let secrets = activation.host.secrets_manager();
+    let env = crate::resolve_env(None);
+    let config =
+        crate::ingress_auth::load_unit_config(secrets.as_ref(), &env, tenant, bundle_id).await?;
+    state
+        .interop
+        .configs
+        .store(tenant, bundle_id, config.clone());
+    Ok(config)
+}
+
+/// Which staged toggle a path needs. A path whose feature is off is NOT
+/// reserved: the request falls through to normal routing, which is what keeps
+/// adding these paths from shadowing an app route on a unit that wants
+/// neither.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteropFeature {
+    A2a,
+    Mcp,
+}
+
+impl InteropFeature {
+    fn enabled_in(self, config: &crate::interop::config::InteropConfig) -> bool {
+        match self {
+            InteropFeature::A2a => config.a2a,
+            InteropFeature::Mcp => config.mcp,
+        }
+    }
+}
+
+/// One unit's interop configuration, resolved for a request that named an
+/// interop path.
+struct InteropUnit {
+    deployment_id: DeploymentId,
+    tenant: String,
+    bundle_id: String,
+    /// The path prefix this unit is mounted under — [`ROOT_PREFIX`] for a
+    /// unit at the service root. Carried because every address the surfaces
+    /// PUBLISH (the card's `supportedInterfaces[].url`, the RFC 9728 resource
+    /// identifier and metadata URL) has to name the path this process serves,
+    /// not the service root.
+    ///
+    /// [`ROOT_PREFIX`]: crate::deployment_routes::ROOT_PREFIX
+    mount: String,
+    config: crate::interop::config::InteropConfig,
+}
+
+/// Read the staged interop config of the unit a request already resolved to.
+///
+/// The caller resolves the mount — the same
+/// [`resolve_mount`](crate::deployment_routes::DeploymentRouteTable::resolve_mount)
+/// the generic ingress routes on — so the unit whose config is read here is
+/// necessarily the unit the Phase 0b gate would read for the same request.
+///
+/// `Ok(None)` means the path is NOT reserved on this deployment — nothing is
+/// staged, or the feature is switched off — and the caller falls through to
+/// normal routing. `Err` is a ready `503`: the store could not answer, so
+/// whether the path is reserved is unknown, and guessing either way is wrong
+/// (falling through would run an unauthenticated turn; answering would invent
+/// an agent).
+async fn resolve_interop_unit(
+    state: &ServeState,
+    activation: &Activation,
+    mount: &crate::deployment_routes::RouteMount<'_>,
+    feature: InteropFeature,
+) -> Result<Option<InteropUnit>, Response<Full<Bytes>>> {
+    let deployment_id = mount.deployment_id;
+    let bundle_id = mount.bundle_id.as_str().to_string();
+    let tenant = mount.tenant.to_string();
+    let config = load_unit_config_cached(state, activation, &tenant, &bundle_id)
+        .await
+        .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
+            operator_log::warn(
+                module_path!(),
+                format!("interop config for unit `{bundle_id}` could not be read: {message}"),
+            );
+            error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the ingress credential store is unavailable",
+            )
+        })?;
+    Ok(config
+        .filter(|config| feature.enabled_in(config))
+        .map(|config| InteropUnit {
+            deployment_id,
+            tenant,
+            bundle_id,
+            mount: mount.prefix.to_string(),
+            config,
+        }))
+}
+
+/// The public base URL the interop surfaces advertise themselves at: the
+/// boot-resolved one (`startup_contract::resolve_public_base_url`), else the
+/// Cloud Run capture. NEVER the request `Host`, which any caller sets.
+///
+/// **It also decides an audience.** With no staged `mcp_resource`, the MCP
+/// resource identifier — the `aud` every OAuth token is checked against — is
+/// derived from this value as `<base>/mcp`, and on Cloud Run that value comes
+/// from [`PublicUrlCapture`]: the first inbound request through the Google
+/// Front End whose `Host` matches this service's own `<K_SERVICE>-*.run.app`.
+/// So an audience can be derived from a header, once, before the designer has
+/// staged the resource it registered with the admin.
+///
+/// What keeps that non-exploitable is the TENANT CLAIM, not the URL. The
+/// capture is pinned to this service's own `K_SERVICE` (see
+/// [`crate::startup_contract::derive_public_base_url`]), so the worst a
+/// caller can do is make the audience name a different path on this same
+/// service — and a token still has to be signed by the unit's staged issuer
+/// AND carry `tenant` equal to the unit's staged `tenant_slug`
+/// ([`crate::interop::mcp::auth`]). A token minted for another workspace is
+/// refused whatever audience this resolves to, and an attacker who is not the
+/// issuer has no token at all.
+fn interop_base_url(state: &ServeState) -> Option<String> {
+    state
+        .interop
+        .public_base_url
+        .clone()
+        .or_else(|| {
+            state
+                .public_url_capture
+                .as_ref()
+                .and_then(|capture| capture.get().cloned())
+        })
+        .map(|url| url.trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+}
+
+/// [`interop_base_url`] with the unit's own mount joined onto it — the address
+/// THIS unit is reachable at, which is what its surfaces must publish.
+///
+/// A unit mounted at `/acme-echo` serves its JSON-RPC endpoint at
+/// `<base>/acme-echo/a2a`, so a card advertising `<base>/a2a` sends every
+/// caller that reads it to a path the process does not serve. The same join
+/// decides the RFC 9728 resource identifier, and therefore the `aud` an MCP
+/// token is checked against, whenever the designer has not staged an
+/// `mcp_resource` yet — and the designer builds the value it registers as
+/// `<service_url><unit path>/mcp`, so joining the mount is what makes the
+/// derived fallback and the registered resource the same string rather than
+/// two that differ by exactly this prefix.
+fn interop_unit_base_url(state: &ServeState, unit: &InteropUnit) -> Option<String> {
+    let base = interop_base_url(state)?;
+    Some(crate::deployment_routes::public_base_with_mount(
+        &base,
+        &unit.mount,
+    ))
+}
+
+/// Runs one interop turn against the dispatched revision. Holds the
+/// activation the request pinned, so a concurrent reload cannot move the turn
+/// onto a different host mid-request.
+struct IngressTurnRunner<'a> {
+    state: &'a ServeState,
+    activation: &'a Activation,
+    tenant: &'a str,
+    deployment_id: DeploymentId,
+}
+
+#[async_trait::async_trait]
+impl crate::interop::a2a::rpc::TurnRunner for IngressTurnRunner<'_> {
+    async fn run(
+        &self,
+        session_hint: &str,
+        user: &str,
+        payload: &Value,
+    ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
+        run_turn(
+            self.state,
+            self.activation,
+            TurnSpec {
+                tenant: self.tenant,
+                deployment_id: self.deployment_id,
+                session_hint: Some(session_hint),
+                // The caller authenticated before this runs, so the hint is
+                // as trusted as a loopback caller's and pins inline.
+                defer_pin: false,
+                cookie: None,
+                user: Some(user),
+                payload,
+            },
+            "a2a dispatch",
+            "a2a execution",
+        )
+        .await
+        // The detail is already in the operator log; the caller sees a
+        // protocol-level internal error, never an ingress response body.
+        .map_err(|_| crate::interop::a2a::rpc::TurnFailure)
+    }
+}
+
+/// Serve one reserved interop path.
+///
+/// Every exit records the status it answered with on the request's own
+/// telemetry span (`crate::interop::telemetry`), which is emitted once when
+/// `trace` is dropped at the end of this function — refusals included, which
+/// is the whole reason the span exists beside the usage meter: the meter only
+/// ever records a turn that RAN.
+async fn serve_interop(
+    req: Request<Incoming>,
+    route: crate::interop::a2a::A2aRoute,
+    unit: &InteropUnit,
+    state: &ServeState,
+    activation: &Activation,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let trace = crate::interop::telemetry::RequestTrace::new(
+        crate::interop::metering::event::Surface::A2a,
+        greentic_telemetry::TelemetryCtx::new(unit.tenant.clone())
+            .with_deployment_id(unit.deployment_id.to_string())
+            .with_bundle_id(unit.bundle_id.clone()),
+    );
+    trace.route(route.as_str());
+    let answered =
+        serve_interop_inner(req, route, unit, state, activation, method, headers, &trace).await;
+    match answered.as_ref() {
+        Ok(response) | Err(response) => trace.http_status(response.status().as_u16()),
+    }
+    answered
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn serve_interop_inner(
+    req: Request<Incoming>,
+    route: crate::interop::a2a::A2aRoute,
+    unit: &InteropUnit,
+    state: &ServeState,
+    activation: &Activation,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+    trace: &crate::interop::telemetry::RequestTrace,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let base_url = interop_unit_base_url(state, unit);
+    let ctx = crate::interop::a2a::A2aContext {
+        config: &unit.config,
+        base_url: base_url.as_deref(),
+        tenant: &unit.tenant,
+        bundle_id: &unit.bundle_id,
+        deployment_id: unit.deployment_id,
+        limiter: &state.interop.limiter,
+        turns: &state.interop.turns,
+        now_ms: crate::ingress_auth::now_ms(),
+        metering: crate::interop::metering::TurnMetering::for_unit(
+            &state.interop.meter,
+            &unit.config,
+            unit.deployment_id,
+            &unit.bundle_id,
+        )
+        .map(|metering| {
+            metering.tokens_recorded_by_runtime(
+                activation
+                    .routing
+                    .runtime_metered
+                    .contains(unit.deployment_id, &unit.bundle_id),
+            )
+        }),
+        trace,
+    };
+    if route == crate::interop::a2a::A2aRoute::Card {
+        if method != hyper::Method::GET {
+            trace.outcome(crate::interop::telemetry::Outcome::Rejected);
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the agent card is served on GET",
+            ));
+        }
+        let request = crate::interop::a2a::A2aRequest {
+            version_header: None,
+            query: None,
+            if_none_match: headers.if_none_match,
+            body: &[],
+        };
+        let response = crate::interop::a2a::card::card_response(&ctx, &request);
+        // The card handler answers `200` or `304`; the second is the
+        // caller's own `If-None-Match` matching, which is a hit worth telling
+        // apart from a rebuild.
+        trace.outcome(if response.status() == StatusCode::NOT_MODIFIED {
+            crate::interop::telemetry::Outcome::NotModified
+        } else {
+            crate::interop::telemetry::Outcome::Served
+        });
+        return Ok(response);
+    }
+
+    if method != hyper::Method::POST {
+        trace.outcome(crate::interop::telemetry::Outcome::Rejected);
+        return Err(error_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "this A2A endpoint requires POST",
+        ));
+    }
+    // Authenticate BEFORE the body is read. The bearer check needs only the
+    // `Authorization` header, so an unauthenticated peer must not be able to
+    // make this process read (and buffer) a megabyte per request. `/mcp`
+    // already had this order; this path did not.
+    let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
+        .map_err(|response| *response)?;
+    let body_bytes = read_body_limited(req).await.map_err(|_| {
+        trace.outcome(crate::interop::telemetry::Outcome::Rejected);
+        error_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the size limit",
+        )
+    })?;
+    let request = crate::interop::a2a::A2aRequest {
+        version_header: headers.version,
+        query: headers.query,
+        if_none_match: None,
+        body: &body_bytes,
+    };
+    let runner = IngressTurnRunner {
+        state,
+        activation,
+        tenant: &unit.tenant,
+        deployment_id: unit.deployment_id,
+    };
+    Ok(match route {
+        crate::interop::a2a::A2aRoute::JsonRpc => {
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, credential_id, &runner).await
+        }
+        _ => {
+            crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, credential_id, &runner).await
+        }
+    })
+}
+
+/// Serve one reserved MCP path.
+///
+/// The endpoint is authenticated HERE rather than inside `rmcp`, which has no
+/// auth of its own: the verified caller is then baked into the service the
+/// factory builds, so a tool never has to read an identity back out of a
+/// request extension.
+async fn serve_mcp(
+    req: Request<Incoming>,
+    route: crate::interop::mcp::McpRoute,
+    unit: &InteropUnit,
+    state: &Arc<ServeState>,
+    activation: &Arc<Activation>,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    let authorization = headers.authorization;
+    let mcp_method = headers.mcp_method;
+    let base_url = interop_unit_base_url(state, unit);
+    // `None` when the unit has neither a staged `mcp_resource` nor a known
+    // public base URL. That is fatal for the DISCOVERY document, which exists
+    // to publish it, and irrelevant to a caller holding the staged A2A bearer
+    // — so it is resolved here and acted on per route rather than refused for
+    // everyone up front.
+    let resource =
+        crate::interop::mcp::metadata::resource_identifier(&unit.config, base_url.as_deref());
+
+    if route == crate::interop::mcp::McpRoute::Metadata {
+        if method != hyper::Method::GET {
+            return Err(error_response(
+                StatusCode::METHOD_NOT_ALLOWED,
+                "the protected-resource metadata is served on GET",
+            ));
+        }
+        let Some(resource) = resource.as_deref() else {
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "mcp: unit `{}` has neither a staged `mcp_resource` nor a public base \
+                     URL, so no resource identifier can be published",
+                    unit.bundle_id
+                ),
+            );
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "this worker's MCP address is not known yet",
+            ));
+        };
+        let Some(document) = crate::interop::mcp::metadata::document(&unit.config, resource) else {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no authorization server is configured for this worker",
+            ));
+        };
+        let body = serde_json::to_vec(&document)
+            .map_err(|err| error_response(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()))?;
+        return Ok(json_response(StatusCode::OK, body));
+    }
+
+    // With no resource identifier there is no discovery URL to point a client
+    // at either, so the `401` below carries a bare challenge rather than a
+    // made-up one. The request is NOT refused for it: only the OAuth half
+    // needs an audience, and a caller holding the staged bearer needs none.
+    let metadata_url = resource.as_deref().map(|resource| {
+        crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), resource)
+    });
+    let caller = match crate::interop::mcp::auth::authenticate(
+        &unit.config,
+        resource.as_deref(),
+        authorization,
+        crate::ingress_auth::now_ms(),
+    )
+    .await
+    {
+        crate::interop::mcp::auth::McpAuth::Allowed(caller) => caller,
+        crate::interop::mcp::auth::McpAuth::Unauthorized => {
+            return Err(mcp_unauthorized(metadata_url.as_deref()));
+        }
+        crate::interop::mcp::auth::McpAuth::IssuerUnavailable => {
+            return Err(error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the authorization server could not be reached to verify this token",
+            ));
+        }
+    };
+
+    // The `Mcp-Method` header prices this request BEFORE the body is read, so
+    // an obvious flood is refused without parsing one. It is caller-supplied,
+    // so it is a pre-filter and never the final price: the `ask` tool settles
+    // the remainder of a turn's cost against this same bucket.
+    let cost = crate::interop::mcp::request_cost(mcp_method);
+    if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
+        let mut response = error_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too many requests from this connection; wait and retry",
+        );
+        if let Ok(value) = header::HeaderValue::from_str(&retry_after.to_string()) {
+            response.headers_mut().insert(header::RETRY_AFTER, value);
+        }
+        return Err(response);
+    }
+
+    let ctx = std::sync::Arc::new(crate::interop::mcp::server::McpContext {
+        runner: std::sync::Arc::new(OwnedTurnRunner {
+            state: Arc::clone(state),
+            activation: Arc::clone(activation),
+            tenant: unit.tenant.clone(),
+            deployment_id: unit.deployment_id,
+        }),
+        turns: std::sync::Arc::clone(&state.interop.turns),
+        limiter: std::sync::Arc::clone(&state.interop.limiter),
+        prepaid: cost,
+        deployment_id: unit.deployment_id,
+        tenant: unit.tenant.clone(),
+        bundle_id: unit.bundle_id.clone(),
+        caller_key: caller.key().to_string(),
+        // Only a STAGED credential may be named as one; an OAuth `sub` is
+        // minted by the authorization server and is not a credential the
+        // designer issued.
+        credential_id: match &caller {
+            crate::interop::mcp::auth::McpCaller::Bearer(id) => Some(id.clone()),
+            crate::interop::mcp::auth::McpCaller::Oauth(_) => None,
+        },
+        metering: crate::interop::metering::TurnMetering::for_unit(
+            &state.interop.meter,
+            &unit.config,
+            unit.deployment_id,
+            &unit.bundle_id,
+        )
+        .map(|metering| {
+            metering.tokens_recorded_by_runtime(
+                activation
+                    .routing
+                    .runtime_metered
+                    .contains(unit.deployment_id, &unit.bundle_id),
+            )
+        }),
+        agent_name: unit
+            .config
+            .agent
+            .name
+            .clone()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or_else(|| unit.bundle_id.clone()),
+    });
+    // GET and DELETE are answered by `rmcp` itself: in stateless mode
+    // (`legacy_session_mode = false`, no event store) its `handle` allows POST
+    // alone and answers anything else `405` with `Allow: POST`.
+    let response = crate::interop::mcp::server::service(ctx).handle(req).await;
+    Ok(collect_boxed_response(response).await)
+}
+
+/// `401` for the MCP endpoint, carrying the discovery URL a client that has
+/// never authenticated needs. Without the header a client fails to connect
+/// with no error that points anywhere.
+fn mcp_unauthorized(metadata_url: Option<&str>) -> Response<Full<Bytes>> {
+    let mut response = error_response(
+        StatusCode::UNAUTHORIZED,
+        "a valid bearer token issued by the configured authorization server is required",
+    );
+    // With no resource identifier there is no discovery document to point at,
+    // so the challenge is bare rather than naming a URL that would 503.
+    let challenge = match metadata_url {
+        Some(url) => format!("Bearer resource_metadata=\"{url}\""),
+        None => "Bearer".to_string(),
+    };
+    if let Ok(value) = header::HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    response
+}
+
+/// Collapse `rmcp`'s boxed body into this ingress's single body type.
+///
+/// The body's error type is `Infallible`, so the collect cannot actually fail;
+/// it is still handled rather than unwrapped, because a future rmcp release
+/// widening that type must fail as a `500` and not as a panic on the request
+/// path.
+async fn collect_boxed_response(
+    response: Response<http_body_util::combinators::BoxBody<Bytes, Infallible>>,
+) -> Response<Full<Bytes>> {
+    let (parts, body) = response.into_parts();
+    match body.collect().await {
+        Ok(collected) => Response::from_parts(parts, Full::new(collected.to_bytes())),
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the MCP transport produced an unreadable body",
+        ),
+    }
+}
+
+/// A [`TurnRunner`] that OWNS what it needs, for a handler that outlives the
+/// request borrow — `rmcp` builds its service from a `'static` factory, so the
+/// borrowed [`IngressTurnRunner`] cannot be handed to it.
+///
+/// It holds the activation the request pinned, so a concurrent reload cannot
+/// move the turn onto a different host mid-request, and goes through the same
+/// [`run_turn`] as every other ingress.
+///
+/// [`TurnRunner`]: crate::interop::a2a::rpc::TurnRunner
+struct OwnedTurnRunner {
+    state: Arc<ServeState>,
+    activation: Arc<Activation>,
+    tenant: String,
+    deployment_id: DeploymentId,
+}
+
+#[async_trait::async_trait]
+impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
+    async fn run(
+        &self,
+        session_hint: &str,
+        user: &str,
+        payload: &Value,
+    ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
+        run_turn(
+            &self.state,
+            &self.activation,
+            TurnSpec {
+                tenant: &self.tenant,
+                deployment_id: self.deployment_id,
+                session_hint: Some(session_hint),
+                // The caller authenticated before this runs, so the hint is
+                // as trusted as a loopback caller's and pins inline.
+                defer_pin: false,
+                cookie: None,
+                user: Some(user),
+                payload,
+            },
+            "mcp dispatch",
+            "mcp execution",
+        )
+        .await
+        // The detail is already in the operator log; the caller sees a
+        // tool-level failure, never an ingress response body.
+        .map_err(|_| crate::interop::a2a::rpc::TurnFailure)
+    }
+}
+
+/// The request facts the interop surfaces read, gathered before the body is
+/// consumed.
+struct InteropRequestHeaders<'a> {
+    authorization: Option<&'a str>,
+    /// `A2A-Version`.
+    version: Option<&'a str>,
+    query: Option<&'a str>,
+    if_none_match: Option<&'a str>,
+    /// `Mcp-Method` (SEP-2243), which the MCP limiter meters on so it never
+    /// has to parse a body.
+    mcp_method: Option<&'a str>,
+}
+
+/// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the
+/// generic JSON ingress that presents no valid bearer for the dispatched unit.
+///
+/// Fails CLOSED. No config staged, no credential in it, or a wrong/expired
+/// token is `401`; a secrets backend that cannot answer is `503`, never an
+/// allow — the same distinction [`read_provider_signing_key`] draws, and for
+/// the same reason: a degraded store must not become an authentication bypass.
+/// Loopback-trusted peers keep their existing trust, and the host-local
+/// `GREENTIC_GENERIC_INGRESS_AUTH=off` escape hatch skips the read entirely.
+async fn gate_generic_ingress(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
+    peer_is_loopback: bool,
+    authorization: Option<&str>,
+) -> Result<(), Response<Full<Bytes>>> {
+    let gate_enabled = state.interop.generic_auth_enabled;
+    if peer_is_loopback || !gate_enabled {
+        return Ok(());
+    }
+    let config = load_unit_config_cached(state, activation, tenant, bundle_id).await;
+    let gate = crate::ingress_auth::decide_generic(
+        peer_is_loopback,
+        gate_enabled,
+        &config,
+        authorization,
+        crate::ingress_auth::now_ms(),
+    );
+    match crate::ingress_auth::refusal(&gate, &config, bundle_id) {
+        None => Ok(()),
+        Some(response) => Err(response),
+    }
+}
+
+/// Ask the dispatcher which revision serves this turn. `label` prefixes the
+/// operator-log line so each ingress keeps its own diagnostic wording.
+async fn dispatch_turn(
+    activation: &Activation,
+    dispatch_req: &DispatchRequest<'_>,
+    label: &str,
+) -> Result<crate::revision_dispatcher::DispatchOutcome, Response<Full<Bytes>>> {
+    // `ThreadRng` is `!Send` and the dispatcher is async, so it cannot survive
+    // the `.await` in the spawned connection task. Seed a `Send` `SmallRng`.
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let deployment_id = dispatch_req.deployment_id;
+    activation
+        .routing
+        .dispatcher
+        .dispatch(dispatch_req, &mut rng)
+        .await
+        .map_err(|err| {
+            operator_log::warn(
+                module_path!(),
+                format!("{label} for deployment {deployment_id} failed: {err:#}"),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "revision dispatch failed",
+            )
+        })
+}
+
+/// Run one already-shaped [`Activity`] against the dispatched revision.
+async fn execute_turn(
+    _state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    scope: &RevisionScope,
+    activity: Activity,
+    label: &str,
+) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
+    let deployment_id = scope.deployment_id;
+    let revision_id = scope.revision_id;
+    // Listener-level tests drive the whole ingress without a WASM pack.
+    #[cfg(test)]
+    if let Some(run) = _state.interop.turn_override.as_ref() {
+        return Ok(run(&activity));
+    }
+    activation
+        .host
+        .handle_activity_for_revision(
+            tenant,
+            deployment_id,
+            scope.bundle_id.clone(),
+            revision_id,
+            activity,
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "{label} failed for deployment {deployment_id} revision {revision_id}: {err:#}"
+                ),
+            );
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
+        })
+}
+
+/// Dispatch → [`build_activity`] → execute, for an ingress with nothing to do
+/// between picking the revision and running the turn. The generic JSON branch
+/// of [`serve`] calls the two halves itself because static routes, provider
+/// routes and endpoint resolution sit between them.
+async fn run_turn(
+    state: &ServeState,
+    activation: &Activation,
+    spec: TurnSpec<'_>,
+    dispatch_label: &str,
+    execute_label: &str,
+) -> Result<Vec<Activity>, Response<Full<Bytes>>> {
+    let dispatch_req = DispatchRequest {
+        env_id: activation.routing.dispatcher.env_id(),
+        tenant: spec.tenant,
+        deployment_id: spec.deployment_id,
+        session_hint: spec.session_hint,
+        defer_pin: spec.defer_pin,
+        trusted: false,
+        header_revision: None,
+        cookie: spec.cookie,
+    };
+    let outcome = dispatch_turn(activation, &dispatch_req, dispatch_label).await?;
+    let activity = build_activity(
+        spec.payload,
+        spec.tenant,
+        spec.user,
+        spec.session_hint,
+        None,
+        None,
+    );
+    let scope = RevisionScope {
+        deployment_id: spec.deployment_id,
+        bundle_id: outcome.bundle_id.clone(),
+        revision_id: outcome.revision_id,
+    };
+    execute_turn(
+        state,
+        activation,
+        spec.tenant,
+        &scope,
+        activity,
+        execute_label,
+    )
+    .await
 }
 
 /// `POST /workers/invoke` payload, mirroring
@@ -1623,70 +2721,30 @@ async fn handle_worker_invoke(
         })?;
 
     let session_hint = worker_req.session_id.clone();
-    let dispatch_req = DispatchRequest {
-        env_id: activation.routing.dispatcher.env_id(),
-        tenant: &tenant,
-        deployment_id,
-        session_hint: session_hint.as_deref(),
-        // Worker-invoke is loopback-gated (trusted caller), so the supplied
-        // session id pins inline like other caller-asserted hints.
-        defer_pin: false,
-        trusted: false,
-        header_revision: None,
-        cookie: None,
-    };
-    let mut rng: rand::rngs::SmallRng = rand::make_rng();
-    let outcome = activation
-        .routing
-        .dispatcher
-        .dispatch(&dispatch_req, &mut rng)
-        .await
-        .map_err(|err| {
-            operator_log::warn(
-                module_path!(),
-                format!("worker-invoke dispatch for deployment {deployment_id} failed: {err:#}"),
-            );
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "revision dispatch failed",
-            )
-        })?;
-
     let user = worker_req
         .tenant
         .user_id
         .as_ref()
         .map(|u| u.as_str().to_string());
     let flow_payload = normalize_worker_payload(&worker_req.payload);
-    let activity = build_activity(
-        &flow_payload,
-        &tenant,
-        user.as_deref(),
-        session_hint.as_deref(),
-        None,
-        None,
-    );
-
-    let replies = activation
-        .host
-        .handle_activity_for_revision(
-            &tenant,
+    let replies = run_turn(
+        &state,
+        &activation,
+        TurnSpec {
+            tenant: &tenant,
             deployment_id,
-            outcome.bundle_id.clone(),
-            outcome.revision_id,
-            activity,
-        )
-        .await
-        .map_err(|err| {
-            operator_log::error(
-                module_path!(),
-                format!(
-                    "worker-invoke execution failed for deployment {deployment_id} revision {}: {err:#}",
-                    outcome.revision_id
-                ),
-            );
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, "flow execution failed")
-        })?;
+            session_hint: session_hint.as_deref(),
+            // Worker-invoke is loopback-gated (trusted caller), so the supplied
+            // session id pins inline like other caller-asserted hints.
+            defer_pin: false,
+            cookie: None,
+            user: user.as_deref(),
+            payload: &flow_payload,
+        },
+        "worker-invoke dispatch",
+        "worker-invoke execution",
+    )
+    .await?;
 
     let messages = replies.iter().map(activity_to_worker_message).collect();
     let response = WorkerInvokeResponse {
@@ -1745,6 +2803,79 @@ enum NotifyAction {
 enum NotifyError {
     Op(OpError),
     Internal(String),
+    /// A configured blob-mirror fetch failed. Distinct from `Internal` because a
+    /// mirror is operator-declared infrastructure: a silent failure strands the
+    /// fleet's binary version on the old build permanently (the poll loop advances
+    /// `last_sequence` on a 2xx, so the plan is never retried). This variant must
+    /// NOT be swallowed — it propagates through `run_update_notify` after content
+    /// has converged and surfaces as a non-2xx to the caller.
+    BinaryMirror(String),
+}
+
+/// Response status, opaque public body, and log detail for a notify failure that
+/// is not an [`NotifyError::Op`] (those go through [`map_op_error`]); `None` for
+/// `Op`.
+///
+/// Extracted from the handler so the mapping is unit-testable. A failed blob
+/// mirror must surface as 502, distinguishable from an opaque 500: otherwise an
+/// operator cannot tell "your in-gap mirror is misconfigured" from "this server
+/// is broken", and the two have completely different remedies.
+fn notify_failure_response(err: &NotifyError) -> Option<(StatusCode, &'static str, String)> {
+    match err {
+        NotifyError::Op(_) => None,
+        NotifyError::Internal(message) => Some((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal error staging update plan",
+            format!("update-notify: internal failure: {message}"),
+        )),
+        NotifyError::BinaryMirror(message) => Some((
+            StatusCode::BAD_GATEWAY,
+            "blob mirror fetch failed",
+            format!("update-notify: blob-mirror failure: {message}"),
+        )),
+    }
+}
+
+/// Whether a completed notify attempt means the plan was ACTED ON, so
+/// [`poll_update_cycle`] may remember its sequence and stop re-fetching it.
+///
+/// Only a 2xx `Ok` qualifies. Every other outcome deliberately leaves the
+/// sequence unadvanced so the plan is retried next cycle:
+/// - a non-2xx `Ok` is the disabled-channel TOCTOU (403) — a re-enabled channel
+///   must still pick this plan up rather than skip it until a newer one exists;
+/// - `Op` / `Internal` mean the plan was not staged at all;
+/// - `BinaryMirror` is a configured blob mirror that failed, and NOT advancing is
+///   what makes the airgap path self-healing: fix the mirror and the fleet
+///   converges on the next poll with no republish.
+///
+/// This is deliberately ONE decision point. While each match arm built its own
+/// return tuple, the rule was duplicated four ways and a regression in any single
+/// arm was invisible to the test suite — a mutation that advanced the sequence on
+/// `BinaryMirror` (reintroducing permanent silent divergence: content converged,
+/// sequence moved on, binary stranded on the old version) passed the whole suite.
+fn notify_outcome_acted_on(outcome: &Result<(StatusCode, Value), NotifyError>) -> bool {
+    matches!(outcome, Ok((status, _)) if status.is_success())
+}
+
+/// Split a binary-update result into `(binary_info, mirror_failure)` for
+/// [`run_update_notify`]: what to report under the response's `binary` key, and
+/// the message of a configured-mirror failure that must be surfaced AFTER content
+/// convergence rather than swallowed.
+///
+/// This encodes the swallow-vs-surface policy in one testable place. Binary
+/// self-update is deliberately best-effort relative to content staging, so every
+/// failure is swallowed to `None` — EXCEPT [`NotifyError::BinaryMirror`], because
+/// a configured mirror is operator-declared infrastructure and swallowing it
+/// returns 200, advances the poll loop's sequence, and strands the fleet's binary
+/// version on the old build with no retry.
+fn classify_binary_step(
+    result: Result<Option<Value>, NotifyError>,
+) -> (Option<Value>, Option<String>) {
+    match result {
+        Ok(info) => (info, None),
+        Err(NotifyError::BinaryMirror(message)) => (None, Some(message)),
+        Err(_) => (None, None),
+    }
 }
 
 /// Parse + validate a `greentic.update-notify.v1` body into the raw plan and
@@ -2065,6 +3196,210 @@ pub(crate) fn write_rollback_tombstone(env_dir: &std::path::Path, marker: &Binar
     }
 }
 
+/// Concurrent update notifies must not both pass the marker inspection before
+/// either writes. Coarse hold is fine: swaps are rare and the function is sync
+/// on blocking threads.
+/// The process resolves a single env at startup, so a process-wide lock equals
+/// a per-env lock today; a per-env lock would be needed if multi-env-per-process
+/// ever lands.
+static BINARY_UPDATE_SWAP_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Post-acquisition shared path: swap a verified binary into `current_exe`,
+/// build and persist the rollback marker, and return the staged-JSON fragment.
+/// Called by both the URL-fetch path and the in-band staging path so the
+/// swap + marker logic is not duplicated.
+fn apply_binary_from_path(
+    own_name: &str,
+    binary: &greentic_update::plan::BinaryArtifact,
+    inner_binary: &std::path::Path,
+    current_exe: &std::path::Path,
+    env_dir: &std::path::Path,
+    current_version: &str,
+) -> Result<Option<Value>, NotifyError> {
+    let swap_opts = binswap::SwapOptions {
+        expected_digest: Some(binary.digest.clone()),
+    };
+    binswap::swap_binary(inner_binary, current_exe, &swap_opts).map_err(|err| {
+        // Fail-closed: the binary is NOT applied, content staging stays
+        // intact. Log the category, never leak the path.
+        operator_log::error(module_path!(), format!("binary-update: swap failed: {err}"));
+        NotifyError::Internal("binary update swap failed".to_string())
+    })?;
+
+    // Durably persist the rollback marker BEFORE reporting success. The
+    // marker is the rollback state — without it the boot-fail guard cannot
+    // arm, and a crash-looping new binary is never rolled back. If the
+    // write fails, undo the swap so we never exec into a binary that has
+    // no rollback coverage.
+    let marker = BinaryUpdateMarker {
+        name: own_name.to_string(),
+        from_version: current_version.to_string(),
+        to_version: binary.version.clone(),
+        staged_at: chrono::Utc::now().to_rfc3339(),
+        phase: MarkerPhase::Pending,
+        rolled_back_at: None,
+        digest: Some(binary.digest.clone()),
+        boot_attempts: 0,
+    };
+    persist_marker_or_undo_swap(env_dir, &marker, current_exe)?;
+
+    operator_log::warn(
+        module_path!(),
+        format!(
+            "binary-update: {own_name} {} installed; restart required to activate",
+            binary.version,
+        ),
+    );
+
+    Ok(Some(serde_json::json!({
+        "staged": true,
+        "restart_required": true,
+        "version": binary.version,
+    })))
+}
+
+/// Read `env_id`'s update channel off disk and return `blob_base_url` when set.
+/// An absent or unreadable channel, or an unset field, yields `None`.
+///
+/// No `resolved_enabled()` gate: reaching `try_apply_binary_update` already
+/// implies the channel was enabled (`notify_action` gated it upstream), so
+/// re-gating here would duplicate the check with no added safety.
+fn load_blob_base_url(store: &LocalFsStore, env_id: &str) -> Option<String> {
+    let env_typed = EnvId::new(env_id).ok()?;
+    let cfg = store.load_update_channel(&env_typed).ok()??;
+    cfg.resolved_blob_base_url().map(|s| s.to_owned())
+}
+
+/// Validate a `sha256:<hex>` digest string and return the bare hex if valid.
+/// Returns `Err` with a human-readable message if the digest is malformed
+/// (missing prefix, wrong length, non-hex chars). This is an URL-injection
+/// defense: we build a fetch URL from the hex so it must be tightly validated
+/// before any network call.
+fn validate_digest_hex(digest: &str) -> Result<&str, String> {
+    let hex = digest
+        .strip_prefix("sha256:")
+        .ok_or_else(|| format!("binary-update: digest missing `sha256:` prefix: {digest}"))?;
+    if hex.len() != 64 {
+        return Err(format!(
+            "binary-update: digest hex must be 64 chars, got {}: {digest}",
+            hex.len(),
+        ));
+    }
+    if !hex
+        .bytes()
+        .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        return Err(format!(
+            "binary-update: digest contains non-lowercase-hex chars: {digest}",
+        ));
+    }
+    Ok(hex)
+}
+
+/// Fetch a binary blob from a blob-mirror HTTP endpoint.
+///
+/// The deployer's `import --push-to` (C3) writes blobs as `blobs/sha256-<hex>`,
+/// so the mirror URL is `{base_url}/sha256-{hex}` where the hex is extracted
+/// from the `sha256:<hex>` digest string (colon → hyphen in the URL).
+///
+/// The transport's scheme is NOT validated here: the blob is digest-verified
+/// against the DSSE-verified plan, so the mirror is a cache and never an
+/// authority — plaintext transport can cause a denial but never a compromise.
+/// The deployer's `config-set` (C2) is the single validation altitude for host
+/// policy, and `greentic-start` likewise does not validate `plan_endpoint`'s
+/// scheme today (see `resolve_poll_cycle`). Adding a second altitude here would
+/// drift from C2.
+fn fetch_blob_from_mirror(base_url: &str, digest: &str) -> Result<Vec<u8>, String> {
+    fetch_blob_from_mirror_capped(base_url, digest, MAX_BINARY_ARCHIVE_BYTES)
+}
+
+/// Inner implementation with an explicit byte cap, so tests can exercise the
+/// cap-check branch without allocating 256 MiB.
+fn fetch_blob_from_mirror_capped(
+    base_url: &str,
+    digest: &str,
+    cap: u64,
+) -> Result<Vec<u8>, String> {
+    let hex = validate_digest_hex(digest)?;
+
+    let url = format!("{}/sha256-{hex}", base_url.trim_end_matches('/'));
+
+    // A dedicated client, not the poll loop's: the binary transfer needs
+    // `BINARY_FETCH_TIMEOUT` (300s) rather than the poll client's short timeout.
+    let client = reqwest::blocking::Client::builder()
+        .timeout(BINARY_FETCH_TIMEOUT)
+        .build()
+        .map_err(|err| format!("binary-update: mirror: failed to build HTTP client: {err}"))?;
+
+    // Reuse the plan path's cap-checked GET rather than repeating the
+    // `.take(cap + 1)` + length-check idiom. That idiom is security-relevant
+    // (detect an over-cap body instead of silently truncating), so it should
+    // exist once — a second copy is a place for the two to drift apart.
+    let buf = fetch_bytes(&client, &url, cap)
+        .map_err(|err| format!("binary-update: mirror fetch failed for {url}: {err}"))?;
+
+    // Digest verification: the plan is DSSE-verified, so the expected digest is
+    // authoritative. A mismatch means the mirror served wrong bytes.
+    let actual = sha256_hex(&buf);
+    if actual != hex {
+        return Err(format!(
+            "binary-update: mirror blob digest mismatch: expected sha256:{hex}, got sha256:{actual}",
+        ));
+    }
+
+    Ok(buf)
+}
+
+/// Shared tail for both in-band and mirror blob acquisition: write the raw
+/// binary bytes to a temp file, set executable permissions on Unix, then apply
+/// via `apply_binary_from_path`. The byte buffer is consumed (moved in) so it
+/// is dropped after the temp-file write and before the swap, avoiding doubled
+/// peak memory — the same property the original in-band path preserved.
+fn write_blob_and_apply(
+    blob_bytes: Vec<u8>,
+    own_name: &str,
+    binary: &greentic_update::plan::BinaryArtifact,
+    current_exe: &std::path::Path,
+    env_dir: &std::path::Path,
+    current_version: &str,
+) -> Result<Option<Value>, NotifyError> {
+    let tmp_dir = tempfile::TempDir::new().map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to create temp dir for binary: {err}"
+        ))
+    })?;
+    let tmp_binary = tmp_dir.path().join(own_name);
+    std::fs::write(&tmp_binary, &blob_bytes).map_err(|err| {
+        NotifyError::Internal(format!(
+            "binary-update: failed to write binary to temp: {err}"
+        ))
+    })?;
+    // Release the buffer before the swap so peak memory holds one copy, not two.
+    // The caller moved it in, so this `drop` is what makes that guaranteed —
+    // the original in-band path got the same effect from a narrower scope.
+    drop(blob_bytes);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp_binary, std::fs::Permissions::from_mode(0o755)).map_err(
+            |err| {
+                NotifyError::Internal(format!(
+                    "binary-update: failed to set executable permissions: {err}"
+                ))
+            },
+        )?;
+    }
+
+    apply_binary_from_path(
+        own_name,
+        binary,
+        &tmp_binary,
+        current_exe,
+        env_dir,
+        current_version,
+    )
+}
+
 /// Attempt to apply a binary self-update for THIS process after content staging
 /// has succeeded. Returns a JSON fragment to merge into the notify response, or
 /// `None` when no binary update applies to this host (the normal case for plans
@@ -2079,6 +3414,7 @@ fn try_apply_binary_update(
     store: &LocalFsStore,
     env_id: &str,
     exe_path: Option<&std::path::Path>,
+    updates_root_override: Option<&std::path::Path>,
 ) -> Result<Option<Value>, NotifyError> {
     // 1. Verify the plan to get the VerifiedUpdatePlan (which has `binaries`).
     //    Content staging already verified via `updates::get`, but we need our own
@@ -2117,7 +3453,7 @@ fn try_apply_binary_update(
         }
     };
 
-    // 3. Guards (fail-safe / fail-closed), BEFORE any download.
+    // 3. Guards (fail-safe / fail-closed), BEFORE any download or staging read.
 
     // 3a. Container refuse: distroless/immutable images cannot (and should not)
     //     swap binaries on disk — update via image tag instead.
@@ -2177,24 +3513,27 @@ fn try_apply_binary_update(
         }
     }
 
-    // 3c. Airgap: if `source` is None, the binary is carried in-band (not
-    //     implemented in P7d).
-    let source_url = match &binary.source {
-        Some(url) => url.clone(),
-        None => {
-            operator_log::info(
-                module_path!(),
-                "binary-update: skipped — airgap in-band delivery (out of P7d scope)",
-            );
-            return Ok(None);
-        }
-    };
+    // Serialize the marker-read → swap → marker-write critical section so
+    // concurrent notify requests cannot both pass the marker inspection
+    // before either writes. Held for the rest of the function.
+    let _swap_guard = BINARY_UPDATE_SWAP_LOCK
+        .lock()
+        .expect("binary update swap lock poisoned");
 
-    // 3d. Idempotency: if a pending marker for this exact version already exists, skip.
+    // 3d. Lineage protection: the `.prev` backup and pending marker form
+    //     the rollback lineage. A second different-version swap before
+    //     reboot would overwrite the only known-good backup with a
+    //     never-booted binary, destroying the ability to roll back. When a
+    //     Pending marker exists for the SAME version+digest, short-circuit
+    //     idempotently; for ANY other Pending marker, refuse fail-closed.
     let marker_path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
     if let Some(existing_marker) = read_binary_update_marker(&env_dir) {
         if existing_marker.phase == MarkerPhase::Pending
             && existing_marker.to_version == binary.version
+            && existing_marker
+                .digest
+                .as_ref()
+                .is_none_or(|d| d == &binary.digest)
         {
             operator_log::info(
                 module_path!(),
@@ -2210,10 +3549,31 @@ fn try_apply_binary_update(
             })));
         }
 
+        if existing_marker.phase == MarkerPhase::Pending {
+            // A different version (or same version, different digest) is
+            // already staged. Refuse the swap to protect the rollback
+            // lineage — the caller must restart first.
+            operator_log::warn(
+                module_path!(),
+                format!(
+                    "binary-update: version {} blocked — version {} already staged \
+                     and awaiting restart; a second swap would destroy the rollback \
+                     backup. Restart first, then retry.",
+                    binary.version, existing_marker.to_version,
+                ),
+            );
+            return Ok(Some(serde_json::json!({
+                "staged": false,
+                "blocked_on_pending": existing_marker.to_version,
+                "restart_required": true,
+            })));
+        }
+
         // 3e. Anti-rollback tombstone: a previous attempt to run this version
         //     failed to boot and was rolled back. Do not retry the SAME build
         //     artifact. If the digest differs (a same-version re-release with
-        //     a fixed binary), allow the swap.
+        //     a fixed binary), allow the swap. Hoisted above the source
+        //     dispatch so a crash-looped in-band binary is not auto-retried.
         if existing_marker.phase == MarkerPhase::RolledBack
             && existing_marker.to_version == binary.version
             && existing_marker
@@ -2238,65 +3598,7 @@ fn try_apply_binary_update(
         }
     }
 
-    // 4. Fetch the archive from `source_url` with bounded size + timeout.
-    let archive_dir = tempfile::TempDir::new().map_err(|err| {
-        NotifyError::Internal(format!("binary-update: failed to create temp dir: {err}"))
-    })?;
-    let archive_ext = if source_url.ends_with(".zip") {
-        "archive.zip"
-    } else {
-        "archive.tgz"
-    };
-    let archive_path = archive_dir.path().join(archive_ext);
-
-    {
-        let client = reqwest::blocking::Client::builder()
-            .timeout(BINARY_FETCH_TIMEOUT)
-            .build()
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: failed to build HTTP client: {err}"))
-            })?;
-
-        use std::io::Read as _;
-        let resp = client
-            .get(&source_url)
-            .send()
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: archive fetch failed: {err}"))
-            })?
-            .error_for_status()
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: archive fetch status error: {err}"))
-            })?;
-
-        let mut buf = Vec::new();
-        resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
-            .read_to_end(&mut buf)
-            .map_err(|err| {
-                NotifyError::Internal(format!("binary-update: archive read error: {err}"))
-            })?;
-        if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
-            return Err(NotifyError::Internal(format!(
-                "binary-update: archive exceeds {} byte cap",
-                MAX_BINARY_ARCHIVE_BYTES,
-            )));
-        }
-        std::fs::write(&archive_path, &buf).map_err(|err| {
-            NotifyError::Internal(format!("binary-update: failed to write archive: {err}"))
-        })?;
-    }
-
-    // 5. Unpack + verify + swap.
-    let unpack_dir = tempfile::TempDir::new().map_err(|err| {
-        NotifyError::Internal(format!(
-            "binary-update: failed to create unpack temp dir: {err}"
-        ))
-    })?;
-    let inner_binary = binswap::unpack_release_binary(&archive_path, own_name, unpack_dir.path())
-        .map_err(|err| {
-        NotifyError::Internal(format!("binary-update: archive unpack failed: {err}"))
-    })?;
-
+    // Resolve the current exe once — shared by both acquisition paths.
     let current_exe = match exe_path {
         Some(p) => p.to_path_buf(),
         None => std::env::current_exe().map_err(|err| {
@@ -2304,47 +3606,208 @@ fn try_apply_binary_update(
         })?,
     };
 
-    let swap_opts = binswap::SwapOptions {
-        expected_digest: Some(binary.digest.clone()),
-    };
-    let _outcome =
-        binswap::swap_binary(&inner_binary, &current_exe, &swap_opts).map_err(|err| {
-            // Fail-closed: the binary is NOT applied, content staging stays
-            // intact. Log the category, never leak the path.
-            operator_log::error(module_path!(), format!("binary-update: swap failed: {err}"));
-            NotifyError::Internal("binary update swap failed".to_string())
-        })?;
+    // 4. Acquire the binary — URL-fetch or in-band staging read.
+    match &binary.source {
+        Some(source_url) => {
+            // URL path: fetch the archive, unpack, then apply.
+            let archive_dir = tempfile::TempDir::new().map_err(|err| {
+                NotifyError::Internal(format!("binary-update: failed to create temp dir: {err}"))
+            })?;
+            let archive_ext = if source_url.ends_with(".zip") {
+                "archive.zip"
+            } else {
+                "archive.tgz"
+            };
+            let archive_path = archive_dir.path().join(archive_ext);
 
-    // 6. Durably persist the rollback marker BEFORE reporting success. The
-    //    marker is the rollback state — without it the boot-fail guard cannot
-    //    arm, and a crash-looping new binary is never rolled back. If the
-    //    write fails, undo the swap so we never exec into a binary that has
-    //    no rollback coverage.
-    let marker = BinaryUpdateMarker {
-        name: own_name.to_string(),
-        from_version: current_version.to_string(),
-        to_version: binary.version.clone(),
-        staged_at: chrono::Utc::now().to_rfc3339(),
-        phase: MarkerPhase::Pending,
-        rolled_back_at: None,
-        digest: Some(binary.digest.clone()),
-        boot_attempts: 0,
-    };
-    persist_marker_or_undo_swap(&env_dir, &marker, &current_exe)?;
+            {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(BINARY_FETCH_TIMEOUT)
+                    .build()
+                    .map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: failed to build HTTP client: {err}"
+                        ))
+                    })?;
 
-    operator_log::warn(
-        module_path!(),
-        format!(
-            "binary-update: {own_name} {} installed; restart required to activate",
-            binary.version,
-        ),
-    );
+                use std::io::Read as _;
+                let resp = client
+                    .get(source_url)
+                    .send()
+                    .map_err(|err| {
+                        NotifyError::Internal(format!("binary-update: archive fetch failed: {err}"))
+                    })?
+                    .error_for_status()
+                    .map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: archive fetch status error: {err}"
+                        ))
+                    })?;
 
-    Ok(Some(serde_json::json!({
-        "staged": true,
-        "restart_required": true,
-        "version": binary.version,
-    })))
+                let mut buf = Vec::new();
+                resp.take(MAX_BINARY_ARCHIVE_BYTES + 1)
+                    .read_to_end(&mut buf)
+                    .map_err(|err| {
+                        NotifyError::Internal(format!("binary-update: archive read error: {err}"))
+                    })?;
+                if buf.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+                    return Err(NotifyError::Internal(format!(
+                        "binary-update: archive exceeds {} byte cap",
+                        MAX_BINARY_ARCHIVE_BYTES,
+                    )));
+                }
+                std::fs::write(&archive_path, &buf).map_err(|err| {
+                    NotifyError::Internal(format!("binary-update: failed to write archive: {err}"))
+                })?;
+            }
+
+            let unpack_dir = tempfile::TempDir::new().map_err(|err| {
+                NotifyError::Internal(format!(
+                    "binary-update: failed to create unpack temp dir: {err}"
+                ))
+            })?;
+            let inner_binary =
+                binswap::unpack_release_binary(&archive_path, own_name, unpack_dir.path())
+                    .map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: archive unpack failed: {err}"
+                        ))
+                    })?;
+
+            apply_binary_from_path(
+                own_name,
+                binary,
+                &inner_binary,
+                &current_exe,
+                &env_dir,
+                current_version,
+            )
+        }
+        None => {
+            // In-band path: the binary blob was staged alongside the plan by
+            // `updates::get`. Open the same staging root, load the plan, verify
+            // the blob's digest on disk, then copy it to a temp file and apply.
+            //
+            // C4 extension: when the staged blob is MISSING (NotFound from
+            // `fs::metadata`) and a `blob_base_url` is configured on the env's
+            // update channel, fall back to fetching the blob from the mirror.
+            // This is the Tier 2 airgap path where the plan was served over
+            // plain HTTP from a static directory written by `op updates import
+            // --push-to`, which does not embed binary blobs in-band.
+            let root = match updates_root_override {
+                Some(r) => UpdatesRoot::open_in(r, env_id),
+                None => UpdatesRoot::open(env_id),
+            }
+            .map_err(|err| {
+                NotifyError::Internal(format!(
+                    "binary-update: open staging root for env `{env_id}`: {err}"
+                ))
+            })?;
+
+            let staged = root
+                .load(&verified.plan.plan_id)
+                .map_err(|err| {
+                    NotifyError::Internal(format!(
+                        "binary-update: load staged plan `{}`: {err}",
+                        verified.plan.plan_id,
+                    ))
+                })?
+                .ok_or_else(|| {
+                    NotifyError::Internal(format!(
+                        "binary-update: staged plan `{}` not found — \
+                         in-band binary requires a staged plan",
+                        verified.plan.plan_id,
+                    ))
+                })?;
+
+            // Pre-read size guard: reject oversized blobs via stat before
+            // allocating the full read, catching sparse/inflated files cheaply.
+            // When the blob file is absent (NotFound), try the mirror fallback
+            // instead of hard-erroring. Any OTHER metadata error (permission
+            // denied, etc.) keeps today's hard error — it signals a broken
+            // local install, not an absent blob.
+            let blob_path = staged.binary_blob_path(binary).map_err(|err| {
+                NotifyError::Internal(format!(
+                    "binary-update: in-band binary blob path for `{}`: {err}",
+                    binary.name,
+                ))
+            })?;
+            // Acquire the blob bytes from ONE of two sources, then hand both to
+            // the same tail. The three arms must stay behaviorally distinct:
+            // present → staged, absent + mirror → fetch, any other stat error →
+            // refuse (a broken local install is not an absent blob).
+            let blob_bytes = match std::fs::metadata(&blob_path) {
+                Ok(meta) => {
+                    // Staged blob exists — the original in-band path.
+                    let blob_len = meta.len();
+                    if blob_len > MAX_BINARY_ARCHIVE_BYTES {
+                        return Err(NotifyError::Internal(format!(
+                            "binary-update: in-band binary exceeds {} byte cap",
+                            MAX_BINARY_ARCHIVE_BYTES,
+                        )));
+                    }
+
+                    let blob_bytes = staged.verify_binary_on_disk(binary).map_err(|err| {
+                        NotifyError::Internal(format!(
+                            "binary-update: in-band binary verification failed for `{}`: {err}",
+                            binary.name,
+                        ))
+                    })?;
+
+                    // Defense-in-depth: post-read cap (the stat check above
+                    // catches most cases; this covers TOCTOU or non-regular
+                    // files).
+                    if blob_bytes.len() as u64 > MAX_BINARY_ARCHIVE_BYTES {
+                        return Err(NotifyError::Internal(format!(
+                            "binary-update: in-band binary exceeds {} byte cap",
+                            MAX_BINARY_ARCHIVE_BYTES,
+                        )));
+                    }
+
+                    blob_bytes
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    // Blob not on disk — try the blob-mirror fallback.
+                    let Some(base_url) = load_blob_base_url(store, env_id) else {
+                        // No mirror configured: reproduce the pre-C4 hard error
+                        // unchanged.
+                        return Err(NotifyError::Internal(format!(
+                            "binary-update: in-band binary stat for `{}`: {err}",
+                            binary.name,
+                        )));
+                    };
+
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "binary-update: env `{env_id}` blob not staged; \
+                             fetching {} from mirror",
+                            binary.digest,
+                        ),
+                    );
+
+                    fetch_blob_from_mirror(&base_url, &binary.digest)
+                        .map_err(NotifyError::BinaryMirror)?
+                }
+                Err(err) => {
+                    // Non-NotFound error: broken local install, hard error.
+                    return Err(NotifyError::Internal(format!(
+                        "binary-update: in-band binary stat for `{}`: {err}",
+                        binary.name,
+                    )));
+                }
+            };
+
+            write_blob_and_apply(
+                blob_bytes,
+                own_name,
+                binary,
+                &current_exe,
+                &env_dir,
+                current_version,
+            )
+        }
+    }
 }
 
 /// Core of the receiver: load the env's update-channel policy and act on a
@@ -2442,19 +3905,21 @@ fn run_update_notify(
             // and, if so, download + verify + swap it. The content path is
             // never regressed — a binary-step failure is logged and the
             // content-staged result still returns.
-            let binary_result = match try_apply_binary_update(plan, sig, store, env_id, exe_path) {
-                Ok(info) => info,
-                Err(err) => {
-                    // Log the error but do NOT fail the content staging.
-                    operator_log::error(
-                        module_path!(),
-                        format!(
-                            "update-notify: binary self-update failed for env `{env_id}`: {err:?}"
-                        ),
-                    );
-                    None
-                }
-            };
+            let binary_step = try_apply_binary_update(plan, sig, store, env_id, exe_path, None);
+            // Log before classifying — the message differs per failure kind, while
+            // the swallow-vs-surface POLICY lives in `classify_binary_step`.
+            match &binary_step {
+                Ok(_) => {}
+                Err(NotifyError::BinaryMirror(message)) => operator_log::error(
+                    module_path!(),
+                    format!("update-notify: blob-mirror failure for env `{env_id}`: {message}"),
+                ),
+                Err(err) => operator_log::error(
+                    module_path!(),
+                    format!("update-notify: binary self-update failed for env `{env_id}`: {err:?}"),
+                ),
+            }
+            let (binary_result, mirror_failure) = classify_binary_step(binary_step);
 
             // `Apply` converges on top of the staged content: snapshot → apply →
             // verify → rollback on failure, all inside the deployer's
@@ -2470,6 +3935,15 @@ fn run_update_notify(
             } else {
                 "staged"
             };
+
+            // Content has converged. Now surface the mirror failure so the
+            // caller sees a non-2xx and the poll loop leaves its sequence
+            // unadvanced and retries next cycle. This MUST come AFTER
+            // `apply_staged_plan` — moving it earlier would block content
+            // convergence on a binary-mirror problem.
+            if let Some(message) = mirror_failure {
+                return Err(NotifyError::BinaryMirror(message));
+            }
 
             let mut body = serde_json::json!({ "status": status });
             if let Some(binary_info) = binary_result {
@@ -2611,15 +4085,11 @@ async fn handle_update_notify(
             Ok(json_response(status, bytes))
         }
         Err(NotifyError::Op(err)) => Err(map_op_error(&err)),
-        Err(NotifyError::Internal(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-notify: internal failure: {message}"),
-            );
-            Err(error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "internal error staging update plan",
-            ))
+        Err(err) => {
+            let (status, public, detail) = notify_failure_response(&err)
+                .expect("only `Op` maps to None and it is matched above");
+            operator_log::error(module_path!(), detail);
+            Err(error_response(status, public))
         }
     }
 }
@@ -3028,49 +4498,49 @@ fn poll_update_cycle(
     }
 
     // 4. Verify + record/stage via the shared receiver core.
-    match run_update_notify(&store, env_id, &plan, &sig, exe_path) {
-        Ok((status, body)) => {
-            let restart = body
+    let outcome = run_update_notify(&store, env_id, &plan, &sig, exe_path);
+
+    // Logging only. The advance decision is made ONCE below, via
+    // `notify_outcome_acted_on` — do not return from these arms.
+    match &outcome {
+        Ok((status, body)) => operator_log::info(
+            module_path!(),
+            format!(
+                "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
+                meta.sequence,
+                status.as_u16(),
+                body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
+            ),
+        ),
+        Err(NotifyError::Op(err)) => operator_log::warn(
+            module_path!(),
+            format!("update-poll: plan rejected for env `{env_id}`: {err}"),
+        ),
+        Err(NotifyError::Internal(message)) => operator_log::error(
+            module_path!(),
+            format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
+        ),
+        Err(NotifyError::BinaryMirror(message)) => operator_log::error(
+            module_path!(),
+            format!(
+                "update-poll: blob-mirror failure for env `{env_id}`, \
+                 plan will be retried next cycle: {message}"
+            ),
+        ),
+    }
+
+    if notify_outcome_acted_on(&outcome) {
+        let restart = matches!(
+            &outcome,
+            Ok((_, body)) if body
                 .get("binary")
                 .and_then(|b| b.get("restart_required"))
                 .and_then(Value::as_bool)
-                == Some(true);
-            operator_log::info(
-                module_path!(),
-                format!(
-                    "update-poll: env `{env_id}` plan sequence {} -> {} ({})",
-                    meta.sequence,
-                    status.as_u16(),
-                    body.get("status").and_then(|s| s.as_str()).unwrap_or("ok"),
-                ),
-            );
-            // Advance the remembered sequence ONLY when the plan was actually
-            // acted on (2xx = staged or recorded). A non-2xx `Ok` means the
-            // channel was disabled between this cycle's config read and the
-            // receiver's own re-read (a TOCTOU that yields 403 `disabled`);
-            // leaving the sequence unadvanced lets a re-enabled channel pick the
-            // plan up next cycle instead of skipping it until the server
-            // publishes a newer one.
-            if status.is_success() {
-                (Some(meta.sequence), interval, restart)
-            } else {
-                (last_sequence, interval, false)
-            }
-        }
-        Err(NotifyError::Op(err)) => {
-            operator_log::warn(
-                module_path!(),
-                format!("update-poll: plan rejected for env `{env_id}`: {err}"),
-            );
-            (last_sequence, interval, false)
-        }
-        Err(NotifyError::Internal(message)) => {
-            operator_log::error(
-                module_path!(),
-                format!("update-poll: internal failure staging plan for env `{env_id}`: {message}"),
-            );
-            (last_sequence, interval, false)
-        }
+                == Some(true)
+        );
+        (Some(meta.sequence), interval, restart)
+    } else {
+        (last_sequence, interval, false)
     }
 }
 
@@ -3310,7 +4780,24 @@ fn build_activity(
     endpoint: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
 ) -> Activity {
+    // Every caller of this function hands it JSON a client wrote, so a caller
+    // block in it is a claim, never a verification. Only the provider route
+    // (`envelope_to_activity`) may carry one — see `client_caller`.
+    let payload = &client_caller::without_client_caller(payload);
     let mut activity = match payload.get("text").and_then(Value::as_str) {
+        // `Activity::text` keeps ONLY the text. That is right for a plain
+        // message and silently lossy for `{"text": …, "metadata": …}` — the
+        // canonical ingress envelope shape, and what an MCP `answer` sent
+        // beside a `message` builds (worker-interop contract §9.4). A submit
+        // whose answers vanished here would resume the parked node with no
+        // fields and nothing red at any layer, so such a payload travels
+        // whole. `with_flow_type` restores the one property `Activity::text`
+        // sets and `Activity::custom` does not, and it is what flow
+        // resolution reads; the `action` that comes with `custom` is a
+        // tracing attribute and is read by nothing else.
+        Some(_) if payload.get("metadata").is_some() => {
+            Activity::custom("http.request", payload.clone()).with_flow_type("messaging")
+        }
         Some(text) => Activity::text(text),
         None => Activity::custom("http.request", payload.clone()),
     };
@@ -3714,6 +5201,8 @@ fn try_probe_response(path: &str, state: &ServeState) -> Option<Response<Full<By
             "deployments_routed": deployments_routed,
             "revisions_active": revisions_active,
             "restart_required": restart,
+            "telemetry": crate::otlp_status::snapshot_json(),
+            "triggers": activation.routing.triggers.status_json(),
         });
         return Some(json_response(StatusCode::OK, body.to_string().into_bytes()));
     }
@@ -3954,7 +5443,16 @@ async fn dispatch_provider_route(
         ));
     };
     let descriptor_pack_id = route_match.descriptor.pack_id.clone();
+    // The pack file behind this route. `provider_webhook_verify` reaches back
+    // into it for the `messaging.provider_ingress.v1` component that verifies
+    // the request signature; cloned here because `route_match` borrows the
+    // activation's route table.
+    let descriptor_pack_path = route_match.descriptor.pack_path.clone();
+    let descriptor_pack_non_secret = route_match.descriptor.pack_non_secret.clone();
     let provider_op = route_match.descriptor.provider_op.clone();
+    // Decided once at revision activation from the provider's declared ops; the
+    // per-turn path never probes `send_typing` by invoking it.
+    let supports_typing = route_match.descriptor.supports_typing;
     let route_tenant = route_match.tenant.clone();
     let route_team = route_match.team.clone();
     let deployment_id = scope.deployment_id;
@@ -3982,13 +5480,18 @@ async fn dispatch_provider_route(
         // Session-token renewal preflight: loads the provider's
         // jwt_signing_key, applies any Authorization rewrite, and may
         // short-circuit (auth failure, /tokens/refresh served locally).
-        let signing_key =
+        let signing_key_read =
             read_provider_signing_key(&activation, tenant, Some(&route_team), &provider_type).await;
+        let signing_key = match &signing_key_read {
+            SigningKeyRead::Found(key) => crate::directline_session::SigningKey::Present(key),
+            SigningKeyRead::NotConfigured => crate::directline_session::SigningKey::NotConfigured,
+            SigningKeyRead::Unavailable => crate::directline_session::SigningKey::Unavailable,
+        };
         let preflight_outcome = crate::directline_session::preflight(
             &hyper::Method::from_bytes(norm_method.as_bytes()).unwrap_or(hyper::Method::POST),
             &norm_path,
             &dl_headers,
-            signing_key.as_deref(),
+            signing_key,
             &state.directline_sessions,
         );
         let forward_plan = match preflight_outcome {
@@ -4065,22 +5568,78 @@ async fn dispatch_provider_route(
         Err(response) => return Err(response),
     };
 
-    // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
-    // body-derived chat-stickiness pin now that the host gate above has admitted
-    // the request (a rejected request returns `Err` above and never pins).
+    // Transport-layer signature gate. `provider_auth` above covers providers
+    // that authenticate with a shared secret in a header (Telegram); this
+    // covers providers that sign the request itself (Slack). Unlike the legacy
+    // `http_ingress` server, this path never runs the pack's
+    // `messaging.provider_ingress.v1` component — it calls the provider's
+    // `ingest_http` op directly — and for Slack that component is the only
+    // place the `X-Slack-Signature` HMAC is checked. Without this gate the body
+    // below is unauthenticated. See [`crate::provider_webhook_verify`] for how
+    // it delegates back to that same component instead of reimplementing the
+    // check, and for what it does when no signing secret is configured.
     //
-    // Trust boundary: the gate only *verifies* the body for providers with a
-    // host-side authenticator — today Telegram endpoints carrying a
-    // `webhook_secret_ref`, i.e. the `Authenticated` outcome. A `Skipped`
-    // outcome means the host had nothing to check the body against: either the
-    // provider verifies inside its own component (e.g. Slack signature), which
-    // runs *after* this point, or the endpoint is a legacy no-secret one. Those
-    // still pin here — unchanged from A1, which pinned them inline during
-    // dispatch — so the pin can precede (delegated) or lack (legacy)
-    // verification. Impact stays low: same-bundle version routing only,
-    // `try_pin` cannot overwrite an existing pin, and the store caps + TTL bound
-    // cardinality. Fully gating the delegated case would need the component to
-    // report its verification result back to the host (tracked separately).
+    // Blocking: instantiating and calling the component compiles wasm, so it
+    // runs on the blocking pool rather than on a hyper worker. The cheap
+    // applicability check happens BEFORE the hop so an uncovered class — most
+    // of all DirectLine, which polls — does not pay for it.
+    if provider_webhook_verify::requires_verification(&provider_type) {
+        let verify_provider_type = provider_type.clone();
+        let verify_pack_id = descriptor_pack_id.clone();
+        let verify_pack_path = descriptor_pack_path.clone();
+        let verify_secrets = secrets.clone();
+        let verify_tenant = tenant.to_string();
+        let verify_headers = request_headers.to_vec();
+        let verify_body = body.to_vec();
+        let verdict = tokio::task::spawn_blocking(move || {
+            provider_webhook_verify::verify_inbound_provider_webhook(
+                &verify_provider_type,
+                &verify_pack_id,
+                &verify_pack_path,
+                verify_secrets,
+                &verify_tenant,
+                &verify_headers,
+                &verify_body,
+            )
+        })
+        .await;
+        match verdict {
+            Ok(Ok(_)) => {}
+            Ok(Err(boxed)) => return Err(*boxed),
+            Err(err) => {
+                // The verification task panicked or was cancelled. There is no
+                // verdict, so there is no admission.
+                operator_log::error(
+                    module_path!(),
+                    format!(
+                        "webhook signature verification task for provider {provider_type} \
+                         did not complete (deployment {deployment_id} revision {revision_id}): \
+                         {err}"
+                    ),
+                );
+                return Err(error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "webhook signature verification is unavailable",
+                ));
+            }
+        }
+    }
+
+    // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
+    // body-derived chat-stickiness pin now that the host gates above have
+    // admitted the request (a rejected request returns `Err` above and never
+    // pins).
+    //
+    // Trust boundary: two gates run before this point, and between them they
+    // cover the shipped signed providers — `provider_auth` for a Telegram
+    // endpoint carrying a `webhook_secret_ref`, and `provider_webhook_verify`
+    // for a provider class that signs its requests (Slack). What still pins
+    // without any verification is a provider class in neither set: a legacy
+    // Telegram endpoint provisioned with no `webhook_secret_ref`, or a class
+    // that carries no transport authentication at all. Those still pin here —
+    // unchanged from A1, which pinned them inline during dispatch. Impact stays
+    // low: same-bundle version routing only, `try_pin` cannot overwrite an
+    // existing pin, and the store caps + TTL bound cardinality.
     //
     // No-op when there is no hint (endpoint with no extractable chat id).
     if let Some(hint) = session_hint {
@@ -4177,6 +5736,34 @@ async fn dispatch_provider_route(
     // welcome_flow on first contact.
     let welcome_hint = flow_target.clone().or(welcome_hint);
 
+    // Deploy-time provider answers (#585): resolved exactly as the legacy host
+    // resolves them, after every admission gate above so a refused request
+    // does no secret reads.
+    let provider_config = crate::revision_provider_config::resolve_revision_provider_config(
+        &secrets,
+        crate::revision_provider_config::RevisionProviderPack {
+            pack_id: descriptor_pack_id.clone(),
+            pack_path: descriptor_pack_path.clone(),
+            pack_non_secret: descriptor_pack_non_secret,
+        },
+        tenant,
+        Some(&route_team),
+    )
+    .await
+    .map_err(|err| {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "could not resolve config for provider {provider_type} \
+                 (deployment {deployment_id} revision {revision_id}): {err:#}"
+            ),
+        );
+        error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "provider config could not be resolved",
+        )
+    })?;
+
     let http_in = build_provider_http_in(
         &provider_type,
         tenant,
@@ -4185,6 +5772,7 @@ async fn dispatch_provider_route(
         &dl_query_pairs,
         &dl_headers,
         body,
+        provider_config,
     );
     let input_json = serde_json::to_vec(&http_in).map_err(|err| {
         error_response(
@@ -4225,7 +5813,7 @@ async fn dispatch_provider_route(
     // so we extract the `_greentic` metadata inline.
     try_notify_webchat_activity(state.notifier.as_ref(), &output).await;
 
-    let result = parse_dispatch_result(&output).map_err(|err| {
+    let mut result = parse_dispatch_result(&output).map_err(|err| {
         operator_log::warn(
             module_path!(),
             format!(
@@ -4238,6 +5826,26 @@ async fn dispatch_provider_route(
             "could not decode provider response envelope",
         )
     })?;
+
+    // Lift any approval decision off the batch before anything routes it.
+    // The envelope a click produces carries `[approval:approved]` as its text,
+    // which is a marker and not something a human typed — routed to a flow (and
+    // with fast2flow enabled, to an LLM router) it would read as chat. The raw
+    // body is passed too: it is where the clicked message's id lives, and that
+    // is what lets the next republish for this gate UPDATE the outstanding
+    // message instead of posting a second approval. No-op unless the bridge is
+    // running.
+    {
+        let content_type = request_headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-type"))
+            .map(|(_, value)| value.as_str());
+        crate::approval_rail::intercept_inbound(
+            content_type,
+            body,
+            &mut result.messaging_envelopes,
+        );
+    }
 
     // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
     // legacy `dispatch_http_ingress` routes these only for `Domain::Events`
@@ -4273,25 +5881,39 @@ async fn dispatch_provider_route(
         let pipeline_bundle = bundle_id.clone();
         let pipeline_team = route_team.clone();
         let pipeline_notifier = Arc::clone(&state.notifier);
-        tokio::spawn(async move {
-            run_provider_inbound_pipeline(
-                pipeline_activation,
-                pipeline_tenant,
-                pipeline_team,
-                deployment_id,
-                pipeline_bundle,
-                revision_id,
-                descriptor_pack_id,
-                pipeline_provider,
-                ingress_envelopes,
-                endpoint_id,
-                flow_target,
-                flow_target_explicit,
-                welcome_hint,
-                pipeline_notifier,
-            )
-            .await;
-        });
+        // Created here, inside the request-instrumented future, so it parents
+        // to the `http.request` span and the turn shares the request's trace.
+        // Ids only — never message content.
+        let turn_span = tracing::info_span!(
+            "messaging.turn",
+            greentic.provider = %provider_type,
+            greentic.tenant = %tenant,
+            greentic.deployment_id = %deployment_id,
+            greentic.revision_id = %revision_id,
+        );
+        tokio::spawn(
+            async move {
+                run_provider_inbound_pipeline(
+                    pipeline_activation,
+                    pipeline_tenant,
+                    pipeline_team,
+                    deployment_id,
+                    pipeline_bundle,
+                    revision_id,
+                    descriptor_pack_id,
+                    pipeline_provider,
+                    ingress_envelopes,
+                    endpoint_id,
+                    flow_target,
+                    flow_target_explicit,
+                    welcome_hint,
+                    pipeline_notifier,
+                    supports_typing,
+                )
+                .await;
+            }
+            .instrument(turn_span),
+        );
     }
 
     // A4: DirectLine post-processing — apply the forward plan (seed sliding
@@ -4303,12 +5925,10 @@ async fn dispatch_provider_route(
             apply_directline_forward_plan_to_response(&state, plan, &mut response);
         }
 
-        // streamUrl rewrite: the provider returns a relative path, but
-        // DirectLineJS requires an absolute ws:// URL.
-        if dl_method == "POST"
-            && (dl_path == "/v3/directline/conversations" || dl_path.ends_with("/conversations"))
-            && (200..300).contains(&response.status)
-        {
+        let succeeded = (200..300).contains(&response.status);
+        let creates_conversation = is_conversation_create(&dl_method, &dl_path);
+
+        if succeeded && creates_conversation {
             // Pin the newly created conversation to the revision that
             // created it. POST /conversations has no conversation_id in
             // the URL yet, so the pre-dispatch session_hint was None
@@ -4324,13 +5944,51 @@ async fn dispatch_provider_route(
                     .commit_pin(tenant, deployment_id, &hint, revision_id)
                     .await;
             }
+        }
 
+        // Resume: a conversation whose pin was lost (restart, redeploy, TTL, or
+        // a different replica) is served from durable state, but its WebSocket
+        // is refused unless a pin exists. Re-establish it when the provider
+        // ACCEPTED a conversation-scoped request (reconnect `GET
+        // /conversations/{id}`, `POST`/`GET .../activities`) for a caller whose
+        // token was already bound to that same conversation. The provider's 2xx
+        // is the proof the conversation exists; the bound token is the proof the
+        // caller owns it. `commit_pin` is insert-if-absent, so a live pin (an
+        // older revision still draining, or a racing request) is never replaced.
+        // The creating POST is handled above.
+        if succeeded
+            && !creates_conversation
+            && dl_forward_plan
+                .as_ref()
+                .is_some_and(|plan| plan.token_bound_to_conversation)
+            && let Some(hint) =
+                crate::session_hint_extractor::extract_webchat_session_hint(&dl_path)
+        {
+            activation
+                .routing
+                .dispatcher
+                .commit_pin(tenant, deployment_id, &hint, revision_id)
+                .await;
+        }
+
+        // streamUrl rewrite: the provider returns a relative path, but
+        // DirectLineJS requires an absolute ws:// URL that routes back through
+        // the same bundle. BOTH responses that carry one need it: the create,
+        // and the reconnect (`GET /conversations/{id}`) DirectLineJS issues
+        // whenever its socket drops — which Cloud Run does at its request
+        // timeout. Rewriting only the create left the reconnect answering a
+        // tenant-scoped URL with no bundle segment; on a bundle-routed
+        // deployment that URL 404s, the client retries it forever, and every
+        // reply after the first socket drop is silently undeliverable.
+        if succeeded && returns_stream_url(&dl_method, &dl_path) {
             rewrite_stream_url(
                 &dl_headers,
                 &mut response,
                 webchat_target.and_then(super::webchat_routing::WebchatTarget::url_bundle_segment),
             );
+        }
 
+        if succeeded && creates_conversation {
             // Cache the post-rewrite response for conversation dedup.
             if let Some(key) = dl_dedup_key {
                 state.conversation_dedup.insert(key, response.clone());
@@ -4371,7 +6029,30 @@ async fn run_provider_inbound_pipeline(
     flow_target_explicit: bool,
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
+    supports_typing: bool,
 ) {
+    // Channel "is typing" signal (docs/typing-signal.md). Built once per batch and
+    // only when the provider declares `send_typing` and the kill switch is on. The
+    // config is the same per-pack override value `run_reply_egress` hands
+    // `send_payload`.
+    let typing_sender = (supports_typing && crate::typing::enabled()).then(|| {
+        Arc::new(crate::typing::RevisionTypingSender {
+            host: Arc::clone(&activation.host),
+            tenant: tenant.clone(),
+            deployment_id,
+            bundle_id: bundle_id.clone(),
+            revision_id,
+            provider_type: provider_type.clone(),
+            notifier: Arc::clone(&notifier),
+        }) as Arc<dyn crate::typing::TypingSender>
+    });
+    let typing_config = typing_sender.as_ref().and_then(|_| {
+        crate::messaging_egress::pack_config_overrides_as_json(
+            &activation.routing.deployment_config_overrides,
+            deployment_id,
+            &pack_id,
+        )
+    });
     for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
         // `flow_hint` metadata key (the provider echoing back the flow the
@@ -4428,20 +6109,41 @@ async fn run_provider_inbound_pipeline(
                 activity,
             )
         };
-        let reply_envelopes = match fast2flow_hook::run_planned_turn(
-            fast2flow_hook::plan_revision_turn(
+        // The whole turn — the Fast2Flow probe included, as on the legacy
+        // path — runs inside the typing indicator, so a slow routing host
+        // shows "typing" instead of a silent pause before the flow starts.
+        let planned_turn = async {
+            let planned = fast2flow_hook::plan_revision_turn(
                 &activation,
                 &turn_scope,
                 ingress,
                 explicit,
                 fallback,
             )
-            .await,
-            run_turn,
-            |reply| build_reply_envelopes(ingress, reply, &pack_id, &tenant),
-        )
-        .await
-        {
+            .await;
+            fast2flow_hook::run_planned_turn(planned, run_turn, |reply| {
+                build_reply_envelopes(ingress, reply, &pack_id, &tenant)
+            })
+            .await
+        };
+        let typing_input = crate::typing::typing_input_for(
+            typing_sender.is_some(),
+            true,
+            &provider_type,
+            &tenant,
+            ingress,
+            typing_config.clone(),
+        );
+        // `keep_typing_while` has returned: no refresh can start after this point,
+        // so a typing indicator never lands after the reply below. One reply
+        // payload can fan out to several envelopes (e.g. `messages[]`).
+        let turn_result = match (&typing_sender, typing_input) {
+            (Some(sender), Some(input)) => {
+                crate::typing::keep_typing_while(Arc::clone(sender), input, planned_turn).await
+            }
+            _ => planned_turn.await,
+        };
+        let reply_envelopes = match turn_result {
             Ok(envelopes) => envelopes,
             Err(err) => {
                 operator_log::error(
@@ -4605,7 +6307,7 @@ async fn run_reply_egress(
 /// The metadata may appear at the top level (`send_payload`) or inside a
 /// base64-encoded `body_b64` field (`directline_http`). When absent the call
 /// is a no-op — non-webchat providers simply don't carry `_greentic`.
-async fn try_notify_webchat_activity(
+pub(crate) async fn try_notify_webchat_activity(
     notifier: &dyn crate::notifier::ActivityNotifier,
     output: &Value,
 ) {
@@ -4662,7 +6364,7 @@ async fn try_notify_webchat_activity(
 /// (channel/session/to) from the ingress. Otherwise treat the payload as
 /// the reply text or wholesale `metadata` carrier and start from a
 /// clone of the ingress envelope.
-fn build_reply_envelopes(
+pub(crate) fn build_reply_envelopes(
     ingress: &ChannelMessageEnvelope,
     reply: &Activity,
     pack_id: &str,
@@ -4780,10 +6482,10 @@ fn collect_forwarded_request_headers(headers: &HeaderMap) -> Vec<(String, String
 
 /// Build the [`HttpInV1`] wire envelope a `greentic.provider-extension.v1`
 /// component expects on `ingest_http`. Mirrors the shape the legacy ingress
-/// builds in [`crate::ingress_dispatch::build_ingress_request`], minus the
-/// pack-level config injection (Phase D revision-aware config injection is
-/// follow-up work — components that need secrets read them from the host
-/// directly today).
+/// builds in [`crate::ingress_dispatch::build_ingress_request`]; `config` is
+/// resolved by [`crate::revision_provider_config`] the same way the legacy
+/// host resolves it.
+#[allow(clippy::too_many_arguments)]
 fn build_provider_http_in(
     provider: &str,
     tenant: &str,
@@ -4792,6 +6494,7 @@ fn build_provider_http_in(
     query: &[(String, String)],
     headers: &[(String, String)],
     body: &[u8],
+    config: Option<Value>,
 ) -> HttpInV1 {
     HttpInV1 {
         v: 1,
@@ -4805,7 +6508,7 @@ fn build_provider_http_in(
         query: query.to_vec(),
         headers: headers.to_vec(),
         body_b64: BASE64.encode(body),
-        config: None,
+        config,
     }
 }
 
@@ -4913,15 +6616,89 @@ fn synthesize_provider_response(response: &IngressHttpResponse) -> Response<Full
 // except `read_provider_signing_key` which reads the secrets manager.
 // ---------------------------------------------------------------------------
 
+/// Owned form of [`crate::directline_session::SigningKey`], returned by the
+/// read so the borrow does not outlive the secrets call.
+#[derive(Debug)]
+enum SigningKeyRead {
+    Found(Vec<u8>),
+    NotConfigured,
+    Unavailable,
+}
+
+/// True for a [`greentic_secrets_lib::SecretError`] that means the read
+/// itself failed, as opposed to `NotFound`, which means the key was never
+/// configured. This is the security-relevant decision in
+/// `read_provider_signing_key`: `Permission` is grouped with the failures,
+/// not with "not found", because a denial means the key probably exists and
+/// cannot be read — treating it as "no key" would reopen the authentication
+/// bypass this module exists to close. Kept as a pure function, independently
+/// testable against all four `SecretError` variants without an `Activation`
+/// or a secrets manager, so this classification cannot silently drift.
+///
+/// Written as a negative match (`!matches!(.., NotFound(_))`) rather than an
+/// explicit list of failure variants, so it fails CLOSED — refuses — if
+/// `greentic-secrets-api` ever adds a fifth `SecretError` variant, rather
+/// than silently treating an unrecognised one as "not found" and forwarding
+/// unverified. The trade-off is deliberate and asymmetric: a future
+/// not-found-shaped variant (say, a typed "no such secret" distinct from
+/// `NotFound`) would read as a failure and refuse legitimate, never-configured
+/// tenant traffic until this arm is updated to name it — an availability
+/// regression, not a security one. That is the correct side to fail on here.
+fn is_backend_failure(err: &greentic_secrets_lib::SecretError) -> bool {
+    !matches!(err, greentic_secrets_lib::SecretError::NotFound(_))
+}
+
+/// Fold the two URI read outcomes into the final decision, plus the most
+/// recent backend-failure message (for the caller's `warn!`; `None` when the
+/// outcome is not `Unavailable`).
+///
+/// Pure and directly testable — this is the accumulation glue itself, not
+/// just [`is_backend_failure`]'s per-error classification: "a successful read
+/// anywhere wins outright; otherwise any backend failure outranks any
+/// not-found". Deleting the fold that turns a lone backend failure into
+/// `Unavailable` would reopen the authentication bypass this module exists
+/// to close while every test that only exercises `is_backend_failure` in
+/// isolation stays green — these tests exist to catch exactly that.
+///
+/// Scan order matters only for which message is reported when both entries
+/// are backend failures (the later one wins); it does not affect the
+/// decision, which is symmetric in the two entries.
+fn classify_reads(
+    results: [Result<Vec<u8>, greentic_secrets_lib::SecretError>; 2],
+) -> (SigningKeyRead, Option<String>) {
+    let mut backend_failure_message: Option<String> = None;
+    for result in results {
+        match result {
+            Ok(bytes) => return (SigningKeyRead::Found(bytes), None),
+            Err(err) if is_backend_failure(&err) => {
+                backend_failure_message = Some(err.to_string());
+            }
+            Err(_) => {}
+        }
+    }
+    match backend_failure_message {
+        Some(message) => (SigningKeyRead::Unavailable, Some(message)),
+        None => (SigningKeyRead::NotConfigured, None),
+    }
+}
+
 /// Read the `jwt_signing_key` for a provider from the secrets manager.
-/// Returns `None` when the key is absent or the read fails (best-effort —
-/// a missing key just means no token renewal, not a hard failure).
+///
+/// Distinguishes a provider that never had a key configured — every URI read
+/// answered "not found" — from one whose key could not be READ: any read for
+/// which [`is_backend_failure`] is true (see [`classify_reads`] for how the
+/// two reads are combined into one decision). Those are not the same thing
+/// downstream: forwarding an unverified request on the first is the
+/// long-standing, deliberate posture for a provider with auth switched off;
+/// doing it on the second turns a degraded secrets backend into an
+/// authentication bypass. The `warn!` below fires only on that failure
+/// path — a never-configured provider is not a warning.
 async fn read_provider_signing_key(
     activation: &Activation,
     tenant: &str,
     team: Option<&str>,
     provider_type: &str,
-) -> Option<Vec<u8>> {
+) -> SigningKeyRead {
     let secrets = activation.host.secrets_manager();
     let env = crate::resolve_env(None);
     let team_segment = crate::secrets_manager::canonical_team(team);
@@ -4939,13 +6716,29 @@ async fn read_provider_signing_key(
         &provider_hyphen,
         "jwt_signing_key",
     );
-    for uri in [&raw_uri, &canonical_uri] {
-        match secrets.read(uri).await {
-            Ok(bytes) => return Some(bytes),
-            Err(_) => continue,
-        }
+    // Try the raw URI first and return immediately on success, so a
+    // provider whose key is found there (the common case) never pays for a
+    // second secrets-manager read. Only a raw-URI failure falls through to
+    // trying the canonical URI too — at that point both outcomes are known,
+    // so the actual decision is delegated to `classify_reads` rather than
+    // re-implemented here.
+    let raw_result = match secrets.read(&raw_uri).await {
+        Ok(bytes) => return SigningKeyRead::Found(bytes),
+        Err(err) => Err(err),
+    };
+    let canonical_result = secrets.read(&canonical_uri).await;
+    let (outcome, backend_failure_message) = classify_reads([raw_result, canonical_result]);
+    if let Some(err) = backend_failure_message {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "directline signing key unreadable for provider={provider_type} \
+                 tenant={tenant}: {err}; requests to this provider will be \
+                 REFUSED until it can be read"
+            ),
+        );
     }
-    None
+    outcome
 }
 
 /// Extract the DirectLine-relative path from a full request path.
@@ -5078,7 +6871,30 @@ fn apply_directline_forward_plan_to_response(
     }
 }
 
-/// Rewrite a relative `streamUrl` in a `POST /conversations` response body
+/// `POST .../conversations` — starts a DirectLine conversation.
+fn is_conversation_create(method: &str, path: &str) -> bool {
+    method == "POST" && (path == "/v3/directline/conversations" || path.ends_with("/conversations"))
+}
+
+/// Whether a successful DirectLine response carries a `streamUrl`: the create
+/// (`POST .../conversations`) and the reconnect (`GET .../conversations/{id}`).
+/// Activity and stream paths (`.../conversations/{id}/activities`, `/stream`)
+/// carry none.
+fn returns_stream_url(method: &str, path: &str) -> bool {
+    if is_conversation_create(method, path) {
+        return true;
+    }
+    if method != "GET" {
+        return false;
+    }
+    let Some(idx) = path.rfind("/conversations/") else {
+        return false;
+    };
+    let conversation_id = &path[idx + "/conversations/".len()..];
+    !conversation_id.is_empty() && !conversation_id.contains('/')
+}
+
+/// Rewrite a relative `streamUrl` in a conversation create or reconnect response body
 /// to an absolute `ws://` URL using the request's `Host` header. DirectLineJS
 /// requires an absolute URL on the WebSocket constructor; a relative path
 /// makes the SDK fall back to HTTP polling.
@@ -5277,16 +7093,20 @@ struct RevisionActivitySource {
     team: String,
     /// Bearer token captured at WS upgrade time.
     auth_token: Option<String>,
+    /// The provider's `HttpInV1.config`, resolved once at upgrade time from
+    /// the pinned revision (#585). A revision's pack-config cannot change
+    /// under a live socket; a new deploy is a new revision.
+    config: Option<Value>,
 }
 
-#[async_trait::async_trait]
-impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
-    async fn fetch_since(
+impl RevisionActivitySource {
+    /// The `HttpInV1` the pump sends to read activities past `since_watermark`.
+    fn activities_poll_payload(
         &self,
         tenant_id: &str,
         conversation_id: &str,
         since_watermark: u64,
-    ) -> Result<(Vec<Value>, u64), String> {
+    ) -> Value {
         let headers: Vec<Value> = match &self.auth_token {
             Some(token) if !token.is_empty() => {
                 vec![serde_json::json!([
@@ -5296,7 +7116,7 @@ impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
             }
             _ => Vec::new(),
         };
-        let payload = serde_json::json!({
+        serde_json::json!({
             "v": 1,
             "provider": self.provider_type,
             "route": Value::Null,
@@ -5308,8 +7128,20 @@ impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
             "query": format!("watermark={since_watermark}&tenant={tenant_id}&team={}", self.team),
             "headers": headers,
             "body_b64": "",
-            "config": Value::Null,
-        });
+            "config": self.config.clone().unwrap_or(Value::Null),
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
+    async fn fetch_since(
+        &self,
+        tenant_id: &str,
+        conversation_id: &str,
+        since_watermark: u64,
+    ) -> Result<(Vec<Value>, u64), String> {
+        let payload = self.activities_poll_payload(tenant_id, conversation_id, since_watermark);
         let input_json = serde_json::to_vec(&payload).map_err(|err| err.to_string())?;
 
         // Try canonical `ingest-http` op, then fall back to the underscore
@@ -5377,10 +7209,12 @@ impl crate::websocket::pump::ActivitySource for RevisionActivitySource {
 
 /// Handle a WebSocket upgrade on the revision path.
 ///
-/// The conversation must already exist (created via REST `POST /conversations`)
-/// and be pinned to a revision. The WS pump reads activities from the SAME
-/// revision the REST conversation was pinned to — never re-dispatching — so
-/// the socket and the REST endpoint always see the same conversation state.
+/// The caller must hold a valid token bound to the conversation (minted by REST
+/// `POST /conversations`). The WS pump reads activities from the revision the
+/// conversation is pinned to, so the socket and the REST endpoint always see
+/// the same conversation state. When the pin is gone (restart, redeploy, TTL)
+/// it is re-established on the current revision after the token is verified,
+/// never replacing a live pin.
 async fn handle_websocket_upgrade(
     req: &mut Request<Incoming>,
     path: &str,
@@ -5451,35 +7285,17 @@ async fn handle_websocket_upgrade(
         })?
         .to_string();
 
-    // Look up the revision pin for this conversation. A5 critical invariant:
-    // the WS pump MUST read from the same revision the REST POST pinned to.
-    // The session hint format is `webchat:{conversation_id}`.
-    let session_hint = format!("webchat:{conv_id}");
-    let pinned = activation
-        .routing
-        .dispatcher
-        .lookup_pin(&tenant, deployment_id, &session_hint)
-        .await;
-
-    let (bundle_id, revision_id) = match pinned {
-        Some((bid, rid)) => (bid, rid),
-        None => {
-            // No pin means the conversation was never created via REST, or the
-            // pin expired. Either way, we cannot safely pick a revision.
-            return Err(error_response(
-                StatusCode::NOT_FOUND,
-                "no revision pin for this conversation; create it via REST first",
-            ));
-        }
-    };
-
-    // Read the JWT signing key from the pinned revision's secrets.
+    // Read the JWT signing key. The key is a provider-level secret, not a
+    // per-revision one, so it can be read before a revision is chosen. This
+    // path has no "auth is off" posture of its own — it always needs the actual
+    // key bytes to validate the `?t=` token — so both a never-configured key
+    // and one that could not be read refuse the same way.
     let team = "default";
     let signing_key =
         read_provider_signing_key(&activation, &tenant, Some(team), &provider_type).await;
     let signing_key = match signing_key {
-        Some(key) => key,
-        None => {
+        SigningKeyRead::Found(key) => key,
+        SigningKeyRead::NotConfigured | SigningKeyRead::Unavailable => {
             return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "missing jwt_signing_key for the webchat provider",
@@ -5487,7 +7303,10 @@ async fn handle_websocket_upgrade(
         }
     };
 
-    // Validate the ?t= token.
+    // Validate the ?t= token. It must be signed by us, unexpired, bound to
+    // THIS conversation id (a conversation-less token is refused here) and to
+    // this tenant — so everything below acts only for a caller that holds a
+    // credential minted for this exact conversation.
     let ctx = match crate::websocket::validate_request_parts(
         req.uri(),
         req.headers(),
@@ -5497,6 +7316,75 @@ async fn handle_websocket_upgrade(
     ) {
         Ok(c) => c,
         Err(err) => return Ok(crate::websocket::refusal_response(&err)),
+    };
+
+    // Find the revision this conversation is pinned to. A5 critical invariant:
+    // the WS pump MUST read from the same revision the REST side serves it
+    // from. The session hint format is `webchat:{conversation_id}`.
+    //
+    // The pin lives in memory (or Redis) and is created by REST traffic, so it
+    // is gone after a restart, a redeploy or a TTL while the conversation's
+    // durable state is not. A caller holding a valid token bound to this
+    // conversation therefore re-establishes it, on the current revision and
+    // insert-if-absent: a live pin — an older revision still draining during a
+    // rolling deploy included — is never replaced, and racing upgrades converge
+    // on one pin. See docs/durable-conversation-state.md.
+    let session_hint = format!("webchat:{conv_id}");
+    let mut rng: rand::rngs::SmallRng = rand::make_rng();
+    let pinned = activation
+        .routing
+        .dispatcher
+        .establish_pin(&tenant, deployment_id, &session_hint, &mut rng)
+        .await;
+
+    let (bundle_id, revision_id) = match pinned {
+        Some((bid, rid)) => (bid, rid),
+        None => {
+            // No routable revision exists for this deployment, so there is
+            // nothing safe to pin to.
+            return Err(error_response(
+                StatusCode::NOT_FOUND,
+                "no revision is available to serve this conversation",
+            ));
+        }
+    };
+
+    // Resolve the provider's config from the pinned revision (#585), after
+    // the token check so an unauthenticated upgrade does no secret reads.
+    let revision_scope = RevisionScope {
+        deployment_id,
+        bundle_id: bundle_id.clone(),
+        revision_id,
+    };
+    let provider_pack = activation
+        .routing
+        .http_routes
+        .match_request_for_revision(effective_ws_path, "GET", &revision_scope)
+        .map(|route| {
+            crate::revision_provider_config::RevisionProviderPack::from_descriptor(route.descriptor)
+        });
+    let provider_config = match provider_pack {
+        Some(pack) => crate::revision_provider_config::resolve_revision_provider_config(
+            &activation.host.secrets_manager(),
+            pack,
+            &tenant,
+            Some(team),
+        )
+        .await
+        .map_err(|err| {
+            operator_log::error(
+                module_path!(),
+                format!(
+                    "could not resolve config for provider {provider_type} \
+                     (deployment {deployment_id} revision {revision_id}): {err:#}"
+                ),
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "provider config could not be resolved",
+            )
+        })?,
+        None => None,
     };
 
     // Acquire a session slot.
@@ -5546,6 +7434,7 @@ async fn handle_websocket_upgrade(
                 provider_type,
                 team: team.to_string(),
                 auth_token,
+                config: provider_config,
             })
         };
     #[cfg(not(test))]
@@ -5558,6 +7447,7 @@ async fn handle_websocket_upgrade(
             provider_type,
             team: team.to_string(),
             auth_token,
+            config: provider_config,
         });
 
     let notifier = state.notifier.clone();
@@ -5606,6 +7496,29 @@ mod tests {
             activity.payload().get("text").and_then(Value::as_str),
             Some("hello there")
         );
+        // A text-only payload must keep taking the `Activity::text` path: the
+        // metadata-sibling arm below it is narrower than "any payload with a
+        // text key", and an arm that widened to this shape would change what
+        // every messaging turn dispatches as.
+        assert_eq!(activity.payload(), &payload);
+        assert!(activity.payload().get("metadata").is_none());
+        assert_eq!(
+            activity_kind(&activity),
+            "message",
+            "a text-only payload must still be a MESSAGE activity"
+        );
+    }
+
+    /// A payload with NO text keeps wrapping whole as a custom activity, and
+    /// keeps its absent flow type — the metadata-sibling arm must not reach
+    /// it and quietly relabel every answer-only submit as messaging.
+    #[test]
+    fn build_activity_metadata_without_text_stays_a_plain_custom_activity() {
+        let payload = json!({ "metadata": { "action": "confirm" } });
+        let activity = build_activity(&payload, "acme", None, Some("s1"), None, None);
+        assert_eq!(activity.payload(), &payload);
+        assert_eq!(activity.flow_type(), None);
+        assert_eq!(activity_kind(&activity), "custom");
     }
 
     #[test]
@@ -5617,6 +7530,19 @@ mod tests {
         assert_eq!(activity.session_id(), None);
         // The whole body is preserved for the entry flow to interpret.
         assert_eq!(activity.payload(), &payload);
+    }
+
+    /// The activity KIND, read through the public `Serialize` impl because
+    /// `Activity::action()` is `pub(crate)` upstream and there is no getter.
+    /// `"message"` is what [`Activity::text`] builds, `"custom"` what
+    /// [`Activity::custom`] does — the difference the metadata-sibling arm in
+    /// `build_activity` turns on, and the one a payload assertion alone
+    /// cannot see.
+    fn activity_kind(activity: &Activity) -> String {
+        serde_json::to_value(activity)
+            .ok()
+            .and_then(|value| value["kind"]["kind"].as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     #[test]
@@ -5643,6 +7569,37 @@ mod tests {
                 .and_then(Value::as_str),
             Some("about_card")
         );
+    }
+
+    /// An answer sent BESIDE a sentence (worker-interop contract §9.4) is the
+    /// canonical envelope shape, and `Activity::text` keeps only the text —
+    /// so a payload carrying both travels whole instead of resuming the
+    /// parked node with no fields and nothing red anywhere.
+    #[test]
+    fn a_text_payload_keeps_a_metadata_sibling() {
+        let both = json!({"text": "bill it annually", "metadata": {"plan": "pro"}});
+        let activity = build_activity(&both, "acme", None, Some("s1"), None, None);
+        assert_eq!(
+            activity
+                .payload()
+                .pointer("/metadata/plan")
+                .and_then(Value::as_str),
+            Some("pro"),
+            "the submitted fields must survive: {:?}",
+            activity.payload()
+        );
+        assert_eq!(
+            activity.payload().get("text").and_then(Value::as_str),
+            Some("bill it annually")
+        );
+        // Flow resolution reads the flow type, and it must still be the one
+        // `Activity::text` would have set. The KIND is the one thing that
+        // does differ — `Activity::custom` is the only public constructor
+        // that keeps a whole payload — and it is read by nothing but a
+        // tracing span (checked against runner-host `f6ff5590`:
+        // `IngressEnvelope.action` reaches `FlowContext.action` and stops).
+        assert_eq!(activity.flow_type(), Some("messaging"));
+        assert_eq!(activity_kind(&activity), "custom");
     }
 
     #[test]
@@ -6044,6 +8001,8 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
+            public_url_capture: None,
         })
         .expect("start split server");
 
@@ -6093,6 +8052,8 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
+            public_url_capture: None,
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -6356,6 +8317,94 @@ mod tests {
         );
     }
 
+    /// The signature gate must be REACHED, not merely exist.
+    ///
+    /// `dispatch_provider_route` is driven with a Slack provider route whose
+    /// pack file does not exist, so the gate cannot find a verifier and refuses
+    /// with `503`. Delete the `provider_webhook_verify` call from
+    /// `dispatch_provider_route` and the request instead walks on to
+    /// `invoke_provider_for_revision`, which answers `502 provider invocation
+    /// failed` — a different status, so this assertion goes red. That is the
+    /// whole point: a unit test of the verifier alone would still pass with the
+    /// call site removed.
+    ///
+    /// `messaging.slack.api` is the `provider_type` the shipped pack declares;
+    /// see `provider_webhook_verify::tests` for why that exact string matters.
+    #[tokio::test]
+    async fn a_slack_webhook_is_gated_before_the_provider_component_is_invoked() {
+        let scope = test_scope();
+        let routes = HttpRouteTable::from_descriptors(vec![
+            crate::http_routes::provider_descriptor_for_test(
+                "/webhook/slack-api",
+                "messaging.slack.api",
+                scope.clone(),
+            ),
+        ]);
+        let base = empty_activation("env-slack");
+        let activation = std::sync::Arc::new(Activation {
+            host: std::sync::Arc::clone(&base.host),
+            routing: std::sync::Arc::new(RevisionIngressRouting {
+                dispatcher: std::sync::Arc::clone(&base.routing.dispatcher),
+                http_routes: routes,
+                deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
+                endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
+                deployment_config_overrides: std::sync::Arc::default(),
+                static_routes: crate::static_routes::ActiveRouteTable::default(),
+                bundle_index: crate::webchat_routing::BundleIndex::empty(),
+                flow_index: crate::webchat_routing::FlowIndex::default(),
+                app_packs: Default::default(),
+                triggers: Default::default(),
+                runtime_metered: Default::default(),
+            }),
+        });
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let state = std::sync::Arc::new(empty_state("env-slack", bound));
+        let headers = vec![
+            ("x-slack-signature".to_string(), "v0=abc".to_string()),
+            (
+                "x-slack-request-timestamp".to_string(),
+                "1700000000".to_string(),
+            ),
+        ];
+
+        let response = dispatch_provider_route(
+            activation,
+            state,
+            "acme",
+            &scope,
+            "/webhook/slack-api",
+            "POST",
+            None,
+            &headers,
+            b"{}",
+            false,
+            &headers,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect_err("an unverifiable Slack webhook must be refused");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "a 502 here means the gate was skipped and the provider component ran"
+        );
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("collect refusal body")
+            .to_bytes();
+        let body = String::from_utf8_lossy(&body);
+        assert!(
+            body.contains("signature verification"),
+            "unexpected refusal body: {body}"
+        );
+    }
+
     #[test]
     fn admit_rejects_non_post_on_generic_path() {
         let scope = test_scope();
@@ -6459,6 +8508,7 @@ mod tests {
             &query,
             &headers,
             br#"{"update_id":42}"#,
+            None,
         );
         assert_eq!(http_in.provider, "messaging.telegram.bot");
         assert_eq!(http_in.tenant_hint.as_deref(), Some("acme"));
@@ -6467,6 +8517,136 @@ mod tests {
         assert_eq!(http_in.headers, headers);
         assert_eq!(http_in.query.len(), 2);
         assert_eq!(http_in.body_b64, BASE64.encode(br#"{"update_id":42}"#));
+    }
+
+    /// #585: deploy-time provider answers ride the ingress envelope instead
+    /// of being dropped as `config: None`.
+    #[tokio::test]
+    async fn provider_ingress_carries_the_stored_setup_answers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("revisions/r1/bundle");
+        let pack_dir = bundle.join("providers/messaging");
+        std::fs::create_dir_all(&pack_dir).unwrap();
+        std::fs::write(bundle.join("bundle-manifest.json"), b"{}").unwrap();
+        let pack_path = pack_dir.join("messaging-provider-under-test.gtpack");
+        std::fs::write(&pack_path, b"not a real pack").unwrap();
+        let answers_dir = bundle.join("state/config/messaging-provider-under-test");
+        std::fs::create_dir_all(&answers_dir).unwrap();
+        std::fs::write(
+            answers_dir.join("setup-answers.json"),
+            br#"{"auto_start_on_open": true}"#,
+        )
+        .unwrap();
+        let secrets = test_host().secrets_manager();
+
+        let config = crate::revision_provider_config::resolve_revision_provider_config(
+            &secrets,
+            crate::revision_provider_config::RevisionProviderPack {
+                pack_id: "messaging-provider-under-test".to_string(),
+                pack_path,
+                pack_non_secret: None,
+            },
+            "acme",
+            Some("default"),
+        )
+        .await
+        .unwrap();
+        let http_in = build_provider_http_in(
+            "messaging.provider.under-test",
+            "acme",
+            "POST",
+            "/v3/directline/conversations",
+            &[],
+            &[],
+            b"{}",
+            config,
+        );
+
+        let config = http_in.config.expect("setup answers reach HttpInV1.config");
+        assert_eq!(
+            config["auto_start_on_open_b64"],
+            json!(BASE64.encode("true")),
+        );
+    }
+
+    /// #585, the shape a Direct Line request really has. The test above
+    /// passes an empty query, which is the one case a provider's strict
+    /// `greentic_types` parse accepts; every Direct Line request carries the
+    /// `tenant`/`team` pairs `augment_directline_queries` adds, and start
+    /// serialises `query` as an array of `[key, value]` pairs. The strict
+    /// `universal_dto::HttpInV1` (`query: Option<String>`) rejects that, so a
+    /// provider falling back to a parser that drops `config` loses the
+    /// deploy-time answers on exactly this route. Providers must parse this
+    /// envelope tolerantly AND keep `config`; changing the wire shape here
+    /// must be deliberate.
+    #[test]
+    fn directline_envelope_keeps_config_beside_the_tenant_query() {
+        let query = augment_directline_queries(&[], "acme", Some("support"));
+        let config = json!({"auto_start_on_open_b64": BASE64.encode("true")});
+        let http_in = build_provider_http_in(
+            "messaging.webchat.gui",
+            "acme",
+            "POST",
+            "/v3/directline/conversations",
+            &query,
+            &[],
+            b"{}",
+            Some(config.clone()),
+        );
+
+        let bytes = serde_json::to_vec(&http_in).unwrap();
+        let wire: Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["config"], config, "config must survive serialisation");
+        assert_eq!(
+            wire["query"],
+            json!([["tenant", "acme"], ["team", "support"]]),
+            "documented wire shape: query is an array of [key, value] pairs",
+        );
+
+        let strict =
+            serde_json::from_slice::<greentic_types::messaging::universal_dto::HttpInV1>(&bytes);
+        assert!(
+            strict.is_err(),
+            "the strict greentic_types HttpInV1 rejects the Direct Line query \
+             shape; providers need a tolerant parser that keeps `config`",
+        );
+    }
+
+    /// #585: the WebSocket pump's activity poll carries the same config.
+    fn test_host() -> std::sync::Arc<RunnerHost> {
+        std::sync::Arc::new(
+            greentic_runner_host::HostBuilder::new()
+                .with_config(greentic_runner_host::HostConfig::from_gtbind(
+                    greentic_runner_host::TenantBindings {
+                        tenant: "acme".to_string(),
+                        packs: Vec::new(),
+                        env_passthrough: Vec::new(),
+                    },
+                ))
+                .build()
+                .expect("build test host"),
+        )
+    }
+
+    #[test]
+    fn activity_poll_payload_carries_the_resolved_config() {
+        let host = test_host();
+        let config = json!({"auto_start_on_open_b64": BASE64.encode("true")});
+        let source = RevisionActivitySource {
+            host,
+            deployment_id: DeploymentId::new(),
+            bundle_id: BundleId::new("bundle-a"),
+            revision_id: RevisionId::new(),
+            provider_type: "messaging.webchat.gui".to_string(),
+            team: "default".to_string(),
+            auth_token: None,
+            config: Some(config.clone()),
+        };
+
+        let payload = source.activities_poll_payload("acme", "conv-1", 7);
+
+        assert_eq!(payload["config"], config);
+        assert_eq!(payload["method"], "GET");
     }
 
     #[test]
@@ -6484,6 +8664,7 @@ mod tests {
             &pairs,
             &[],
             b"{}",
+            None,
         );
         assert_eq!(
             http_in.query,
@@ -6987,6 +9168,43 @@ mod tests {
     }
 
     #[test]
+    fn build_reply_envelopes_delivers_the_agent_reply_node_output() {
+        // End-to-end for the env path a `greentic-start --store-root` operator
+        // environment actually serves: a Designer-authored `dw.agent` node
+        // returns `{reply, trail, terminated_by}`, which matched no
+        // `parse_envelopes` shape — so the Err was swallowed here and the
+        // partner's worker answered every turn with nothing at all.
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-agent",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-a",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "when did my order ship?",
+        }))
+        .expect("ingress envelope");
+        let reply = Activity::custom(
+            "response",
+            json!({
+                "reply": "The order shipped on Tuesday.",
+                "trail": [{"node": "agent", "took_ms": 812}],
+                "terminated_by": "final_answer",
+            }),
+        );
+
+        let envs = build_reply_envelopes(&ingress, &reply, "pack", "acme");
+        assert_eq!(envs.len(), 1, "the agent reply must produce an envelope");
+        assert_eq!(
+            envs[0].text.as_deref(),
+            Some("The order shipped on Tuesday.")
+        );
+        assert_ne!(
+            envs[0].id, ingress.id,
+            "each reply gets its own id, not the inbound request's"
+        );
+    }
+
+    #[test]
     fn synthesize_provider_response_defaults_to_200_and_preserves_body() {
         let response = IngressHttpResponse {
             status: 0, // Not a real HTTP status — synth must fall back to 200.
@@ -7057,6 +9275,8 @@ mod tests {
 
     fn envelope_for(user: &str, conversation: &str) -> IngressEnvelope {
         IngressEnvelope {
+            // This fixture is about session isolation, not card navigation.
+            entry_node: None,
             tenant: "acme".into(),
             env: Some("local".into()),
             pack_id: Some("pack.demo".into()),
@@ -7097,6 +9317,9 @@ mod tests {
                 flow_id: "flow.main".into(),
                 next_flow: None,
                 next_node: next_node.into(),
+                // This fixture models a `session.wait` pause, not a card
+                // awaiting the user's submit.
+                awaiting_submit: false,
                 state,
             },
         }
@@ -7108,8 +9331,8 @@ mod tests {
     /// own session store; here we model that — two `FlowResumeStore`s over
     /// separate session backends — and prove a snapshot saved by revision A is
     /// invisible to revision B for the identical resume envelope.
-    #[test]
-    fn isolated_revision_stores_do_not_cross_resume() {
+    #[tokio::test]
+    async fn isolated_revision_stores_do_not_cross_resume() {
         let store_a = FlowResumeStore::new(new_session_store());
         let store_b = FlowResumeStore::new(new_session_store());
 
@@ -7118,29 +9341,31 @@ mod tests {
 
         store_a
             .save(&envelope, &wait_for("node-a"))
+            .await
             .expect("save A");
 
         // Revision B, with its own store, sees nothing for the same envelope.
         assert!(
-            store_b.fetch(&envelope).expect("fetch B").is_none(),
+            store_b.fetch(&envelope).await.expect("fetch B").is_none(),
             "revision B must not observe revision A's suspended snapshot"
         );
         // Revision A still resumes its own snapshot at the right node.
         let resumed = store_a
             .fetch(&envelope)
+            .await
             .expect("fetch A")
             .expect("A snapshot present");
         assert_eq!(resumed.next_node, "node-a");
 
-        store_a.clear(&envelope).expect("clear A");
+        store_a.clear(&envelope).await.expect("clear A");
     }
 
     /// Negative control: a SHARED session store (the pre-fix behavior) DOES leak
     /// across revisions for the same envelope — revision B resumes revision A's
     /// snapshot against a potentially different flow graph. This is exactly the
     /// contamination `revision_boot`'s per-revision stores prevent.
-    #[test]
-    fn shared_revision_store_leaks_across_revisions() {
+    #[tokio::test]
+    async fn shared_revision_store_leaks_across_revisions() {
         let shared = new_session_store();
         let store_a = FlowResumeStore::new(Arc::clone(&shared));
         let store_b = FlowResumeStore::new(shared);
@@ -7148,10 +9373,12 @@ mod tests {
         let envelope = envelope_for("user-1", "conv-1");
         store_a
             .save(&envelope, &wait_for("node-a"))
+            .await
             .expect("save A");
 
         let leaked = store_b
             .fetch(&envelope)
+            .await
             .expect("fetch B")
             .expect("shared store leaks the snapshot to revision B");
         assert_eq!(
@@ -7159,7 +9386,7 @@ mod tests {
             "shared store hands revision A's snapshot to revision B (the bug)"
         );
 
-        store_a.clear(&envelope).expect("clear");
+        store_a.clear(&envelope).await.expect("clear");
     }
 
     // --- N1.2: listen-address resolution ----------------------------------
@@ -7240,6 +9467,8 @@ mod tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 app_packs: Default::default(),
+                triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -7280,6 +9509,8 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         }
     }
@@ -7294,6 +9525,100 @@ mod tests {
         let collected = runtime.block_on(body.collect()).expect("collect Full body");
         let bytes = collected.to_bytes();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The store-root path (`handle_connection`, reached through the real
+    /// accept helper and hyper) opens an `http.request` span per request and
+    /// records the final status on it as an INTEGER — the OTel bridge exports
+    /// a `u64` as a string, which semconv forbids. Two requests (a 200 probe
+    /// and a 404 unknown path) pin that the recorded value tracks the actual
+    /// response, not a constant.
+    ///
+    /// `crate::metrics::record_http_request` is not asserted here: it writes
+    /// to the process-global meter, and installing a reader for it would leak
+    /// into every other test in the binary.
+    #[test]
+    fn handle_connection_records_the_status_on_the_request_span() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        async fn get(addr: SocketAddr, path: &str) -> u16 {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .expect("write request");
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.expect("read response");
+            let head = String::from_utf8_lossy(&buf);
+            head.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or_else(|| panic!("no status line in response: {head:?}"))
+        }
+
+        let (subscriber, captured) = crate::request_span::capture::subscriber();
+        // A current-thread runtime runs every spawned task on this thread, so
+        // the thread-local subscriber installed by `with_default` sees the
+        // connection tasks' spans too.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        let statuses = tracing::subscriber::with_default(subscriber, || {
+            runtime.block_on(async {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                    .await
+                    .expect("bind");
+                let addr = listener.local_addr().expect("local addr");
+                let state = Arc::new(empty_state("span-test", addr));
+                let accept_state = Arc::clone(&state);
+                let accept_loop = tokio::spawn(async move {
+                    for _ in 0..2 {
+                        let accepted = listener.accept().await;
+                        spawn_revision_connection(accepted, &accept_state, true);
+                    }
+                });
+                let ok = get(addr, "/healthz").await;
+                let missing = get(addr, "/nope/12345").await;
+                accept_loop.await.expect("accept loop");
+                (ok, missing)
+            })
+        });
+        assert_eq!(statuses, (200, 404));
+
+        let requests = captured.named("http.request");
+        assert_eq!(
+            requests.len(),
+            2,
+            "one request span per request: {requests:?}"
+        );
+        let by_route = |route: &str| {
+            requests
+                .iter()
+                .find(|s| s.fields.get("http.route").map(String::as_str) == Some(route))
+                .unwrap_or_else(|| panic!("no request span for {route}: {requests:?}"))
+                .clone()
+        };
+        let healthz = by_route("/healthz");
+        assert_eq!(
+            healthz.i64_fields.get("http.response.status_code"),
+            Some(&200),
+            "status must be recorded as an integer"
+        );
+        let missing = by_route("/nope/:id");
+        assert_eq!(
+            missing.i64_fields.get("http.response.status_code"),
+            Some(&404)
+        );
+        assert_eq!(
+            missing.fields.get("otel.name").map(String::as_str),
+            Some("GET /nope/:id"),
+            "a numeric path segment must not reach the span name"
+        );
     }
 
     #[test]
@@ -7437,6 +9762,8 @@ mod tests {
                 bundle_index,
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 app_packs: Default::default(),
+                triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -7592,6 +9919,8 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
+            public_url_capture: None,
         })
         .expect("start server");
 
@@ -7646,6 +9975,8 @@ mod tests {
             updates_enabled: false,
             auto_restart_enabled: false,
             exe_path: None,
+            public_base_url: None,
+            public_url_capture: None,
         })
         .expect("start server");
         let port = server.actual_port();
@@ -7946,6 +10277,99 @@ mod tests {
         assert_eq!(encode_directline_query_string(&[]), None);
     }
 
+    // `is_backend_failure` is the security-relevant classification behind
+    // `read_provider_signing_key`: get it wrong and a degraded secrets
+    // backend silently reopens the DirectLine authentication bypass. Tested
+    // directly, against all four `SecretError` variants, so nothing can move
+    // a variant across the NotFound/failure line without a test noticing.
+    #[test]
+    fn is_backend_failure_is_false_only_for_not_found() {
+        assert!(!is_backend_failure(
+            &greentic_secrets_lib::SecretError::NotFound("jwt_signing_key".to_string())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_permission() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Permission("denied".to_string())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_backend() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Backend("storage unreachable".into())
+        ));
+    }
+
+    #[test]
+    fn is_backend_failure_is_true_for_other() {
+        assert!(is_backend_failure(
+            &greentic_secrets_lib::SecretError::Other(anyhow::anyhow!("boom"))
+        ));
+    }
+
+    // `classify_reads` is the accumulation glue that decides `Unavailable`
+    // vs. `NotConfigured` from the two URI outcomes — the part
+    // `is_backend_failure` alone does not cover, since it only classifies
+    // one error. Deleting the fold this function performs would reopen the
+    // DirectLine auth bypass while every `is_backend_failure`-only test
+    // stayed green; these four cases pin the fold itself.
+    #[test]
+    fn classify_reads_both_not_found_is_not_configured() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "raw".to_string(),
+            )),
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "canonical".to_string(),
+            )),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::NotConfigured));
+        assert!(message.is_none());
+    }
+
+    #[test]
+    fn classify_reads_backend_failure_then_not_found_is_unavailable() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::Backend(
+                "storage unreachable".into(),
+            )),
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "canonical".to_string(),
+            )),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::Unavailable));
+        assert!(message.is_some());
+    }
+
+    #[test]
+    fn classify_reads_not_found_then_backend_failure_is_unavailable() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::NotFound(
+                "raw".to_string(),
+            )),
+            Err(greentic_secrets_lib::SecretError::Backend(
+                "storage unreachable".into(),
+            )),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::Unavailable));
+        assert!(message.is_some());
+    }
+
+    #[test]
+    fn classify_reads_a_success_wins_even_beside_a_prior_failure() {
+        let (outcome, message) = classify_reads([
+            Err(greentic_secrets_lib::SecretError::Backend(
+                "storage unreachable".into(),
+            )),
+            Ok(b"the-signing-key".to_vec()),
+        ]);
+        assert!(matches!(outcome, SigningKeyRead::Found(key) if key == b"the-signing-key"));
+        assert!(message.is_none());
+    }
+
     // Category 5: rewrite_stream_url
 
     #[test]
@@ -8075,6 +10499,96 @@ mod tests {
             body["streamUrl"],
             "ws://127.0.0.1:8080/v1/messaging/webchat/default/legal/v3/directline/conversations/abc123/stream?watermark=-1&t=TOKEN",
             "the bundle segment belongs before /v3/directline, not in front of an already tenant-scoped path"
+        );
+    }
+
+    #[test]
+    fn stream_url_is_returned_by_create_and_reconnect_only() {
+        // Create and reconnect both answer with a streamUrl, and both must be
+        // rewritten — rewriting only the create is what broke every
+        // bundle-routed webchat after its first socket drop.
+        assert!(returns_stream_url("POST", "/v3/directline/conversations"));
+        assert!(returns_stream_url(
+            "POST",
+            "/v1/messaging/webchat/default/v3/directline/conversations"
+        ));
+        assert!(returns_stream_url(
+            "GET",
+            "/v3/directline/conversations/13704d81-f98b-4108-96fe-f2e429648925"
+        ));
+        assert!(returns_stream_url(
+            "GET",
+            "/v1/messaging/webchat/default/v3/directline/conversations/abc123"
+        ));
+
+        assert!(!returns_stream_url("GET", "/v3/directline/conversations"));
+        assert!(!returns_stream_url("GET", "/v3/directline/conversations/"));
+        assert!(!returns_stream_url(
+            "GET",
+            "/v3/directline/conversations/abc123/activities"
+        ));
+        assert!(!returns_stream_url(
+            "GET",
+            "/v3/directline/conversations/abc123/stream"
+        ));
+        assert!(!returns_stream_url(
+            "POST",
+            "/v3/directline/conversations/abc123/activities"
+        ));
+        assert!(!returns_stream_url(
+            "POST",
+            "/v3/directline/tokens/generate"
+        ));
+    }
+
+    #[test]
+    fn only_the_create_pins_and_dedups() {
+        // The reconnect gets the rewrite but must not re-pin the revision or
+        // overwrite the create's dedup cache entry.
+        assert!(is_conversation_create(
+            "POST",
+            "/v3/directline/conversations"
+        ));
+        assert!(!is_conversation_create(
+            "GET",
+            "/v3/directline/conversations/abc123"
+        ));
+    }
+
+    #[test]
+    fn reconnect_stream_url_keeps_the_bundle_segment() {
+        // The exact body a bundle-routed Cloud Run deployment answered a
+        // reconnect with on 2026-09-17: tenant-scoped, no bundle segment. The
+        // browser resolved it against the page origin and 404'd on every retry.
+        let headers = vec![
+            (
+                "Host".to_string(),
+                "gtc-svc-01m2j1dmm4qmbqhk6qgtc28w86-zhwr2khniq-ew.a.run.app".to_string(),
+            ),
+            ("X-Forwarded-Proto".to_string(), "https".to_string()),
+        ];
+        let mut response = IngressHttpResponse {
+            status: 200,
+            headers: vec![],
+            body: Some(
+                serde_json::to_vec(&serde_json::json!({
+                    "conversationId": "13704d81",
+                    "expires_in": 86400,
+                    "streamUrl": "/v1/messaging/webchat/default/v3/directline/conversations/13704d81/stream?watermark=-1&t=TOKEN"
+                }))
+                .unwrap(),
+            ),
+        };
+        assert!(returns_stream_url(
+            "GET",
+            "/v1/messaging/webchat/default/v3/directline/conversations/13704d81"
+        ));
+        rewrite_stream_url(&headers, &mut response, Some("/freddies-freight-challenge"));
+        let body: serde_json::Value =
+            serde_json::from_slice(response.body.as_ref().unwrap()).unwrap();
+        assert_eq!(
+            body["streamUrl"],
+            "wss://gtc-svc-01m2j1dmm4qmbqhk6qgtc28w86-zhwr2khniq-ew.a.run.app/v1/messaging/webchat/default/freddies-freight-challenge/v3/directline/conversations/13704d81/stream?watermark=-1&t=TOKEN",
         );
     }
 
@@ -8226,7 +10740,10 @@ mod tests {
     #[test]
     fn cors_allows_directline_conversations_path() {
         assert!(
-            path_allows_cors("/v3/directline/conversations"),
+            path_allows_cors(
+                "/v3/directline/conversations",
+                "/v3/directline/conversations"
+            ),
             "DirectLine conversations path must allow CORS"
         );
     }
@@ -8235,7 +10752,8 @@ mod tests {
     fn cors_allows_directline_activities_path() {
         assert!(
             path_allows_cors(
-                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities"
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities",
+                "/v1/messaging/webchat/demo/v3/directline/conversations/abc/activities",
             ),
             "DirectLine activities path must allow CORS"
         );
@@ -8244,7 +10762,10 @@ mod tests {
     #[test]
     fn cors_allows_directline_token_path() {
         assert!(
-            path_allows_cors("/v1/messaging/webchat/demo/token"),
+            path_allows_cors(
+                "/v1/messaging/webchat/demo/token",
+                "/v1/messaging/webchat/demo/token",
+            ),
             "DirectLine token path must allow CORS"
         );
     }
@@ -8252,7 +10773,7 @@ mod tests {
     #[test]
     fn cors_blocks_workers_invoke() {
         assert!(
-            !path_allows_cors("/workers/invoke"),
+            !path_allows_cors("/workers/invoke", "/workers/invoke"),
             "/workers/invoke must NOT allow CORS"
         );
     }
@@ -8611,6 +11132,8 @@ mod tests {
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
             app_packs: live.routing.app_packs.clone(),
+            triggers: live.routing.triggers.clone(),
+            runtime_metered: live.routing.runtime_metered.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -8664,6 +11187,8 @@ mod tests {
             static_routes: live.routing.static_routes.clone(),
             flow_index: live.routing.flow_index.clone(),
             app_packs: live.routing.app_packs.clone(),
+            triggers: live.routing.triggers.clone(),
+            runtime_metered: live.routing.runtime_metered.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -8827,6 +11352,8 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -8933,6 +11460,8 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -9033,6 +11562,8 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -9106,6 +11637,8 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         let server = server_for_test(std::sync::Arc::clone(&state));
@@ -9229,6 +11762,8 @@ mod tests {
             bundle_index: crate::webchat_routing::BundleIndex::empty(),
             flow_index: crate::webchat_routing::FlowIndex::default(),
             app_packs: Default::default(),
+            triggers: Default::default(),
+            runtime_metered: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -9384,6 +11919,8 @@ mod tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         })
     }
@@ -9527,7 +12064,8 @@ mod tests {
         // anyway. This test validates the classifier's output, not the
         // end-to-end CORS behaviour on stream responses.
         assert!(path_allows_cors(
-            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream"
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream",
+            "/v1/messaging/webchat/tenant1/v3/directline/conversations/c1/stream",
         ));
     }
 
@@ -9949,6 +12487,107 @@ mod update_notify_tests {
     }
 
     #[test]
+    fn poll_outcome_advances_sequence_only_on_a_2xx() {
+        // The single decision point behind `poll_update_cycle`'s sequence
+        // bookkeeping. ONLY a 2xx `Ok` means the plan was acted on; every other
+        // outcome must leave the sequence unadvanced so the next cycle retries.
+        //
+        // The `BinaryMirror` case is the one that had no coverage and allowed a
+        // real bug: advancing there means content converges, the sequence moves
+        // on, and the binary is stranded on the old build with NO retry until
+        // someone publishes a higher sequence — a permanent silent divergence
+        // whose only trace is one log line.
+        let body = serde_json::json!({ "status": "staged" });
+        assert!(notify_outcome_acted_on(&Ok((StatusCode::OK, body.clone()))));
+        assert!(notify_outcome_acted_on(&Ok((
+            StatusCode::ACCEPTED,
+            body.clone()
+        ))));
+        // Non-2xx `Ok` is the disabled-channel TOCTOU — a re-enabled channel must
+        // still pick this plan up rather than skip it.
+        assert!(!notify_outcome_acted_on(&Ok((
+            StatusCode::FORBIDDEN,
+            body.clone()
+        ))));
+        assert!(!notify_outcome_acted_on(&Err(NotifyError::Op(
+            OpError::Conflict("rejected".into())
+        ))));
+        assert!(!notify_outcome_acted_on(&Err(NotifyError::Internal(
+            "boom".into()
+        ))));
+        assert!(
+            !notify_outcome_acted_on(&Err(NotifyError::BinaryMirror("mirror down".into()))),
+            "a configured blob mirror that failed must NOT advance the sequence — \
+             not advancing is what makes the airgap path self-healing"
+        );
+    }
+
+    #[test]
+    fn classify_binary_step_surfaces_only_mirror_failures() {
+        // The swallow-vs-surface policy, pinned without touching `HOME`. Binary
+        // self-update is best-effort relative to content staging, so every
+        // failure is swallowed — except a configured blob mirror, which must be
+        // surfaced. Swallowing that one returns 200, advances the poll sequence,
+        // and strands the fleet's binary version with no retry.
+        let info = serde_json::json!({ "version": "99.0.0" });
+
+        let (binary, mirror) = classify_binary_step(Ok(Some(info.clone())));
+        assert_eq!(binary, Some(info), "a successful swap must be reported");
+        assert!(mirror.is_none());
+
+        // No binary for this host — the ordinary content-only plan.
+        let (binary, mirror) = classify_binary_step(Ok(None));
+        assert!(binary.is_none() && mirror.is_none());
+
+        // Best-effort: an internal binary failure stays swallowed, so content
+        // staging still reports success. This is the pre-C4 B3 contract.
+        let (binary, mirror) = classify_binary_step(Err(NotifyError::Internal("boom".into())));
+        assert!(
+            binary.is_none() && mirror.is_none(),
+            "an internal binary failure must stay best-effort"
+        );
+        let (binary, mirror) =
+            classify_binary_step(Err(NotifyError::Op(OpError::Conflict("x".into()))));
+        assert!(binary.is_none() && mirror.is_none());
+
+        // The one that must NOT be swallowed.
+        let (binary, mirror) =
+            classify_binary_step(Err(NotifyError::BinaryMirror("mirror down".into())));
+        assert!(binary.is_none());
+        assert_eq!(
+            mirror.as_deref(),
+            Some("mirror down"),
+            "a configured-mirror failure must be surfaced, not swallowed"
+        );
+    }
+
+    #[test]
+    fn notify_failure_response_separates_a_broken_mirror_from_a_broken_server() {
+        // An operator must be able to tell "your in-gap mirror is misconfigured"
+        // (502) from "this server is broken" (500) off the status alone; the two
+        // have completely different remedies. `Op` is routed via `map_op_error`.
+        let (status, public, detail) =
+            notify_failure_response(&NotifyError::BinaryMirror("404 from mirror".into()))
+                .expect("BinaryMirror maps");
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(public.contains("mirror"), "public body: {public}");
+        assert!(
+            detail.contains("404 from mirror"),
+            "log detail must keep the cause: {detail}"
+        );
+
+        let (status, _, detail) =
+            notify_failure_response(&NotifyError::Internal("boom".into())).expect("Internal maps");
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(detail.contains("boom"), "{detail}");
+
+        assert!(
+            notify_failure_response(&NotifyError::Op(OpError::Conflict("x".into()))).is_none(),
+            "`Op` must stay on the map_op_error path"
+        );
+    }
+
+    #[test]
     fn poll_cycle_disabled_channel_does_not_fetch() {
         // Deny-by-default: a disabled channel returns before any HTTP. The
         // endpoint points at an unroutable port, so a fetch attempt would error;
@@ -10150,6 +12789,8 @@ mod binary_update_tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 app_packs: Default::default(),
+                triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -10320,6 +12961,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -10358,6 +13001,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -10391,6 +13036,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/healthz", &state).expect("/healthz response");
@@ -10420,6 +13067,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -10638,6 +13287,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
         let resp = try_probe_response("/status", &state).expect("/status response");
@@ -10655,6 +13306,71 @@ mod binary_update_tests {
             Some(env!("CARGO_PKG_VERSION")),
             "/status must include version"
         );
+    }
+
+    #[test]
+    fn status_includes_telemetry_field_with_no_endpoint_echoed() {
+        let _g = crate::otlp_status::test_lock();
+        crate::otlp_status::reset_for_test();
+        crate::otlp_status::record_installed("otlp-grpc");
+        crate::otlp_status::record_export(
+            crate::otlp_status::Signal::Traces,
+            Err("connect http://u:p@collector:4317 failed".into()),
+        );
+
+        let bound: SocketAddr = "127.0.0.1:8080".parse().unwrap();
+        let state = ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(empty_activation_for_test("local"))),
+            bound_addr: bound,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
+            activity_source_override: None,
+        };
+        let resp = try_probe_response("/status", &state).expect("/status response");
+        let body_bytes = resp.into_body();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let collected = rt
+            .block_on(http_body_util::BodyExt::collect(body_bytes))
+            .unwrap();
+        let text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
+        let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+
+        assert_eq!(json["schema"], "greentic.status.v1");
+        assert_eq!(json["telemetry"]["exporter"], "otlp-grpc");
+        assert_eq!(json["telemetry"]["installed"], true);
+        assert!(json["telemetry"]["signals"]["traces"].is_object());
+
+        // The credential must never be echoed. `redact` keeps `scheme://host`
+        // (see otlp_status::redact's doc comment and its own tests) and only
+        // strips the `user:pass@` userinfo, so the body legitimately still
+        // contains the bare "http://collector:4317" host — assert on the
+        // credential, not on the scheme separator.
+        assert!(
+            !text.contains("u:p"),
+            "credential leaked into /status: {text}"
+        );
+        assert!(
+            !text.contains("u:p@"),
+            "credential leaked into /status: {text}"
+        );
+
+        crate::otlp_status::reset_for_test();
     }
 
     /// Regression: binary swap response with restart_required=true must set
@@ -10679,6 +13395,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -10715,6 +13433,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
         state.mark_restart_required();
@@ -10897,6 +13617,1765 @@ mod binary_update_tests {
         assert!(
             !prev_path.exists(),
             "restore_prev consumes the .prev copy it restores from"
+        );
+    }
+
+    // ── B3: in-band binary delivery tests ───────────────────────────────────
+
+    use greentic_update::plan::UPDATE_PLAN_SCHEMA_V1;
+    use greentic_update::plan::{
+        CompatRequirements, OnFail, RollbackKind, RollbackPolicy, UpdatePlan,
+    };
+    use greentic_update::staging::UpdatesRoot;
+
+    /// Compute `sha256:<hex>` digest for the given bytes, matching the staging
+    /// API's convention.
+    fn test_digest_of(bytes: &[u8]) -> String {
+        format!("sha256:{}", sha256_hex(bytes))
+    }
+
+    /// Build a minimal `UpdatePlan` carrying a single binary, no content
+    /// artifacts. `env_id` must match the staging root opened by the test.
+    fn test_plan_with_binary(plan_id: &str, env_id: &str, binary: BinaryArtifact) -> UpdatePlan {
+        UpdatePlan {
+            schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence: 1,
+            created_at: chrono::Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({}),
+            artifacts: vec![],
+            binaries: vec![binary],
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    fn test_verified(plan: UpdatePlan) -> greentic_update::plan::VerifiedUpdatePlan {
+        greentic_update::plan::VerifiedUpdatePlan {
+            plan,
+            plan_sha256: "0".repeat(64),
+            verified_key_ids: vec!["k1".to_string()],
+        }
+    }
+
+    fn test_inband_binary(version: &str, digest: String) -> BinaryArtifact {
+        BinaryArtifact {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            version: version.to_string(),
+            target: binswap::current_target().to_string(),
+            digest,
+            source: None,
+        }
+    }
+
+    /// Stage a plan into a fresh staging root and return the root path, the
+    /// `StagedPlan` handle, and the `BinaryArtifact`. When `skip_blob` is
+    /// true the binary blob is NOT written, simulating a missing-blob scenario.
+    fn stage_inband_binary(
+        dummy_exe: &[u8],
+        env_id: &str,
+        skip_blob: bool,
+    ) -> (
+        tempfile::TempDir,
+        greentic_update::staging::StagedPlan,
+        BinaryArtifact,
+    ) {
+        let staging_dir = tempfile::TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+        let bin = test_inband_binary("99.0.0", test_digest_of(dummy_exe));
+        let plan = test_plan_with_binary("plan-inband-1", env_id, bin.clone());
+        let verified = test_verified(plan);
+        let staged = root.begin(&verified, b"plan", b"sig").unwrap();
+        if !skip_blob {
+            staged.put_binary_blob(&bin, dummy_exe).unwrap();
+        }
+        staged
+            .transition(greentic_update::staging::UpdateStage::Inbox)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Staged)
+            .unwrap();
+        (staging_dir, staged, bin)
+    }
+
+    #[test]
+    fn binary_update_inband_swaps_from_staging() {
+        let dummy_exe = b"dummy-binary-payload-v99";
+        let env_id = "test-env-inband";
+        let (staging_dir, staged, bin) = stage_inband_binary(dummy_exe, env_id, false);
+
+        // Verify the blob is readable from staging.
+        let blob_bytes = staged.verify_binary_on_disk(&bin).unwrap();
+        assert_eq!(blob_bytes, dummy_exe, "staged blob must match");
+
+        // Write the blob to a temp file (the in-band path copies staged bytes
+        // to a temp before swap_binary).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let tmp_binary = tmp.path().join(env!("CARGO_PKG_NAME"));
+        std::fs::write(&tmp_binary, &blob_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // Target exe is a TEMP file — never the real test binary.
+        let target_exe = tmp.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let env_dir = tempfile::TempDir::new().unwrap();
+
+        let result = apply_binary_from_path(
+            env!("CARGO_PKG_NAME"),
+            &bin,
+            &tmp_binary,
+            &target_exe,
+            env_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(result.is_ok(), "apply_binary_from_path should succeed");
+        let json = result.unwrap().expect("should return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must now contain the dummy payload (swap happened).
+        let swapped = std::fs::read(&target_exe).unwrap();
+        assert_eq!(
+            swapped, dummy_exe,
+            "target must be replaced by the new binary"
+        );
+
+        // A Pending marker must exist with the right versions and digest.
+        let marker = read_binary_update_marker(env_dir.path()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.from_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(marker.digest.as_deref(), Some(bin.digest.as_str()));
+
+        drop(staging_dir); // keep alive until here
+    }
+
+    #[test]
+    fn binary_update_inband_verify_fails_tampered() {
+        let dummy_exe = b"good-binary-content";
+        let env_id = "test-env-tampered";
+        let (_staging_dir, staged, bin) = stage_inband_binary(dummy_exe, env_id, false);
+
+        // Tamper the blob on disk after staging.
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        std::fs::write(&blob_path, b"corrupted-bytes").unwrap();
+
+        // verify_binary_on_disk must fail with a digest mismatch.
+        let err = staged.verify_binary_on_disk(&bin).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("mismatch"),
+            "error must mention digest mismatch: {msg}"
+        );
+    }
+
+    #[test]
+    fn binary_update_inband_missing_blob_errors() {
+        let dummy_exe = b"binary-content";
+        let (_staging_dir, staged, bin) = stage_inband_binary(dummy_exe, "test-env-missing", true);
+
+        // verify_binary_on_disk must fail with an IO error (file not found).
+        let err = staged.verify_binary_on_disk(&bin).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("io error") || msg.contains("not a regular file"),
+            "error must name the problem (IO or not-regular-file): {msg}"
+        );
+    }
+
+    // ── B3: end-to-end try_apply_binary_update coverage ─────────────────────
+
+    use greentic_deployer::environment::{TRUST_ROOT_FILE, TrustRootDocument};
+    use greentic_distributor_client::signing::{TrustRoot, TrustedKey, key_id_for_public_key_pem};
+    use greentic_update::plan::build_update_plan;
+
+    /// Deterministic Ed25519 test key pair: returns (private PKCS#8 PEM,
+    /// TrustedKey with SPKI PEM + canonical key id).
+    fn test_signing_key(seed: u8) -> (String, TrustedKey) {
+        use ed25519_dalek::SigningKey;
+        use ed25519_dalek::pkcs8::EncodePrivateKey;
+        use ed25519_dalek::pkcs8::EncodePublicKey;
+        use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
+
+        let sk = SigningKey::from_bytes(&[seed; 32]);
+        let priv_pem = sk.to_pkcs8_pem(LineEnding::LF).unwrap().to_string();
+        let pub_pem = sk
+            .verifying_key()
+            .to_public_key_pem(LineEnding::LF)
+            .unwrap();
+        let key_id = key_id_for_public_key_pem(&pub_pem).unwrap();
+        (
+            priv_pem,
+            TrustedKey {
+                key_id,
+                public_key_pem: pub_pem,
+            },
+        )
+    }
+
+    struct InbandHarnessOpts {
+        version: &'static str,
+        plan_id: &'static str,
+        skip_blob: bool,
+        source: Option<String>,
+        /// Override the plan's recorded binary digest. `None` derives it from
+        /// `dummy_exe`, which is what every ordinary test wants; `Some` exists so
+        /// a test can plant a deliberately malformed digest without hand-rolling
+        /// the whole signing-key / trust-root / staging setup.
+        digest: Option<String>,
+    }
+
+    impl Default for InbandHarnessOpts {
+        fn default() -> Self {
+            Self {
+                version: "99.0.0",
+                plan_id: "plan-e2e-1",
+                skip_blob: false,
+                source: None,
+                digest: None,
+            }
+        }
+    }
+
+    /// Wire up all infrastructure needed by `try_apply_binary_update`:
+    /// store, trust root, signed plan, and staged binary. Returns the
+    /// components the test needs to call the function and assert on results.
+    struct InbandTestHarness {
+        store_dir: tempfile::TempDir,
+        staging_dir: tempfile::TempDir,
+        #[allow(dead_code)]
+        exe_dir: tempfile::TempDir,
+        plan_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+        env_id: String,
+        target_exe: std::path::PathBuf,
+        binary_digest: String,
+    }
+
+    fn stage_plan(
+        plan_id: &str,
+        env_id: &str,
+        bin: &BinaryArtifact,
+        dummy_exe: &[u8],
+        plan_bytes: &[u8],
+        envelope_bytes: &[u8],
+        skip_blob: bool,
+    ) -> tempfile::TempDir {
+        let staging_dir = tempfile::TempDir::new().unwrap();
+        let root = UpdatesRoot::open_in(staging_dir.path(), env_id).unwrap();
+        let verified = test_verified(test_plan_with_binary(plan_id, env_id, bin.clone()));
+        let staged = root.begin(&verified, plan_bytes, envelope_bytes).unwrap();
+        if !skip_blob {
+            staged.put_binary_blob(bin, dummy_exe).unwrap();
+        }
+        staged
+            .transition(greentic_update::staging::UpdateStage::Inbox)
+            .unwrap();
+        staged
+            .transition(greentic_update::staging::UpdateStage::Staged)
+            .unwrap();
+        staging_dir
+    }
+
+    impl InbandTestHarness {
+        /// Build a harness with a single in-band binary (source=None) for THIS
+        /// process name + target. The dummy binary payload differs from the
+        /// current test binary so the swap is observable.
+        fn new(env_id: &str, dummy_exe: &[u8]) -> Self {
+            Self::with_opts(env_id, dummy_exe, InbandHarnessOpts::default())
+        }
+
+        /// Like [`new`] but with a caller-chosen version and plan id.
+        fn new_with_version(
+            env_id: &str,
+            dummy_exe: &[u8],
+            version: &'static str,
+            plan_id: &'static str,
+        ) -> Self {
+            Self::with_opts(
+                env_id,
+                dummy_exe,
+                InbandHarnessOpts {
+                    version,
+                    plan_id,
+                    ..Default::default()
+                },
+            )
+        }
+
+        fn with_opts(env_id: &str, dummy_exe: &[u8], opts: InbandHarnessOpts) -> Self {
+            let (priv_pem, tk) = test_signing_key(42);
+            let trust = TrustRoot::new(vec![tk.clone()]);
+
+            let digest = opts
+                .digest
+                .clone()
+                .unwrap_or_else(|| test_digest_of(dummy_exe));
+            let mut bin = test_inband_binary(opts.version, digest.clone());
+            bin.source = opts.source;
+
+            let plan = test_plan_with_binary(opts.plan_id, env_id, bin.clone());
+            let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+                .expect("test plan must build");
+
+            // Set up the store directory with the env's trust-root.
+            let store_dir = tempfile::TempDir::new().unwrap();
+            let env_dir = store_dir.path().join(env_id);
+            std::fs::create_dir_all(&env_dir).unwrap();
+            let trust_doc = TrustRootDocument::v1(vec![tk]);
+            std::fs::write(
+                env_dir.join(TRUST_ROOT_FILE),
+                serde_json::to_vec_pretty(&trust_doc).unwrap(),
+            )
+            .unwrap();
+
+            let staging_dir = stage_plan(
+                opts.plan_id,
+                env_id,
+                &bin,
+                dummy_exe,
+                &built.plan_bytes,
+                &built.envelope_bytes,
+                opts.skip_blob,
+            );
+
+            // Create a temp target exe (NEVER the real test binary).
+            let exe_dir = tempfile::TempDir::new().unwrap();
+            let target_exe = exe_dir.path().join("target-exe");
+            std::fs::write(&target_exe, b"old-binary").unwrap();
+
+            Self {
+                store_dir,
+                staging_dir,
+                exe_dir,
+                plan_bytes: built.plan_bytes,
+                sig_bytes: built.envelope_bytes,
+                env_id: env_id.to_string(),
+                target_exe,
+                binary_digest: digest,
+            }
+        }
+
+        fn store(&self) -> LocalFsStore {
+            LocalFsStore::new(self.store_dir.path())
+        }
+
+        fn env_dir(&self) -> std::path::PathBuf {
+            self.store_dir.path().join(&self.env_id)
+        }
+
+        fn call(&self) -> Result<Option<Value>, NotifyError> {
+            try_apply_binary_update(
+                &self.plan_bytes,
+                &self.sig_bytes,
+                &self.store(),
+                &self.env_id,
+                Some(&self.target_exe),
+                Some(self.staging_dir.path()),
+            )
+        }
+    }
+
+    #[test]
+    fn e2e_inband_happy_path_swaps_and_writes_marker() {
+        let h = InbandTestHarness::new("e2e-happy", b"dummy-v99-binary");
+        let result = h.call();
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the dummy payload.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(swapped, b"dummy-v99-binary", "binary must be swapped");
+
+        // A Pending marker must exist with the correct digest.
+        let marker = read_binary_update_marker(&h.env_dir()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(
+            marker.digest.as_deref(),
+            Some(h.binary_digest.as_str()),
+            "marker must record the digest"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_verify_rejects_tampered_blob() {
+        let dummy = b"good-binary-for-tamper-test";
+        let h = InbandTestHarness::new("e2e-tamper", dummy);
+
+        // Tamper the staged blob AFTER staging.
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        std::fs::write(&blob_path, b"tampered-content").unwrap();
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "tampered blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("verification failed") || err_msg.contains("mismatch"),
+            "error must name verification failure: {err_msg}"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_missing_blob_is_an_error() {
+        let h = InbandTestHarness::with_opts(
+            "e2e-missing-blob",
+            b"never-staged",
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "missing blob must be an error, not a silent skip: {result:?}"
+        );
+    }
+
+    #[test]
+    fn e2e_inband_tombstone_blocks_same_digest() {
+        let dummy = b"tombstone-test-binary";
+        let h = InbandTestHarness::new("e2e-tombstone", dummy);
+
+        // Write a RolledBack tombstone for the SAME version + digest.
+        let tombstone = BinaryUpdateMarker {
+            name: env!("CARGO_PKG_NAME").to_string(),
+            from_version: env!("CARGO_PKG_VERSION").to_string(),
+            to_version: "99.0.0".to_string(),
+            staged_at: "2026-07-28T00:00:00Z".to_string(),
+            phase: MarkerPhase::RolledBack,
+            rolled_back_at: Some("2026-07-28T01:00:00Z".to_string()),
+            digest: Some(h.binary_digest.clone()),
+            boot_attempts: 0,
+        };
+        std::fs::write(
+            h.env_dir().join(BINARY_UPDATE_PENDING_FILE),
+            serde_json::to_vec(&tombstone).unwrap(),
+        )
+        .unwrap();
+
+        let result = h.call();
+        let json = result.expect("tombstone guard returns Ok");
+        assert!(
+            json.is_none(),
+            "tombstone must block retry of the same digest: {json:?}"
+        );
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when tombstone blocks"
+        );
+    }
+
+    #[test]
+    fn e2e_apply_binary_rejects_digest_mismatch_at_swap() {
+        // Verifies that apply_binary_from_path passes expected_digest to
+        // SwapOptions so swap_binary re-verifies the bytes. Construct a
+        // BinaryArtifact whose digest does NOT match the file on disk:
+        // with expected_digest=Some the swap must fail; dropping it to None
+        // (the mutation) would let this pass.
+        let real_content = b"real-binary-content";
+        let wrong_digest =
+            "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+        let bin = test_inband_binary("99.0.0", wrong_digest.to_string());
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let inner_binary = tmp.path().join("binary");
+        std::fs::write(&inner_binary, real_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&inner_binary, std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+
+        let target_exe = tmp.path().join("target-exe");
+        std::fs::write(&target_exe, b"old-binary").unwrap();
+
+        let env_dir = tempfile::TempDir::new().unwrap();
+
+        let result = apply_binary_from_path(
+            env!("CARGO_PKG_NAME"),
+            &bin,
+            &inner_binary,
+            &target_exe,
+            env_dir.path(),
+            env!("CARGO_PKG_VERSION"),
+        );
+        assert!(
+            result.is_err(),
+            "digest mismatch at swap must fail: {result:?}"
+        );
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when digest mismatches"
+        );
+    }
+
+    #[test]
+    fn e2e_source_some_does_not_use_staging_path() {
+        // A plan with source=Some(url) must NOT go through the staging path.
+        // We set up staging that WOULD succeed if used, but the source=Some
+        // path must be taken instead — and since the URL is fake, it must fail
+        // with a fetch error, proving the URL path was taken.
+        let h = InbandTestHarness::with_opts(
+            "e2e-source-some",
+            b"should-not-be-used",
+            InbandHarnessOpts {
+                plan_id: "plan-e2e-source",
+                source: Some("https://localhost:1/nonexistent-archive.tgz".to_string()),
+                ..Default::default()
+            },
+        );
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "source=Some must take URL path, not staging: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("fetch") || err_msg.contains("connect") || err_msg.contains("error"),
+            "error must be a fetch failure, not a staging error: {err_msg}"
+        );
+        // The binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped");
+    }
+
+    #[test]
+    fn e2e_pending_different_version_blocks_swap() {
+        // First swap: stage v99 successfully.
+        let h = InbandTestHarness::new("e2e-lineage-block", b"dummy-v99");
+        let r1 = h.call().expect("first swap must succeed").unwrap();
+        assert_eq!(r1["staged"], true);
+        let swapped_v99 = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            swapped_v99, b"dummy-v99",
+            "binary must be v99 after first swap"
+        );
+
+        let marker_after_v99 =
+            read_binary_update_marker(&h.env_dir()).expect("marker must exist after first swap");
+        assert_eq!(marker_after_v99.to_version, "99.0.0");
+
+        // Second swap: try to stage v100 (different, higher version).
+        // Must be blocked by the lineage guard.
+        let h2 = InbandTestHarness::new_with_version(
+            "e2e-lineage-block",
+            b"dummy-v100",
+            "100.0.0",
+            "plan-e2e-lineage-v100",
+        );
+        // Reuse h's store/env_dir (which has the pending marker) but h2's
+        // staging has the v100 blob. Call through h2's staging + h's store.
+        let result = try_apply_binary_update(
+            &h2.plan_bytes,
+            &h2.sig_bytes,
+            &h.store(),
+            &h.env_id,
+            Some(&h.target_exe),
+            Some(h2.staging_dir.path()),
+        );
+        let json = result.expect("lineage guard returns Ok").unwrap();
+        assert_eq!(json["staged"], false, "second swap must be blocked");
+        assert_eq!(json["blocked_on_pending"], "99.0.0");
+        assert_eq!(json["restart_required"], true);
+
+        // The binary on disk must still be v99 (no second swap).
+        let still_v99 = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(still_v99, b"dummy-v99", "binary must not be overwritten");
+
+        // The marker must still name v99.
+        let marker_still =
+            read_binary_update_marker(&h.env_dir()).expect("marker must still exist");
+        assert_eq!(marker_still.to_version, "99.0.0");
+    }
+
+    #[test]
+    fn e2e_oversized_blob_rejected_before_read() {
+        let dummy = b"small-exe";
+        let h = InbandTestHarness::new("e2e-oversize", dummy);
+
+        // Inflate the staged blob to exceed MAX_BINARY_ARCHIVE_BYTES via
+        // set_len (sparse — cheap, no actual disk I/O).
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        {
+            let f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&blob_path)
+                .unwrap();
+            f.set_len(MAX_BINARY_ARCHIVE_BYTES + 1).unwrap();
+        }
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "oversized blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("byte cap"),
+            "error must mention byte cap: {err_msg}"
+        );
+
+        // The target exe must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped when blob is oversized"
+        );
+    }
+
+    // ── C4: blob-mirror fallback tests ───────────────────────────────────────
+
+    /// Write `update-channel.json` into the harness's store so
+    /// `load_blob_base_url` returns the given base URL.
+    fn write_blob_base_url(harness: &InbandTestHarness, base_url: &str) {
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(&harness.env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.blob_base_url = Some(base_url.to_string());
+        let env_dir = harness.env_dir();
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Spawn a minimal HTTP/1.1 server on a random port that serves exactly one
+    /// blob at `/sha256-<hex>`. Returns `(base_url, join_handle)`. The server
+    /// accepts one connection, serves the response, then shuts down.
+    fn spawn_blob_mirror(
+        blob_hex: &str,
+        body: &[u8],
+        status: u16,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+        let expected_path = format!("/sha256-{blob_hex}");
+        let body = body.to_vec();
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            // Bounded accept. A plain blocking `accept()` deadlocks the caller's
+            // `join()` whenever the client never connects — which is exactly what
+            // a "the mirror must not be contacted" regression looks like. That
+            // turns a clean assertion failure into a CI job timeout carrying no
+            // diagnostic, so give up after a deadline and let the test's own
+            // assertions report the real problem.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break Some(stream),
+                    Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                        if std::time::Instant::now() >= deadline {
+                            break None;
+                        }
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let Some(stream) = stream else {
+                return;
+            };
+            // The accepted socket can inherit the listener's non-blocking flag;
+            // the request/response exchange below wants blocking semantics.
+            stream.set_nonblocking(false).unwrap();
+            let mut reader = std::io::BufReader::new(&stream);
+            // Read the request line and headers (up to blank line).
+            let mut request_line = String::new();
+            reader.read_line(&mut request_line).unwrap();
+            // Drain remaining headers.
+            loop {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                if line == "\r\n" || line == "\n" || line.is_empty() {
+                    break;
+                }
+            }
+            // Verify the request path.
+            let path = request_line.split_whitespace().nth(1).unwrap_or("");
+            let mut writer = reader.into_inner();
+            if path != expected_path {
+                let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_string();
+                let _ = writer.write_all(resp.as_bytes());
+                return;
+            }
+            let resp = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Length: {}\r\n\r\n",
+                if status == 200 { "OK" } else { "Error" },
+                body.len(),
+            );
+            let _ = writer.write_all(resp.as_bytes());
+            let _ = writer.write_all(&body);
+        });
+        (base_url, handle)
+    }
+
+    #[test]
+    fn c4_mirror_fallback_swaps_from_mirror() {
+        let dummy_exe = b"mirror-binary-v99";
+        let h = InbandTestHarness::with_opts(
+            "c4-mirror-happy",
+            dummy_exe,
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+
+        // Extract the bare hex from the digest.
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        let (base_url, server) = spawn_blob_mirror(hex, dummy_exe, 200);
+        write_blob_base_url(&h, &base_url);
+
+        let result = h.call();
+        server.join().unwrap();
+
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["restart_required"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the mirror payload.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(swapped, dummy_exe, "binary must be swapped from mirror");
+
+        // A Pending marker must exist.
+        let marker = read_binary_update_marker(&h.env_dir()).expect("marker must be written");
+        assert_eq!(marker.phase, MarkerPhase::Pending);
+        assert_eq!(marker.to_version, "99.0.0");
+        assert_eq!(marker.digest.as_deref(), Some(h.binary_digest.as_str()),);
+    }
+
+    #[test]
+    fn c4_mirror_tampered_bytes_hard_error() {
+        let dummy_exe = b"good-mirror-binary";
+        let h = InbandTestHarness::with_opts(
+            "c4-mirror-tamper",
+            dummy_exe,
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        // Serve WRONG bytes — the digest will not match.
+        let (base_url, server) = spawn_blob_mirror(hex, b"tampered-payload", 200);
+        write_blob_base_url(&h, &base_url);
+
+        let result = h.call();
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "tampered mirror blob must be rejected: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("digest mismatch"),
+            "error must mention digest mismatch: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on tamper"
+        );
+
+        // No pending marker.
+        assert!(
+            read_binary_update_marker(&h.env_dir()).is_none(),
+            "no marker must be written on mirror digest mismatch"
+        );
+    }
+
+    #[test]
+    fn c4_no_mirror_configured_reproduces_pre_c4_error() {
+        // Staged blob is missing AND no mirror configured → the pre-C4 hard
+        // error, byte-for-byte (regression pin).
+        let h = InbandTestHarness::with_opts(
+            "c4-no-mirror",
+            b"never-staged",
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        // Do NOT write_blob_base_url → load_blob_base_url returns None.
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "missing blob + no mirror must error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("in-band binary stat"),
+            "error must be the pre-C4 stat error, not a new message: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped");
+    }
+
+    #[test]
+    fn c4_blob_present_ignores_mirror() {
+        // Staged blob IS present, mirror is configured at an unroutable address.
+        // Must succeed from the staged blob, proving the mirror was never contacted.
+        let dummy_exe = b"local-blob-binary";
+        let h = InbandTestHarness::new("c4-blob-present", dummy_exe);
+
+        // Point the mirror at an unroutable address — if contacted, it would fail.
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+        let json = result.expect("must succeed").expect("must return Some");
+        assert_eq!(json["staged"], true);
+        assert_eq!(json["version"], "99.0.0");
+
+        // The target exe must contain the STAGED payload, not anything from a mirror.
+        let swapped = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            swapped, dummy_exe,
+            "binary must come from staging, not mirror"
+        );
+    }
+
+    #[test]
+    fn c4_mirror_fetch_failure_is_hard_error() {
+        // Mirror configured at an unroutable address, blob missing → hard error
+        // from the fetch failure, not a silent skip.
+        let h = InbandTestHarness::with_opts(
+            "c4-fetch-fail",
+            b"unreachable-binary",
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+        assert!(
+            result.is_err(),
+            "mirror fetch failure must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("mirror fetch failed"),
+            "error must name the mirror fetch failure: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on fetch failure"
+        );
+
+        // No pending marker.
+        assert!(
+            read_binary_update_marker(&h.env_dir()).is_none(),
+            "no marker on mirror fetch failure"
+        );
+    }
+
+    #[test]
+    fn c4_mirror_500_is_hard_error() {
+        // Mirror serves a 500 Internal Server Error → hard error.
+        let dummy_exe = b"server-error-binary";
+        let h = InbandTestHarness::with_opts(
+            "c4-mirror-500",
+            dummy_exe,
+            InbandHarnessOpts {
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        let (base_url, server) = spawn_blob_mirror(hex, b"", 500);
+        write_blob_base_url(&h, &base_url);
+
+        let result = h.call();
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "mirror 500 must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("mirror fetch failed") && err_msg.contains("status error"),
+            "error must name BOTH the mirror and the HTTP status failure: {err_msg}"
+        );
+
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(on_disk, b"old-binary", "binary must not be swapped on 500");
+    }
+
+    #[test]
+    fn c4_malformed_digest_rejected_upstream_of_the_mirror() {
+        // A binary whose digest is NOT `sha256:<64 hex>` must fail BEFORE any
+        // network call. The gate that actually fires is UPSTREAM of C4:
+        // `staged.binary_blob_path()` validates the digest inside
+        // greentic-update (`staging.rs`: "malformed artifact digest") before the
+        // metadata match that dispatches to the mirror, so a bad digest can
+        // never reach URL construction. Assert that specific error rather than
+        // accepting `validate_digest_hex`'s message too — an `||` over both
+        // would hide which gate fired, and would keep passing if the ordering
+        // regressed so that the mirror ran first. `validate_digest_hex` is the
+        // second, defense-in-depth gate and is pinned directly by
+        // `c4_validate_digest_hex_rejects_bad_inputs`.
+        let h = InbandTestHarness::with_opts(
+            "c4-malformed",
+            b"malformed-digest-binary",
+            InbandHarnessOpts {
+                plan_id: "plan-c4-malformed",
+                digest: Some("md5:abc123".to_string()),
+                skip_blob: true,
+                ..Default::default()
+            },
+        );
+        // Mirror configured at an unroutable address: if the digest gate ever
+        // stopped firing first, the fetch attempt would surface a DIFFERENT
+        // error, so this address is part of the assertion.
+        write_blob_base_url(&h, "http://127.0.0.1:1/blobs");
+
+        let result = h.call();
+
+        assert!(
+            result.is_err(),
+            "malformed digest must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("malformed artifact digest"),
+            "the upstream blob-path gate must reject the digest before the \
+             mirror dispatch is reached: {err_msg}"
+        );
+
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on malformed digest"
+        );
+    }
+
+    #[test]
+    fn c4_mirror_oversized_response_rejected() {
+        // Exercise the cap-check branch in fetch_blob_from_mirror_capped.
+        // Allocating 256 MiB (the production cap) is impractical in a unit
+        // test, so we call the _capped variant with a small cap and spawn a
+        // server that sends more bytes than that cap.
+        const TEST_CAP: u64 = 128; // tiny cap for the test
+
+        // Build a payload that exceeds TEST_CAP. Content doesn't matter for
+        // the cap check — it fires before digest verification.
+        let oversized_body = vec![0u8; (TEST_CAP + 1) as usize];
+
+        // We still need a valid digest string to pass validate_digest_hex.
+        let dummy_exe = b"oversized-cap-test";
+        let digest = test_digest_of(dummy_exe);
+        let hex = digest.strip_prefix("sha256:").unwrap();
+
+        let (base_url, server) = spawn_blob_mirror(hex, &oversized_body, 200);
+        let result = fetch_blob_from_mirror_capped(&base_url, &digest, TEST_CAP);
+        server.join().unwrap();
+
+        assert!(
+            result.is_err(),
+            "oversized mirror response must be rejected: {result:?}"
+        );
+        let err_msg = result.unwrap_err();
+        assert!(
+            err_msg.contains("exceeds") && err_msg.contains("bytes"),
+            "error must be the byte-cap rejection, not a digest mismatch: {err_msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn c4_non_notfound_metadata_error_is_hard_error() {
+        // When fs::metadata on the blob path fails with something OTHER than
+        // NotFound (e.g. PermissionDenied), the error must be a hard error
+        // that does NOT attempt a mirror fallback. This pins the
+        // ErrorKind::NotFound guard so it cannot be silently widened to a
+        // catch-all.
+        let dummy_exe = b"perm-denied-binary";
+        let h = InbandTestHarness::new("c4-perm-denied", dummy_exe);
+
+        // The blob IS staged (skip_blob defaults to false). Now remove
+        // permissions on the blob's parent directory so that fs::metadata
+        // returns PermissionDenied instead of NotFound.
+        let bin = test_inband_binary("99.0.0", h.binary_digest.clone());
+        let root = UpdatesRoot::open_in(h.staging_dir.path(), &h.env_id).unwrap();
+        let staged = root.load("plan-e2e-1").unwrap().unwrap();
+        let blob_path = staged.binary_blob_path(&bin).unwrap();
+        let blob_parent = blob_path.parent().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(blob_parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Configure a mirror at an unroutable address — if the code
+        // incorrectly falls through to the mirror, it would produce a
+        // different error ("mirror fetch failed") instead of the expected
+        // "in-band binary stat" error.
+        write_blob_base_url(&h, "http://127.0.0.1:1");
+
+        let result = h.call();
+
+        // Restore permissions so the TempDir cleanup succeeds.
+        std::fs::set_permissions(blob_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(
+            result.is_err(),
+            "permission-denied on blob must be a hard error: {result:?}"
+        );
+        let err_msg = format!("{:?}", result.unwrap_err());
+        assert!(
+            err_msg.contains("in-band binary stat"),
+            "error must be the non-NotFound stat error, not a mirror fallback: {err_msg}"
+        );
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on permission denied"
+        );
+    }
+
+    #[test]
+    fn c4_validate_digest_hex_rejects_bad_inputs() {
+        // Comprehensive unit tests for validate_digest_hex.
+        assert!(validate_digest_hex(&format!("sha256:{}", "a".repeat(64))).is_ok());
+        assert!(validate_digest_hex(&format!("sha256:{}", "0123456789abcdef".repeat(4))).is_ok());
+
+        // Missing prefix.
+        let err = validate_digest_hex("abcd").unwrap_err();
+        assert!(err.contains("missing `sha256:` prefix"), "{err}");
+
+        // Wrong prefix.
+        let err = validate_digest_hex(&format!("sha512:{}", "a".repeat(64))).unwrap_err();
+        assert!(err.contains("missing `sha256:` prefix"), "{err}");
+
+        // Too short.
+        let err = validate_digest_hex("sha256:abcd").unwrap_err();
+        assert!(err.contains("64 chars"), "{err}");
+
+        // Too long.
+        let err = validate_digest_hex(&format!("sha256:{}", "a".repeat(65))).unwrap_err();
+        assert!(err.contains("64 chars"), "{err}");
+
+        // Uppercase hex.
+        let err = validate_digest_hex(&format!("sha256:{}", "A".repeat(64))).unwrap_err();
+        assert!(err.contains("non-lowercase-hex"), "{err}");
+
+        // Non-hex chars.
+        let err = validate_digest_hex(&format!("sha256:{}z", "a".repeat(63))).unwrap_err();
+        assert!(err.contains("non-lowercase-hex"), "{err}");
+    }
+
+    // ── C4-notify: tests through the production caller (run_update_notify) ──
+    //
+    // The B3/C4 tests above call `try_apply_binary_update` directly. These tests
+    // go through `run_update_notify` — the production caller — to verify that
+    // `BinaryMirror` errors are NOT swallowed and surface as `Err` to the HTTP
+    // handler and the poll loop.
+
+    /// Build a plan whose `target` is a valid `EnvManifest` so it passes the
+    /// deployer's `updates::get` target-parsing gate. The B3/C4
+    /// `test_plan_with_binary` uses `target: json!({})` which is fine when
+    /// calling `try_apply_binary_update` directly (it never parses `target`),
+    /// but `updates::get` requires a real `greentic.env-manifest.v1`.
+    fn test_plan_for_notify(plan_id: &str, env_id: &str, binary: BinaryArtifact) -> UpdatePlan {
+        UpdatePlan {
+            schema: UPDATE_PLAN_SCHEMA_V1.to_string(),
+            plan_id: plan_id.to_string(),
+            env_id: env_id.to_string(),
+            sequence: 1,
+            created_at: chrono::Utc::now(),
+            nonce: "test-nonce".to_string(),
+            target: serde_json::json!({
+                "schema": "greentic.env-manifest.v1",
+                "environment": { "id": env_id }
+            }),
+            artifacts: vec![],
+            binaries: vec![binary],
+            compat: CompatRequirements::default(),
+            rollback: RollbackPolicy {
+                policy: RollbackKind::Auto,
+                health_timeout_s: 60,
+                on_fail: OnFail::Restore,
+            },
+        }
+    }
+
+    /// Write a minimal `environment.json` so `updates::get` can
+    /// `store.load(&env_id)` without error.
+    fn write_environment_json(store_dir: &std::path::Path, env_id: &str) {
+        let env_dir = store_dir.join(env_id);
+        std::fs::create_dir_all(&env_dir).unwrap();
+        std::fs::write(
+            env_dir.join("environment.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema": "greentic.environment.v1",
+                "environment_id": env_id,
+                "name": "test",
+                "host_config": { "env_id": env_id },
+                "packs": []
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Remove the per-env staging directory that `updates::get` writes to via
+    /// the global `UpdatesRoot`. Without cleanup, every test run leaves debris
+    /// in `~/.greentic/updates/`.
+    fn cleanup_updates_root(env_id: &str) {
+        if let Some(dir) = std::env::var_os("GREENTIC_UPDATES_DIR") {
+            let _ = std::fs::remove_dir_all(std::path::PathBuf::from(dir).join(env_id));
+        }
+        if let Some(home) = std::env::var_os("HOME") {
+            let _ = std::fs::remove_dir_all(
+                std::path::PathBuf::from(home)
+                    .join(".greentic")
+                    .join("updates")
+                    .join(env_id),
+            );
+        }
+    }
+
+    /// Test harness for `run_update_notify` — sets up everything the deployer's
+    /// `updates::get` needs (environment.json, trust root, update channel) plus
+    /// a signed plan with a valid `EnvManifest` target. Cleans up the global
+    /// staging root on drop.
+    struct NotifyTestHarness {
+        store_dir: tempfile::TempDir,
+        #[allow(dead_code)]
+        exe_dir: tempfile::TempDir,
+        plan_bytes: Vec<u8>,
+        sig_bytes: Vec<u8>,
+        env_id: String,
+        target_exe: std::path::PathBuf,
+        binary_digest: String,
+    }
+
+    impl NotifyTestHarness {
+        fn new(env_id: &str, dummy_exe: &[u8], blob_base_url: Option<&str>) -> Self {
+            // Pre-clean, not just the `Drop` clean. `updates::get` resolves its
+            // staging root internally from `HOME`/`GREENTIC_UPDATES_DIR` — there
+            // is no override parameter — so these tests necessarily stage under
+            // the real updates root. Cleaning only on `Drop` makes them flaky:
+            // any run killed mid-test (a `timeout`, a Ctrl-C, a panic in the
+            // harness itself) leaves a staged plan behind, and the next run gets
+            // `Conflict("a different plan is already staged under id ...")`
+            // because the plan bytes differ. Each test uses a distinct `env_id`,
+            // so pre-cleaning its own subtree cannot disturb a sibling.
+            cleanup_updates_root(env_id);
+
+            let (priv_pem, tk) = test_signing_key(42);
+            let trust = TrustRoot::new(vec![tk.clone()]);
+
+            let digest = test_digest_of(dummy_exe);
+            let bin = test_inband_binary("99.0.0", digest.clone());
+
+            let plan = test_plan_for_notify("plan-notify-1", env_id, bin);
+            let built = build_update_plan(&plan, &priv_pem, &tk.key_id, &trust)
+                .expect("test plan must build");
+
+            let store_dir = tempfile::TempDir::new().unwrap();
+            let env_dir = store_dir.path().join(env_id);
+            std::fs::create_dir_all(&env_dir).unwrap();
+
+            // environment.json — minimal valid Environment for the deployer.
+            write_environment_json(store_dir.path(), env_id);
+
+            // trust-root.json — same key that signed the plan.
+            let trust_doc = TrustRootDocument::v1(vec![tk]);
+            std::fs::write(
+                env_dir.join(TRUST_ROOT_FILE),
+                serde_json::to_vec_pretty(&trust_doc).unwrap(),
+            )
+            .unwrap();
+
+            // update-channel.json — enabled, Stage mode.
+            let mut cfg = UpdateChannelConfig::disabled(EnvId::new(env_id).unwrap());
+            cfg.enabled = Some(true);
+            cfg.on_update = Some(UpdateAction::Stage);
+            if let Some(url) = blob_base_url {
+                cfg.blob_base_url = Some(url.to_string());
+            }
+            std::fs::write(
+                env_dir.join("update-channel.json"),
+                serde_json::to_vec_pretty(&cfg).unwrap(),
+            )
+            .unwrap();
+
+            // Target exe — NOT the real test binary.
+            let exe_dir = tempfile::TempDir::new().unwrap();
+            let target_exe = exe_dir.path().join("target-exe");
+            std::fs::write(&target_exe, b"old-binary").unwrap();
+
+            Self {
+                store_dir,
+                exe_dir,
+                plan_bytes: built.plan_bytes,
+                sig_bytes: built.envelope_bytes,
+                env_id: env_id.to_string(),
+                target_exe,
+                binary_digest: digest,
+            }
+        }
+
+        fn store(&self) -> LocalFsStore {
+            LocalFsStore::new(self.store_dir.path())
+        }
+
+        fn call_notify(&self) -> Result<(StatusCode, Value), NotifyError> {
+            run_update_notify(
+                &self.store(),
+                &self.env_id,
+                &self.plan_bytes,
+                &self.sig_bytes,
+                Some(&self.target_exe),
+            )
+        }
+    }
+
+    impl Drop for NotifyTestHarness {
+        fn drop(&mut self) {
+            cleanup_updates_root(&self.env_id);
+        }
+    }
+
+    // The `c4_notify_*` and `c6_poll_*` scenarios below drive the real
+    // `run_update_notify` / `poll_update_cycle`, which resolve their staging root
+    // from the process-global `HOME` (there is no override parameter). Unrelated
+    // tests in this crate mutate `HOME` with `std::env::set_var` (`src/lib.rs`,
+    // `src/seed_copy.rs`, `src/startup_contract.rs`), and cargo runs tests as
+    // threads in ONE process — so a concurrent `set_var` can move `HOME` between
+    // staging and lookup, yielding a spurious "staged plan not found". That is a
+    // race against foreign tests, not something these scenarios can defend against.
+    //
+    // They are therefore `#[ignore]`d: each has a companion `driver_*` test (not
+    // ignored) that spawns `std::env::current_exe()` as a CHILD PROCESS with
+    // per-command `HOME` and `GREENTIC_UPDATES_DIR` env, runs the scenario in
+    // isolation via `--exact --ignored --test-threads=1`, and asserts both exit
+    // success AND "1 passed" in stdout (so a renamed scenario is caught, not
+    // silently skipped). CI therefore exercises every scenario through its driver
+    // on every default `cargo test` run — the `#[ignore]` only prevents the
+    // scenario from racing other threads inside the parent process.
+    //
+    // The swallow-vs-surface policy is ALSO pinned deterministically, without any
+    // `HOME` dependency, by `classify_binary_step_surfaces_only_mirror_failures`,
+    // `poll_outcome_advances_sequence_only_on_a_2xx`, and
+    // `notify_failure_response_separates_a_broken_mirror_from_a_broken_server`.
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_mirror_unreachable_returns_binary_mirror_error() {
+        // A configured mirror that is unreachable must surface as
+        // `Err(BinaryMirror)` from `run_update_notify`, NOT `Ok(200)`.
+        // This is the bug the finding identified: before the fix, the
+        // error was swallowed, HTTP 200 returned, and the poll loop
+        // advanced the sequence — stranding the binary version forever.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-mirror-down",
+            b"unreachable-binary",
+            Some("http://127.0.0.1:1"), // unroutable → connection refused
+        );
+
+        let result = h.call_notify();
+
+        match &result {
+            Err(NotifyError::BinaryMirror(msg)) => {
+                assert!(
+                    msg.contains("mirror fetch failed"),
+                    "BinaryMirror message must name the mirror fetch: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(BinaryMirror), got {other:?} — \
+                 a swallowed mirror failure would be Ok(200)"
+            ),
+        }
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on mirror failure"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_mirror_tampered_returns_binary_mirror_error() {
+        // A mirror serving tampered bytes (digest mismatch) must also
+        // surface as `Err(BinaryMirror)`, not `Ok(200)`.
+        let dummy_exe = b"good-notify-binary";
+        let h = NotifyTestHarness::new("c4-ntfy-mirror-tamper", dummy_exe, None);
+
+        let hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+        // Serve WRONG bytes — digest will not match.
+        let (base_url, server) = spawn_blob_mirror(hex, b"tampered-payload", 200);
+
+        // Update the channel config with the mirror URL.
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(&h.env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.blob_base_url = Some(base_url);
+        std::fs::write(
+            h.store_dir
+                .path()
+                .join(&h.env_id)
+                .join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let result = h.call_notify();
+        server.join().unwrap();
+
+        match &result {
+            Err(NotifyError::BinaryMirror(msg)) => {
+                assert!(
+                    msg.contains("digest mismatch"),
+                    "BinaryMirror message must name digest mismatch: {msg}"
+                );
+            }
+            other => panic!(
+                "expected Err(BinaryMirror), got {other:?} — \
+                 a swallowed digest-mismatch would be Ok(200)"
+            ),
+        }
+
+        // Binary must NOT have been swapped.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, b"old-binary",
+            "binary must not be swapped on tampered mirror"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_no_mirror_b3_regression_pin() {
+        // Regression pin: an in-band binary failure with NO mirror configured
+        // must still yield `Ok((200, ...))` with no `binary` key — the pre-C4
+        // best-effort behavior. This test stops someone later "fixing" all
+        // binary failures into hard errors.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-no-mirror",
+            b"never-staged-binary",
+            None, // no blob_base_url
+        );
+
+        let result = h.call_notify();
+
+        let (status, body) = result
+            .expect("missing blob + no mirror must be Ok (best-effort binary, content staged)");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "content staging must succeed even when binary blob is missing"
+        );
+        assert_eq!(body["status"], "staged");
+        assert!(
+            body.get("binary").is_none(),
+            "no `binary` key when binary step is best-effort-failed: {body}"
+        );
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get; races foreign set_var(\"HOME\") — see note above"]
+    fn c4_notify_content_staged_despite_mirror_failure() {
+        // Content must converge (plan staged by `updates::get`) even when the
+        // mirror fails. The call returns `Err(BinaryMirror)` — but the plan IS
+        // staged in the UpdatesRoot beforehand.
+        let h = NotifyTestHarness::new(
+            "c4-ntfy-content-conv",
+            b"content-convergence-binary",
+            Some("http://127.0.0.1:1"), // unroutable
+        );
+
+        let result = h.call_notify();
+
+        // The result must be a BinaryMirror error.
+        assert!(
+            matches!(&result, Err(NotifyError::BinaryMirror(_))),
+            "expected BinaryMirror error, got: {result:?}"
+        );
+
+        // But the plan WAS staged by `updates::get` before the mirror failure.
+        // Verify by opening the staging root and checking the plan exists.
+        let root = greentic_update::staging::UpdatesRoot::open(&h.env_id)
+            .expect("staging root must exist after updates::get");
+        let staged = root
+            .load("plan-notify-1")
+            .expect("load must not error")
+            .expect("plan must be staged despite the mirror failure");
+        let stage = staged.stage().expect("stage read");
+        assert_eq!(
+            stage,
+            greentic_update::staging::UpdateStage::Staged,
+            "plan must be in Staged state (content converged)"
+        );
+    }
+
+    // ── C6 driver infrastructure ─────────────────────────────────────────────
+    //
+    // `run_scenario_in_child` is the shared core for every `driver_*` test.
+    // It spawns this same test binary as a child process with isolated `HOME`
+    // and `GREENTIC_UPDATES_DIR`, runs the named `--ignored` scenario, and
+    // asserts BOTH exit-0 AND "1 passed" in stdout. The "1 passed" guard is
+    // mandatory: without it a renamed scenario would match nothing and the
+    // driver would silently pass (libtest exits 0 with "0 passed" when the
+    // filter matches nothing).
+
+    /// Wall-clock ceiling for a scenario child. Generous next to the 10s
+    /// deadlines inside the scenarios themselves, but bounded: without it a
+    /// wedged child turns into a CI job that hangs until the platform timeout
+    /// kills it with no diagnostic at all.
+    const SCENARIO_CHILD_TIMEOUT: Duration = Duration::from_secs(120);
+
+    fn run_scenario_in_child(scenario_filter: &str) {
+        let home = tempfile::TempDir::new().expect("HOME tempdir");
+        let updates_dir = tempfile::TempDir::new().expect("GREENTIC_UPDATES_DIR tempdir");
+        let io_dir = tempfile::TempDir::new().expect("child stdio tempdir");
+        let stdout_path = io_dir.path().join("stdout");
+        let stderr_path = io_dir.path().join("stderr");
+        let exe = std::env::current_exe().expect("current_exe");
+        let mut child = std::process::Command::new(&exe)
+            .args([
+                "--exact",
+                scenario_filter,
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("HOME", home.path())
+            .env("GREENTIC_UPDATES_DIR", updates_dir.path())
+            // Pin container detection OFF. `is_container_environment()` (the
+            // `GREENTIC_CONTAINER` override, `/.dockerenv`, `/run/.containerenv`,
+            // cgroup markers) makes `try_apply_binary_update` return `Ok(None)`
+            // before it ever downloads a blob. Left to autodetect, every
+            // binary-swap assertion below would depend on whether the CI runner
+            // happens to be containerized. Per-`Command` so no `set_var` is needed.
+            .env("GREENTIC_CONTAINER", "0")
+            // Redirect to files rather than pipes: a piped child that outfills
+            // the pipe buffer blocks on write while the parent blocks on wait.
+            .stdout(std::fs::File::create(&stdout_path).expect("create child stdout"))
+            .stderr(std::fs::File::create(&stderr_path).expect("create child stderr"))
+            .spawn()
+            .expect("failed to spawn child test process");
+
+        let deadline = std::time::Instant::now() + SCENARIO_CHILD_TIMEOUT;
+        let status = loop {
+            match child.try_wait().expect("try_wait on scenario child") {
+                Some(status) => break Some(status),
+                None if std::time::Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+                None => std::thread::sleep(Duration::from_millis(20)),
+            }
+        };
+
+        let stdout = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+        let status = status.unwrap_or_else(|| {
+            panic!(
+                "child process for `{scenario_filter}` did not finish within {}s and was killed \
+                 (a hang, not a failure)\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+                SCENARIO_CHILD_TIMEOUT.as_secs(),
+            )
+        });
+
+        assert!(
+            status.success(),
+            "child process for `{scenario_filter}` exited with {status}\n\
+             --- stdout ---\n{stdout}\n--- stderr ---\n{stderr}",
+        );
+
+        // THE most important assertion in the driver: a misnamed filter
+        // matches nothing, libtest exits 0 with "0 passed", and the driver
+        // silently becomes a no-op. This line catches that.
+        assert!(
+            stdout.contains("1 passed"),
+            "child stdout must prove exactly 1 scenario ran \
+             (guard against silent no-op on a renamed filter).\n\
+             filter: `{scenario_filter}`\n--- stdout ---\n{stdout}",
+        );
+    }
+
+    // ── C6 drivers for the four C4 notify scenarios ───────────────────────
+
+    #[test]
+    fn driver_c4_notify_mirror_unreachable() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_mirror_unreachable_returns_binary_mirror_error",
+        );
+    }
+
+    #[test]
+    fn driver_c4_notify_mirror_tampered() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_mirror_tampered_returns_binary_mirror_error",
+        );
+    }
+
+    #[test]
+    fn driver_c4_notify_no_mirror_b3_regression() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_no_mirror_b3_regression_pin",
+        );
+    }
+
+    #[test]
+    fn driver_c4_notify_content_staged_despite_mirror_failure() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c4_notify_content_staged_despite_mirror_failure",
+        );
+    }
+
+    // ── C6 positive poll: poll_update_cycle stages + swaps ─────────────────
+    //
+    // This is the positive-path proof the task requires: a real
+    // `poll_update_cycle` call against a local HTTP server that serves the
+    // exact Tier 2 wire layout (`/meta`, plan bytes, `.sig`, blob).
+
+    /// Spawn a minimal HTTP/1.1 server that serves the Tier 2 poll endpoints:
+    ///   GET <base>/plan/meta  -> `{"sequence": N, "plan_sha256": "<hex>"}`
+    ///   GET <base>/plan       -> raw plan bytes
+    ///   GET <base>/plan.sig   -> DSSE envelope bytes
+    ///   GET <base>/sha256-<hex> -> binary blob bytes
+    ///
+    /// Accepts up to 4 connections (one per endpoint) with a 10-second
+    /// deadline, then shuts down. The deadline prevents `join()` from
+    /// hanging when fewer than 4 connections arrive (e.g. the container
+    /// guard skips the blob download in Docker CI).
+    /// Returns `(base_url, join_handle)`.
+    fn spawn_tier2_server(
+        plan_bytes: &[u8],
+        sig_bytes: &[u8],
+        blob_hex: &str,
+        blob_body: &[u8],
+        sequence: u64,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        let plan_sha256 = sha256_hex(plan_bytes);
+        let meta_body = serde_json::to_vec(&serde_json::json!({
+            "sequence": sequence,
+            "plan_sha256": plan_sha256,
+        }))
+        .unwrap();
+        let plan_bytes = plan_bytes.to_vec();
+        let sig_bytes = sig_bytes.to_vec();
+        let blob_path = format!("/sha256-{blob_hex}");
+        let blob_body = blob_body.to_vec();
+
+        let handle = std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+
+            // Bounded accept. A plain blocking `accept()` deadlocks the caller's
+            // `join()` whenever the client makes fewer connections than expected —
+            // e.g. `is_container_environment()` returns true in Docker CI, skipping
+            // the blob download. That turns a clean assertion failure into a CI job
+            // timeout with no diagnostic. Give up after a deadline and let the
+            // test's own assertions report the real problem.
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+
+            // Serve up to 4 requests (meta, plan, sig, blob).
+            for _ in 0..4 {
+                let stream = loop {
+                    match listener.accept() {
+                        Ok((s, _)) => break Some(s),
+                        Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                            if std::time::Instant::now() >= deadline {
+                                break None;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break None,
+                    }
+                };
+                let Some(stream) = stream else {
+                    break;
+                };
+                // The accepted socket can inherit the listener's non-blocking
+                // flag; the request/response exchange below wants blocking
+                // semantics.
+                stream.set_nonblocking(false).unwrap();
+                let mut reader = std::io::BufReader::new(&stream);
+                let mut request_line = String::new();
+                reader.read_line(&mut request_line).unwrap();
+                // Drain headers.
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .to_string();
+                let mut writer = reader.into_inner();
+
+                let response_body: &[u8] = if path == "/plan/meta" {
+                    &meta_body
+                } else if path == "/plan" {
+                    &plan_bytes
+                } else if path == "/plan.sig" {
+                    &sig_bytes
+                } else if path == blob_path {
+                    &blob_body
+                } else {
+                    let resp =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = writer.write_all(resp.as_bytes());
+                    continue;
+                };
+
+                // `Connection: close` is load-bearing: this server answers ONE
+                // request per accepted socket and then drops it. Without the
+                // header the client keeps the socket in its keep-alive pool and
+                // may send the next GET (`/plan.sig`) down a connection this
+                // loop has already closed, failing with "error sending request"
+                // — a race that made `c6_poll_cycle_stages_plan_and_swaps_binary`
+                // flaky in CI.
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    response_body.len(),
+                );
+                let _ = writer.write_all(resp.as_bytes());
+                let _ = writer.write_all(response_body);
+            }
+        });
+
+        (base_url, handle)
+    }
+
+    #[test]
+    #[ignore = "drives real updates::get via poll_update_cycle; races foreign set_var(\"HOME\")"]
+    fn c6_poll_cycle_stages_plan_and_swaps_binary() {
+        // Positive poll proof: a poll cycle against a local Tier 2 server
+        // must stage the plan, swap the binary, advance the sequence, and
+        // set the restart flag.
+        let dummy_exe = b"new-poll-binary-v99";
+        let env_id = "c6-poll-happy";
+
+        let h = NotifyTestHarness::new(env_id, dummy_exe, None);
+
+        let blob_hex = h.binary_digest.strip_prefix("sha256:").unwrap();
+
+        // Spin up the Tier 2 server. The meta sequence must match the plan's
+        // embedded `sequence` field (the deployer always writes them equal);
+        // `test_plan_for_notify` hardcodes sequence 1.
+        let plan_sequence = 1;
+        let (base_url, server) = spawn_tier2_server(
+            &h.plan_bytes,
+            &h.sig_bytes,
+            blob_hex,
+            dummy_exe,
+            plan_sequence,
+        );
+
+        // Configure the update channel with the poll endpoint and blob base URL.
+        let mut cfg = UpdateChannelConfig::disabled(EnvId::new(env_id).unwrap());
+        cfg.enabled = Some(true);
+        cfg.on_update = Some(UpdateAction::Stage);
+        cfg.plan_endpoint = Some(format!("{base_url}/plan"));
+        cfg.blob_base_url = Some(base_url.clone());
+        std::fs::write(
+            h.store_dir.path().join(env_id).join("update-channel.json"),
+            serde_json::to_vec_pretty(&cfg).unwrap(),
+        )
+        .unwrap();
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("client");
+
+        let (seq, _interval, restart) = poll_update_cycle(
+            env_id,
+            h.store_dir.path(),
+            &client,
+            None, // no previous sequence
+            Some(&h.target_exe),
+        );
+        server.join().unwrap();
+
+        // Sequence must have advanced to the plan's sequence (1).
+        assert_eq!(
+            seq,
+            Some(plan_sequence),
+            "poll cycle must advance the sequence on a successful stage"
+        );
+
+        // Restart flag must be set (binary was swapped).
+        assert!(
+            restart,
+            "poll cycle must set the restart flag after a binary swap"
+        );
+
+        // Binary must have been swapped to the new bytes.
+        let on_disk = std::fs::read(&h.target_exe).unwrap();
+        assert_eq!(
+            on_disk, dummy_exe,
+            "target binary must be replaced by the new binary after poll"
+        );
+    }
+
+    #[test]
+    fn driver_c6_poll_cycle_stages_and_swaps() {
+        run_scenario_in_child(
+            "revision_serve::binary_update_tests::c6_poll_cycle_stages_plan_and_swaps_binary",
         );
     }
 
@@ -11102,6 +15581,8 @@ mod binary_update_tests {
                 bundle_index: crate::webchat_routing::BundleIndex::empty(),
                 flow_index: crate::webchat_routing::FlowIndex::default(),
                 app_packs: Default::default(),
+                triggers: Default::default(),
+                runtime_metered: Default::default(),
             }),
         }
     }
@@ -11168,6 +15649,8 @@ mod binary_update_tests {
                 crate::websocket::WsLimits::default(),
             )),
             notifier: Arc::clone(&notifier),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
             ),
@@ -11264,6 +15747,230 @@ mod binary_update_tests {
         accept_handle.abort();
     }
 
+    /// Serve `activation` on a loopback listener through the real connection
+    /// pipeline, with the test activity source substituted for the provider.
+    async fn ws_serve_fixture(
+        activation: Activation,
+    ) -> (
+        Arc<ServeState>,
+        std::net::SocketAddr,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let test_source = std::sync::Arc::new(TestActivitySource::new());
+        test_source.append("hello from replay");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        let state = Arc::new(ServeState {
+            slot: ArcSwap::new(std::sync::Arc::new(activation)),
+            bound_addr: addr,
+            gui_enabled: false,
+            restart_required: AtomicBool::new(false),
+            updates_enabled: false,
+            auto_restart_pending: AtomicBool::new(false),
+            auto_restart_enabled: false,
+            exe_path: None,
+            directline_sessions: Arc::new(
+                crate::directline_session::DirectLineSessions::with_ttl_secs(1800),
+            ),
+            conversation_dedup: Arc::new(crate::conv_dedup::ConversationDedupCache::new()),
+            session_manager: Arc::new(crate::websocket::SessionManager::new(
+                crate::websocket::WsLimits::default(),
+            )),
+            notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
+            public_url_capture: None,
+            interop: crate::interop::InteropState::default(),
+            activity_source_override: Some(
+                test_source as Arc<dyn crate::websocket::pump::ActivitySource>,
+            ),
+        });
+        let accept_state = Arc::clone(&state);
+        let handle = tokio::spawn(async move {
+            while let Ok(accept) = listener.accept().await {
+                spawn_revision_connection(Ok(accept), &accept_state, true);
+            }
+        });
+        (state, addr, handle)
+    }
+
+    fn ws_status(
+        result: Result<
+            (
+                tokio_tungstenite::WebSocketStream<
+                    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+                >,
+                tokio_tungstenite::tungstenite::handshake::client::Response,
+            ),
+            tokio_tungstenite::tungstenite::Error,
+        >,
+    ) -> u16 {
+        match result {
+            Ok((_ws, response)) => response.status().as_u16(),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                response.status().as_u16()
+            }
+            Err(other) => panic!("unexpected websocket error: {other:?}"),
+        }
+    }
+
+    /// The bug this guards: after a restart / redeploy the page resumes a
+    /// conversation whose durable state is intact, and its stream WebSocket was
+    /// answered `404 no revision pin ... create it via REST first`, because the
+    /// pin lives in memory and only `POST /conversations` created it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_resume_without_a_pin_re_establishes_it() {
+        let (tenant, key) = ("test-tenant", b"repin-ws-key".as_slice());
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+        let activation =
+            ws_test_activation("local", tenant, dep_id, rev_id, bundle_id, key, pin_store);
+        let (state, addr, accept) = ws_serve_fixture(activation).await;
+        let dispatcher = Arc::clone(&state.current().routing.dispatcher);
+        assert_eq!(
+            dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-resume")
+                .await,
+            None,
+            "precondition: a fresh process holds no pin"
+        );
+
+        let token = issue_test_token("c-resume", tenant, key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/c-resume/stream?t={token}&watermark=0"
+        );
+        let status = ws_status(tokio_tungstenite::connect_async(&url).await);
+        assert_eq!(status, 101, "resume must complete the handshake");
+        assert_eq!(
+            dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-resume")
+                .await
+                .map(|(_, r)| r),
+            Some(rev_id),
+            "and leave the conversation pinned to the current revision"
+        );
+        accept.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_without_a_valid_token_for_this_conversation_cannot_pin() {
+        let (tenant, key) = ("test-tenant", b"repin-ws-key".as_slice());
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let rev_id = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+        let activation =
+            ws_test_activation("local", tenant, dep_id, rev_id, bundle_id, key, pin_store);
+        let (state, addr, accept) = ws_serve_fixture(activation).await;
+        let dispatcher = Arc::clone(&state.current().routing.dispatcher);
+        let base = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/c-victim/stream"
+        );
+
+        // Another conversation's token.
+        let other = issue_test_token("c-other", tenant, key);
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(format!("{base}?t={other}")).await),
+            403
+        );
+        // A token signed with a different key.
+        let forged = issue_test_token("c-victim", tenant, b"some-other-key");
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(format!("{base}?t={forged}")).await),
+            401
+        );
+        // A token for another tenant.
+        let foreign = issue_test_token("c-victim", "other-tenant", key);
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(format!("{base}?t={foreign}")).await),
+            403
+        );
+        // No token at all.
+        assert_eq!(
+            ws_status(tokio_tungstenite::connect_async(base.clone()).await),
+            401
+        );
+        assert_eq!(
+            dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-victim")
+                .await,
+            None,
+            "no refused request may leave a pin behind"
+        );
+        accept.abort();
+    }
+
+    /// A conversation pinned to an older revision that is still serving (a
+    /// rolling deploy) keeps it: the resume path never steals a live pin.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn ws_resume_keeps_an_existing_live_pin() {
+        let (tenant, key) = ("test-tenant", b"repin-ws-key".as_slice());
+        let dep_id = greentic_deploy_spec::ids::DeploymentId::new();
+        let new_rev = greentic_deploy_spec::ids::RevisionId::new();
+        let old_rev = greentic_deploy_spec::ids::RevisionId::new();
+        let bundle_id = greentic_deploy_spec::ids::BundleId::new("test.webchat");
+        let pin_store: std::sync::Arc<dyn crate::revision_pin::RevisionPinStore> =
+            std::sync::Arc::new(crate::revision_pin::InMemoryPinStore::new());
+        let activation = ws_test_activation(
+            "local",
+            tenant,
+            dep_id,
+            new_rev,
+            bundle_id.clone(),
+            key,
+            pin_store,
+        );
+        activation
+            .routing
+            .dispatcher
+            .apply_traffic_split(
+                dep_id,
+                vec![
+                    crate::revision_dispatcher::RevisionEntry {
+                        revision_id: new_rev,
+                        bundle_id: bundle_id.clone(),
+                        weight_bps: 5_000,
+                    },
+                    crate::revision_dispatcher::RevisionEntry {
+                        revision_id: old_rev,
+                        bundle_id: bundle_id.clone(),
+                        weight_bps: 5_000,
+                    },
+                ],
+                bundle_id,
+                1,
+            )
+            .expect("second revision");
+        activation
+            .routing
+            .dispatcher
+            .commit_pin(tenant, dep_id, "webchat:c-old", old_rev)
+            .await;
+        let (state, addr, accept) = ws_serve_fixture(activation).await;
+
+        let token = issue_test_token("c-old", tenant, key);
+        let url = format!(
+            "ws://{addr}/v1/messaging/webchat/{tenant}/v3/directline/conversations/c-old/stream?t={token}&watermark=0"
+        );
+        assert_eq!(ws_status(tokio_tungstenite::connect_async(&url).await), 101);
+        assert_eq!(
+            state
+                .current()
+                .routing
+                .dispatcher
+                .lookup_pin(tenant, dep_id, "webchat:c-old")
+                .await
+                .map(|(_, r)| r),
+            Some(old_rev),
+            "the live pin to the older revision must survive the resume"
+        );
+        accept.abort();
+    }
+
     /// Combined regression for the webchat token 502: the store is keyed the
     /// way greentic-setup/`SecretsSetup` persist (canonical underscore
     /// provider segment, tenant-level `_` team), the serve-path manager built
@@ -11302,8 +16009,11 @@ mod binary_update_tests {
                 std::env::remove_var(crate::secrets_gate::ENV_SERVE_SECRETS_BACKEND);
                 std::env::remove_var("GREENTIC_DEV_SECRETS_PATH");
             }
-            let resolved =
-                crate::secrets_gate::resolve_serve_secrets_manager(env_dir.path(), "demo");
+            let resolved = crate::secrets_gate::resolve_serve_secrets_manager(
+                env_dir.path(),
+                "demo",
+                crate::dev_store_path::EnvDirOrigin::Default,
+            );
             drop(guard);
             resolved.expect("serve secrets manager")
         };
@@ -11329,8 +16039,131 @@ mod binary_update_tests {
     }
 }
 
+#[cfg(test)]
+mod public_url_capture_tests {
+    use super::{PublicUrlCapture, try_capture_public_url};
+
+    /// Build a Cloud-Run-shaped request header map.
+    fn cr_headers(host: &str, trace: bool) -> hyper::HeaderMap {
+        let mut h = hyper::HeaderMap::new();
+        h.insert(hyper::header::HOST, host.parse().unwrap());
+        h.insert("x-forwarded-proto", "https".parse().unwrap());
+        if trace {
+            h.insert("x-cloud-trace-context", "abc/1;o=1".parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn try_capture_fires_for_own_service_host() {
+        // Exercises the actual handle_connection hook logic: a GFE-fronted
+        // request to this service's own run.app URL captures the base URL.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn try_capture_ignores_request_without_trace_context() {
+        // No X-Cloud-Trace-Context → not a GFE-fronted request → no capture.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", false));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_ignores_foreign_host_hijack() {
+        // Attacker-supplied Host that is not this service's own URL — the
+        // service-name pin must reject it (webhook-hijack defense).
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("evil.attacker.com", true));
+        try_capture_public_url(&cap, &cr_headers("othersvc-1.a.run.app", true));
+        assert_eq!(cap.get(), None);
+    }
+
+    #[test]
+    fn try_capture_is_noop_once_captured() {
+        // First valid capture wins; a later request cannot overwrite it, even
+        // one that would otherwise be valid.
+        let cap = PublicUrlCapture::new("gtc-svc-abc".to_string());
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-uc.a.run.app", true));
+        try_capture_public_url(&cap, &cr_headers("gtc-svc-abc-zz.a.run.app", true));
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://gtc-svc-abc-uc.a.run.app"),
+        );
+    }
+
+    #[test]
+    fn offer_sets_once_and_second_offer_is_ignored() {
+        let cap = PublicUrlCapture::default();
+        cap.offer("https://first.run.app".to_string());
+        cap.offer("https://second.run.app".to_string());
+        assert_eq!(
+            cap.get().map(String::as_str),
+            Some("https://first.run.app"),
+            "only the first offer should win",
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_resolves_after_offer() {
+        let cap = std::sync::Arc::new(PublicUrlCapture::default());
+        let cap2 = std::sync::Arc::clone(&cap);
+
+        let handle = tokio::spawn(async move { cap2.captured().await });
+
+        // Small yield to let the waiter register before the offer.
+        tokio::task::yield_now().await;
+        cap.offer("https://test.run.app".to_string());
+
+        let url = handle.await.expect("task should not panic");
+        assert_eq!(url, "https://test.run.app");
+    }
+
+    #[tokio::test]
+    async fn captured_returns_immediately_when_already_set() {
+        let cap = PublicUrlCapture::default();
+        cap.offer("https://already.run.app".to_string());
+
+        // Should return immediately — no waiting.
+        let url = cap.captured().await;
+        assert_eq!(url, "https://already.run.app");
+    }
+
+    #[tokio::test]
+    async fn captured_wakes_waiter_registered_before_offer() {
+        // Reproduces the race condition the plan warns about:
+        // the waiter registers notified() before re-checking get().
+        let cap = std::sync::Arc::new(PublicUrlCapture::default());
+        let cap2 = std::sync::Arc::clone(&cap);
+
+        let handle = tokio::spawn(async move { cap2.captured().await });
+
+        // Give the spawned task time to enter the loop and register notified().
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        cap.offer("https://race.run.app".to_string());
+
+        let url = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("should not time out")
+            .expect("task should not panic");
+        assert_eq!(url, "https://race.run.app");
+    }
+}
+
+#[cfg(test)]
+#[path = "revision_serve/interop_ingress_tests.rs"]
+mod interop_ingress_tests;
+
 #[path = "revision_serve/fast2flow_hook.rs"]
 mod fast2flow_hook;
+
+#[path = "revision_serve/client_caller.rs"]
+mod client_caller;
 
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_tests.rs"]
