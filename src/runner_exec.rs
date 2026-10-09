@@ -123,6 +123,62 @@ pub(crate) fn session_snapshot_path(
         .join(format!("{safe_id}.snapshot.json"))
 }
 
+/// The runner session id a conversation runs under inside one flow:
+/// `{pack}:{flow}:{conversation}`, so two flows or packs sharing a
+/// conversation id keep separate parked snapshots.
+pub(crate) fn flow_session_id(pack_label: &str, flow_id: &str, conversation: &str) -> String {
+    format!("{pack_label}:{flow_id}:{conversation}")
+}
+
+/// Directory the desktop runner persists a flow's parked snapshots in:
+/// `state/sessions/{tenant}/{team}/{pack}/{flow}`. Tenant- and team-scoped,
+/// so two workspaces never resume each other's conversations.
+pub(crate) fn session_state_dir(
+    root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    pack_label: &str,
+    flow_id: &str,
+) -> PathBuf {
+    root.join("state")
+        .join("sessions")
+        .join(tenant)
+        .join(team.unwrap_or("default"))
+        .join(pack_label)
+        .join(flow_id)
+}
+
+/// The file a conversation's parked `FlowSnapshot` lives in while `flow_id`
+/// is waiting on it. Present means "this flow is parked on this
+/// conversation"; the runner deletes it when the flow completes.
+///
+/// Mirrors `session_snapshot_file` in greentic-runner-desktop
+/// (`crates/greentic-runner-desktop/src/lib.rs`, checked at rev `b661e13`),
+/// which is private: every byte outside `[A-Za-z0-9-_.:]` becomes `_`. If the
+/// two ever drift, a parked flow reads as completed — callers degrade to
+/// routing the turn afresh rather than resuming, never to a wrong resume.
+pub(crate) fn session_snapshot_path(
+    root: &Path,
+    tenant: &str,
+    team: Option<&str>,
+    pack_label: &str,
+    flow_id: &str,
+    conversation: &str,
+) -> PathBuf {
+    let safe_id: String = flow_session_id(pack_label, flow_id, conversation)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    session_state_dir(root, tenant, team, pack_label, flow_id)
+        .join(format!("{safe_id}.snapshot.json"))
+}
+
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
     // Ensure flow.log is initialized in bundle's logs directory
     let _ = crate::flow_log::init(&request.root.join("logs"));
