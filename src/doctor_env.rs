@@ -793,6 +793,7 @@ mod tests {
 
     fn deployment(bundle: &str, status: BundleDeploymentStatus) -> BundleDeployment {
         BundleDeployment {
+            pack_name: None,
             schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
             deployment_id: DeploymentId::new(),
             env_id: crate::test_fixtures::env_id(),
