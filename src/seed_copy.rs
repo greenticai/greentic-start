@@ -58,6 +58,10 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::operator_log;
+use crate::seed_pointer::{self, BlobPuller};
+
+/// The seed file that may be a pointer (see [`crate::seed_pointer`]).
+const ENVIRONMENT_FILE: &str = "environment.json";
 
 /// Environment variable naming the read-only seed directory to copy into the
 /// env-store before boot. Unset on interactive/local runs (the step is a no-op).
@@ -133,7 +137,7 @@ pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<
         );
     }
 
-    let copied = copy_tree_into(&seed_canon, dest_root)
+    let copied = copy_tree_with(&seed_canon, dest_root, true, &seed_pointer::OciBlobPuller)
         .with_context(|| format!("seeding environment store from `{}`", seed_dir.display()))?;
     if copied == 0 {
         anyhow::bail!(
@@ -150,7 +154,19 @@ pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<
 /// destination directory component is refused (never followed), so the copy
 /// cannot escape the store through a redirected parent. Symlinks and special
 /// files in the source are skipped.
+#[cfg(test)]
 fn copy_tree_into(src: &Path, dst: &Path) -> anyhow::Result<u64> {
+    copy_tree_with(src, dst, true, &seed_pointer::OciBlobPuller)
+}
+
+/// `copy_tree_into` with the pointer puller injected. `top` is true only for the
+/// seed root, the one place `environment.json` can be a pointer.
+fn copy_tree_with(
+    src: &Path,
+    dst: &Path,
+    top: bool,
+    puller: &dyn BlobPuller,
+) -> anyhow::Result<u64> {
     // Never follow a symlinked destination directory component: writing through
     // it would escape the env store. Applied at every level via the recursion.
     if let Ok(meta) = fs::symlink_metadata(dst)
@@ -178,9 +194,13 @@ fn copy_tree_into(src: &Path, dst: &Path) -> anyhow::Result<u64> {
             .with_context(|| format!("inspecting `{}`", from.display()))?;
 
         if file_type.is_dir() {
-            copied += copy_tree_into(&from, &to)?;
+            copied += copy_tree_with(&from, &to, false, puller)?;
         } else if file_type.is_file() {
-            install_file(&from, &to)?;
+            if top && entry.file_name() == ENVIRONMENT_FILE {
+                install_environment_file(&from, &to, puller)?;
+            } else {
+                install_file(&from, &to)?;
+            }
             copied += 1;
         } else {
             operator_log::debug(
@@ -203,6 +223,38 @@ fn copy_tree_into(src: &Path, dst: &Path) -> anyhow::Result<u64> {
 /// destination — including a symlink — with a regular file, and a crash mid-copy
 /// leaves only the temp file, never a truncated `to`.
 fn install_file(from: &Path, to: &Path) -> anyhow::Result<()> {
+    install_with(to, |dst_f, tmp| {
+        let mut src_f = File::open(from)
+            .with_context(|| format!("opening seed source `{}`", from.display()))?;
+        io::copy(&mut src_f, dst_f)
+            .with_context(|| format!("copying `{}` -> `{}`", from.display(), tmp.display()))?;
+        Ok(())
+    })
+}
+
+/// Install the seed's `environment.json`. When it is a pointer
+/// (`$greentic_seed_pointer`), the verified real document is installed instead,
+/// with the same atomic 0600 install; otherwise the source bytes are copied
+/// exactly as `install_file` would.
+fn install_environment_file(from: &Path, to: &Path, puller: &dyn BlobPuller) -> anyhow::Result<()> {
+    let bytes =
+        fs::read(from).with_context(|| format!("reading seed environment `{}`", from.display()))?;
+    let resolved =
+        seed_pointer::resolve_if_pointer(&bytes, puller, seed_pointer::default_backoff())
+            .with_context(|| format!("resolving seed pointer in `{}`", from.display()))?;
+    let payload = resolved.as_deref().unwrap_or(&bytes);
+    install_with(to, |dst_f, tmp| {
+        io::Write::write_all(dst_f, payload)
+            .with_context(|| format!("writing environment to `{}`", tmp.display()))
+    })
+}
+
+/// Atomic install core: `fill` writes the content into a pid-scoped `O_EXCL`
+/// temp sibling of `to`, which is then forced `0600` and renamed over `to`.
+fn install_with(
+    to: &Path,
+    fill: impl FnOnce(&mut File, &Path) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     let parent = to
         .parent()
         .with_context(|| format!("destination `{}` has no parent directory", to.display()))?;
@@ -221,10 +273,7 @@ fn install_file(from: &Path, to: &Path) -> anyhow::Result<()> {
             .create_new(true)
             .open(&tmp)
             .with_context(|| format!("creating seed temp file `{}`", tmp.display()))?;
-        let mut src_f = File::open(from)
-            .with_context(|| format!("opening seed source `{}`", from.display()))?;
-        io::copy(&mut src_f, &mut dst_f)
-            .with_context(|| format!("copying `{}` -> `{}`", from.display(), tmp.display()))?;
+        fill(&mut dst_f, &tmp)?;
         drop(dst_f);
         set_writable(&tmp)?;
         fs::rename(&tmp, to)
@@ -399,6 +448,92 @@ mod tests {
         );
         // Nothing was written through the symlink into the outside directory.
         assert!(!outside.path().join("dev").exists());
+    }
+
+    struct FixedPuller(Result<Vec<u8>, String>);
+    impl BlobPuller for FixedPuller {
+        fn pull(&self, _uri: &str) -> anyhow::Result<Vec<u8>> {
+            self.0.clone().map_err(|m| anyhow::anyhow!(m))
+        }
+    }
+
+    fn pointer_for(real: &[u8]) -> Vec<u8> {
+        use sha2::{Digest, Sha256};
+        let sha: String = Sha256::digest(real)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        serde_json::to_vec(&serde_json::json!({
+            "$greentic_seed_pointer": 1, "kind": "oci",
+            "uri": "reg.example/p/env@sha256:abc", "sha256": sha, "size": real.len(),
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn inline_environment_json_is_copied_byte_identically() {
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        let inline = b"{ \"id\" : \"local\" }\n";
+        fs::write(src.path().join("environment.json"), inline).unwrap();
+        let puller = FixedPuller(Err("must not be called".into()));
+        copy_tree_with(src.path(), dst.path(), true, &puller).unwrap();
+        assert_eq!(
+            fs::read(dst.path().join("environment.json")).unwrap(),
+            inline
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pointer_environment_json_is_replaced_by_verified_bytes_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        let real = br#"{"id":"local","revisions":["many"]}"#;
+        fs::write(src.path().join("environment.json"), pointer_for(real)).unwrap();
+        fs::write(src.path().join(".dev.secrets.env"), b"S=1").unwrap();
+        let puller = FixedPuller(Ok(real.to_vec()));
+        let n = copy_tree_with(src.path(), dst.path(), true, &puller).unwrap();
+        assert_eq!(n, 2);
+        let landed = dst.path().join("environment.json");
+        assert_eq!(fs::read(&landed).unwrap(), real);
+        assert_eq!(
+            fs::metadata(&landed).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::read(dst.path().join(".dev.secrets.env")).unwrap(),
+            b"S=1"
+        );
+    }
+
+    #[test]
+    fn unverifiable_pointer_installs_nothing_and_leaves_no_temp() {
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        let real = br#"{"id":"local"}"#;
+        fs::write(src.path().join("environment.json"), pointer_for(real)).unwrap();
+        let puller = FixedPuller(Ok(br#"{"id":"EVIL"}"#.to_vec()));
+        let err = copy_tree_with(src.path(), dst.path(), true, &puller).unwrap_err();
+        assert!(format!("{err:#}").contains("refusing to install"));
+        assert!(!dst.path().join("environment.json").exists());
+        assert_eq!(fs::read_dir(dst.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_nested_environment_json_is_never_treated_as_a_pointer() {
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        fs::create_dir_all(src.path().join("sub")).unwrap();
+        let ptr = pointer_for(b"{}");
+        fs::write(src.path().join("sub/environment.json"), &ptr).unwrap();
+        let puller = FixedPuller(Err("must not be called".into()));
+        copy_tree_with(src.path(), dst.path(), true, &puller).unwrap();
+        assert_eq!(
+            fs::read(dst.path().join("sub/environment.json")).unwrap(),
+            ptr
+        );
     }
 
     #[test]

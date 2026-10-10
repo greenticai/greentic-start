@@ -93,6 +93,7 @@ use crate::ingress_types::IngressHttpResponse;
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::provider_auth;
+use crate::provider_auth_marker;
 use crate::provider_webhook_verify;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
@@ -5459,6 +5460,11 @@ async fn dispatch_provider_route(
     webchat_target: Option<&crate::webchat_routing::WebchatTarget>,
     flow_header: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    // The provider reads `x-greentic-auth-verified` as "the host authenticated
+    // this webhook". Only the host may set it, so a client-supplied occurrence
+    // is dropped here, before any gate or forwarding step can see it — on every
+    // route and whatever the gate below decides. See `provider_auth_marker`.
+    let request_headers = &provider_auth_marker::strip_reserved(request_headers);
     let Some(route_match) = activation
         .routing
         .http_routes
@@ -5549,15 +5555,19 @@ async fn dispatch_provider_route(
             && (norm_path == "/v3/directline/conversations"
                 || norm_path.ends_with("/conversations"))
         {
-            crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+            // Keyed on the CALLER's bearer (`request_headers`, not `dl_headers`
+            // after the rewrite above): the cached response carries a token
+            // bound to the new conversation.
+            crate::conv_dedup::create_key(
                 deployment_id,
-                tenant: route_tenant.clone(),
-                team: route_team.clone(),
-                user_id,
-                flow_hint: webchat_target
+                &route_tenant,
+                &route_team,
+                webchat_target
                     .and_then(|t| t.flow_id.clone())
                     .or_else(|| flow_header.map(str::to_string)),
-            })
+                body,
+                request_headers,
+            )
         } else {
             None
         };
@@ -5593,7 +5603,7 @@ async fn dispatch_provider_route(
     // endpoints provisioned before PR #246 have no `webhook_secret_ref` and
     // continue to identify-route by `provider_id`.
     let secrets = activation.host.secrets_manager();
-    let header_endpoint_id_authenticated = match provider_auth::authenticate_provider_webhook(
+    let auth_outcome = match provider_auth::authenticate_provider_webhook(
         activation.routing.endpoint_admit.as_ref(),
         &secrets,
         scope,
@@ -5602,10 +5612,17 @@ async fn dispatch_provider_route(
     )
     .await
     {
-        Ok(provider_auth::AuthOutcome::Authenticated(eid)) => Some(eid),
-        Ok(provider_auth::AuthOutcome::Skipped) => None,
+        Ok(outcome) => outcome,
         Err(response) => return Err(response),
     };
+    let header_endpoint_id_authenticated = match &auth_outcome {
+        provider_auth::AuthOutcome::Authenticated(eid) => Some(eid.clone()),
+        provider_auth::AuthOutcome::Skipped => None,
+    };
+    // Tell the provider the gate above passed (never for `Skipped`), so it may
+    // stamp a verified caller. `dl_headers` was copied from the stripped
+    // `request_headers`, so this is the only way the marker gets in.
+    provider_auth_marker::stamp_if_authenticated(&mut dl_headers, &auth_outcome);
     // Whether THIS host verified the request (a matched webhook secret above,
     // or a checked signature below). Inbound attachments resolve a remote
     // fetch reference only from a verified request.
@@ -6911,6 +6928,13 @@ fn extract_directline_provider_path(path: &str) -> String {
 /// `/token` → `POST /v3/directline/tokens/generate`
 /// `/directline/...` → `/v3/directline/...`
 fn normalize_directline_dispatch(method: &str, path: &str) -> (String, String) {
+    // Canonical case first: the session preflight, the dedup key, the
+    // revision pin, the streamUrl rewrite and the method forwarded to the
+    // provider all compare against `GET`/`POST`. A lower-case `get` used to
+    // skip the preflight and still reach the provider's (case-insensitive)
+    // router (G2 review).
+    let method = method.to_ascii_uppercase();
+    let method = method.as_str();
     if path == "/token" {
         return (
             "POST".to_string(),
@@ -10361,6 +10385,23 @@ mod tests {
     }
 
     // Category 2: normalize_directline_dispatch
+
+    #[test]
+    fn normalize_directline_dispatch_upper_cases_the_method() {
+        // Everything after it (the preflight, dedup, the revision pin, the
+        // streamUrl rewrite, the method forwarded to the provider) compares
+        // against the canonical spelling.
+        for raw in ["get", "Get", "gEt"] {
+            let (method, path) =
+                normalize_directline_dispatch(raw, "/v3/directline/conversations/c1");
+            assert_eq!(method, "GET", "{raw}");
+            assert_eq!(path, "/v3/directline/conversations/c1");
+            assert!(returns_stream_url(&method, &path), "{raw}");
+        }
+        let (method, path) = normalize_directline_dispatch("post", "/directline/conversations");
+        assert_eq!(method, "POST");
+        assert!(is_conversation_create(&method, &path));
+    }
 
     #[test]
     fn normalize_directline_dispatch_maps_token_to_canonical() {

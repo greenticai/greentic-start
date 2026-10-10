@@ -37,6 +37,10 @@ pub fn dispatch_http_ingress_with_op(
     ctx: &OperatorContext,
     op_name: &str,
 ) -> anyhow::Result<IngressDispatchResult> {
+    // This path runs no `provider_auth` gate, so the host-to-provider
+    // "authenticated" marker must never arrive on it: strip any client copy.
+    let sanitized = crate::provider_auth_marker::sanitize_ingress(request);
+    let request: &IngressRequestV1 = &sanitized;
     // Resolved once and shared by both branches: the provider_ingress extension
     // receives it through ingress@0.0.3, `ingest_http` through `HttpInV1.config`.
     let injected_config = build_injected_config(runner_host, domain, &request.provider, ctx);

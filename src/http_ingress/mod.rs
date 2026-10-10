@@ -57,7 +57,7 @@ use crate::static_handler::serve_static_route;
 use admin_relay::{
     AdminRelayConfig, handle_admin_relay, load_admin_relay_config_from_env, relay_target_path,
 };
-use conv_dedup::{ConversationDedupCache, DedupKey, extract_user_id};
+use conv_dedup::{ConversationDedupCache, create_key};
 use helpers::{
     build_http_response, collect_headers, collect_queries, cors_preflight_response, domain_name,
     error_response, handle_builtin_health_request, handle_oauth_callback,
@@ -1727,6 +1727,9 @@ fn apply_directline_forward_plan(
 }
 
 fn normalize_directline_dispatch(method: &Method, path: &str) -> (Method, String) {
+    // Canonical case first: the preflight, the dedup check and the method
+    // forwarded to the provider all compare against `GET`/`POST`.
+    let method = &directline_session::canonical_method(method);
     if path == "/token" {
         return (Method::POST, "/v3/directline/tokens/generate".to_string());
     }
@@ -1803,6 +1806,9 @@ where
     let provider_queries =
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let mut headers = collect_headers(req.headers());
+    // The caller's headers as received: the dedup key below hashes the bearer
+    // the caller presented, before the session preflight may rewrite it.
+    let caller_headers = headers.clone();
     let body = req
         .into_body()
         .collect()
@@ -1838,13 +1844,14 @@ where
         && (request.path == "/v3/directline/conversations"
             || request.path.ends_with("/conversations"))
     {
-        extract_user_id(&body).map(|user_id| DedupKey {
-            deployment_id: greentic_deploy_spec::DeploymentId::default(),
-            tenant: request.tenant.to_string(),
-            team: request.team.to_string(),
-            user_id,
-            flow_hint: None,
-        })
+        create_key(
+            greentic_deploy_spec::DeploymentId::default(),
+            request.tenant,
+            request.team,
+            None,
+            &body,
+            &caller_headers,
+        )
     } else {
         None
     };
@@ -3421,6 +3428,22 @@ mod tests {
                 "/v3/directline/conversations".to_string()
             ))
         );
+    }
+
+    #[test]
+    fn normalize_directline_dispatch_upper_cases_the_method() {
+        // The forwarded method, the dedup check and the streamUrl rewrite all
+        // compare against the canonical spelling.
+        for raw in ["get", "Get", "gEt"] {
+            let lower = Method::from_bytes(raw.as_bytes()).unwrap();
+            let (method, path) =
+                normalize_directline_dispatch(&lower, "/v3/directline/conversations/c1");
+            assert_eq!(method, Method::GET, "{raw}");
+            assert_eq!(path, "/v3/directline/conversations/c1");
+        }
+        let lower = Method::from_bytes(b"post").unwrap();
+        let (method, _) = normalize_directline_dispatch(&lower, "/directline/conversations");
+        assert_eq!(method, Method::POST);
     }
 
     #[test]

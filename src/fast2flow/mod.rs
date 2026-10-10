@@ -18,6 +18,7 @@ pub mod host_process;
 pub(crate) mod index_refresh;
 pub mod llm_router;
 pub mod mapper;
+pub(crate) mod pack_config;
 pub(crate) mod probe;
 pub(crate) mod revision_packs;
 #[cfg(all(test, unix))]
@@ -27,7 +28,7 @@ pub(crate) mod turn;
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
 pub use gate::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY, Fast2FlowGate};
-pub use host_process::invoke_routing_host_detailed;
+pub use host_process::invoke_routing_host_with_env;
 pub use llm_router::try_llm_route;
 pub use mapper::map_directive_to_control;
 
@@ -235,7 +236,8 @@ pub fn route_request_in_scope(
         now_unix_ms,
     };
 
-    let out = match invoke_routing_host_detailed(&cfg.host_bin, &input) {
+    let host_env = pack_host_env(pack_path);
+    let out = match invoke_routing_host_with_env(&cfg.host_bin, &input, &host_env) {
         Ok(out) => out,
         Err(reason) => {
             let line = format!(
@@ -299,6 +301,34 @@ pub fn route_request_in_scope(
 }
 
 /// (scope, reason) pairs already warned about as a failed routing host.
+/// Packs whose `assets/fast2flow.json` was unusable, reported once each.
+static PACK_CONFIG_WARNED: std::sync::LazyLock<index_refresh::WarnOnce<std::path::PathBuf>> =
+    std::sync::LazyLock::new(index_refresh::WarnOnce::default);
+
+/// The routing host's environment for this pack's turns: the pack's own
+/// threshold unless the operator pinned one on the process. An unusable
+/// settings file is reported once and the host keeps its defaults.
+fn pack_host_env(pack_path: &std::path::Path) -> Vec<(String, String)> {
+    let routing = match pack_config::read(pack_path) {
+        Ok(routing) => routing,
+        Err(reason) => {
+            if PACK_CONFIG_WARNED.first(pack_path.to_path_buf()) {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "[fast2flow] ignoring pack routing settings for {}: {reason}; \
+                         the routing host keeps its defaults",
+                        pack_path.display()
+                    ),
+                );
+            }
+            None
+        }
+    };
+    let operator = std::env::var(pack_config::ENV_MIN_CONFIDENCE).ok();
+    pack_config::host_env(routing, operator.as_deref())
+}
+
 static HOST_FAILURES_LOGGED: std::sync::LazyLock<index_refresh::WarnOnce<(String, String)>> =
     std::sync::LazyLock::new(Default::default);
 
