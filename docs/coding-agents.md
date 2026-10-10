@@ -327,6 +327,11 @@ failures on these endpoints carry a machine-readable `code`
   and the `directline_session_preflight` / `apply_directline_forward_plan` hooks
   in [src/http_ingress/mod.rs](/projects/ai/greentic-ng/greentic-start/src/http_ingress/mod.rs).
   Background: [docs/directline-token-renewal.md](/projects/ai/greentic-ng/greentic-start/docs/directline-token-renewal.md).
+- Conversation ownership: start never binds a conversation-less token to the
+  conversation in the URL; it refuses an anonymous one on reconnect /
+  `/activities` (`403 ConversationOwnerRequired`) and forwards a signed-in one
+  unchanged for the provider to decide. There is no switch to relax the
+  refusal. Methods are matched case-insensitively. See [docs/directline-conversation-ownership.md](directline-conversation-ownership.md).
 - WebSocket `/stream` keepalive (re-mint the pump's internal token, `touch` the
   window while connected) is not wired yet — follow-up.
 

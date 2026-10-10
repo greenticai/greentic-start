@@ -5510,15 +5510,19 @@ async fn dispatch_provider_route(
             && (norm_path == "/v3/directline/conversations"
                 || norm_path.ends_with("/conversations"))
         {
-            crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+            // Keyed on the CALLER's bearer (`request_headers`, not `dl_headers`
+            // after the rewrite above): the cached response carries a token
+            // bound to the new conversation.
+            crate::conv_dedup::create_key(
                 deployment_id,
-                tenant: route_tenant.clone(),
-                team: route_team.clone(),
-                user_id,
-                flow_hint: webchat_target
+                &route_tenant,
+                &route_team,
+                webchat_target
                     .and_then(|t| t.flow_id.clone())
                     .or_else(|| flow_header.map(str::to_string)),
-            })
+                body,
+                request_headers,
+            )
         } else {
             None
         };
@@ -6778,6 +6782,13 @@ fn extract_directline_provider_path(path: &str) -> String {
 /// `/token` → `POST /v3/directline/tokens/generate`
 /// `/directline/...` → `/v3/directline/...`
 fn normalize_directline_dispatch(method: &str, path: &str) -> (String, String) {
+    // Canonical case first: the session preflight, the dedup key, the
+    // revision pin, the streamUrl rewrite and the method forwarded to the
+    // provider all compare against `GET`/`POST`. A lower-case `get` used to
+    // skip the preflight and still reach the provider's (case-insensitive)
+    // router (G2 review).
+    let method = method.to_ascii_uppercase();
+    let method = method.as_str();
     if path == "/token" {
         return (
             "POST".to_string(),
@@ -10193,6 +10204,23 @@ mod tests {
     }
 
     // Category 2: normalize_directline_dispatch
+
+    #[test]
+    fn normalize_directline_dispatch_upper_cases_the_method() {
+        // Everything after it (the preflight, dedup, the revision pin, the
+        // streamUrl rewrite, the method forwarded to the provider) compares
+        // against the canonical spelling.
+        for raw in ["get", "Get", "gEt"] {
+            let (method, path) =
+                normalize_directline_dispatch(raw, "/v3/directline/conversations/c1");
+            assert_eq!(method, "GET", "{raw}");
+            assert_eq!(path, "/v3/directline/conversations/c1");
+            assert!(returns_stream_url(&method, &path), "{raw}");
+        }
+        let (method, path) = normalize_directline_dispatch("post", "/directline/conversations");
+        assert_eq!(method, "POST");
+        assert!(is_conversation_create(&method, &path));
+    }
 
     #[test]
     fn normalize_directline_dispatch_maps_token_to_canonical() {
