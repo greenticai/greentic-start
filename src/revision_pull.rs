@@ -430,6 +430,7 @@ mod tests {
             created_at: Utc.timestamp_opt(0, 0).unwrap(),
             bundle_digest: "sha256:00".to_string(),
             bundle_source_uri,
+            runtime_image_digest: None,
             pack_list: Vec::new(),
             pack_list_lock_ref: PathBuf::new(),
             pack_config_refs: Vec::new(),
