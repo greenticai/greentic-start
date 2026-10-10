@@ -352,6 +352,20 @@ the body is trusted, both inside `dispatch_provider_route`:
   `ingest_http` verifies nothing — without the gate a Slack webhook on this path
   was unauthenticated.
 
+**The authenticated-request marker.** When `provider_auth` returns
+`Authenticated` (the endpoint HAS a `webhook_secret_ref` and the inbound header
+matched it), the host adds the reserved header `x-greentic-auth-verified:
+telegram` to the `HttpInV1.headers` handed to the provider's `ingest_http`
+(`src/provider_auth_marker.rs`). The Telegram provider stamps a verified
+`extensions.caller` (private chats only) solely on that marker. Two rules keep
+it unforgeable: `dispatch_provider_route` strips every client-supplied
+occurrence (any case) before any gate runs, and the legacy `http_ingress` path
+strips it too (`ingress_dispatch`); the host stamps only for `Authenticated`,
+never for `Skipped`. A Telegram endpoint with no `webhook_secret_ref` is still
+admitted (legacy) but gets no marker, so no verified caller; the host logs a
+warning at most hourly per bundle naming the remedy, `greentic-deployer op
+messaging endpoint rotate-webhook-secret`.
+
 Two consequences to remember:
 
 - **It fails closed.** A Slack deployment with no `SLACK_SIGNING_SECRET`

@@ -92,6 +92,7 @@ use crate::ingress_types::IngressHttpResponse;
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::provider_auth;
+use crate::provider_auth_marker;
 use crate::provider_webhook_verify;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
@@ -5420,6 +5421,11 @@ async fn dispatch_provider_route(
     webchat_target: Option<&crate::webchat_routing::WebchatTarget>,
     flow_header: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    // The provider reads `x-greentic-auth-verified` as "the host authenticated
+    // this webhook". Only the host may set it, so a client-supplied occurrence
+    // is dropped here, before any gate or forwarding step can see it — on every
+    // route and whatever the gate below decides. See `provider_auth_marker`.
+    let request_headers = &provider_auth_marker::strip_reserved(request_headers);
     let Some(route_match) = activation
         .routing
         .http_routes
@@ -5558,7 +5564,7 @@ async fn dispatch_provider_route(
     // endpoints provisioned before PR #246 have no `webhook_secret_ref` and
     // continue to identify-route by `provider_id`.
     let secrets = activation.host.secrets_manager();
-    let header_endpoint_id_authenticated = match provider_auth::authenticate_provider_webhook(
+    let auth_outcome = match provider_auth::authenticate_provider_webhook(
         activation.routing.endpoint_admit.as_ref(),
         &secrets,
         scope,
@@ -5567,10 +5573,17 @@ async fn dispatch_provider_route(
     )
     .await
     {
-        Ok(provider_auth::AuthOutcome::Authenticated(eid)) => Some(eid),
-        Ok(provider_auth::AuthOutcome::Skipped) => None,
+        Ok(outcome) => outcome,
         Err(response) => return Err(response),
     };
+    let header_endpoint_id_authenticated = match &auth_outcome {
+        provider_auth::AuthOutcome::Authenticated(eid) => Some(eid.clone()),
+        provider_auth::AuthOutcome::Skipped => None,
+    };
+    // Tell the provider the gate above passed (never for `Skipped`), so it may
+    // stamp a verified caller. `dl_headers` was copied from the stripped
+    // `request_headers`, so this is the only way the marker gets in.
+    provider_auth_marker::stamp_if_authenticated(&mut dl_headers, &auth_outcome);
 
     // Transport-layer signature gate. `provider_auth` above covers providers
     // that authenticate with a shared secret in a header (Telegram); this

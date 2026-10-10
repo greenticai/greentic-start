@@ -81,6 +81,7 @@ mod port_utils;
 mod post_ingress_hooks;
 mod project;
 mod provider_auth;
+mod provider_auth_marker;
 pub mod provider_config_envelope;
 mod provider_webhook_verify;
 mod qa_persist;
