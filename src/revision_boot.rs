@@ -433,6 +433,53 @@ pub(crate) async fn activate_runtime_config(
     let secrets_env = crate::resolve_env(None);
     let mut meter_decisions =
         crate::interop::metering::runtime_meter::UnitMeterDecisions::default();
+    let mut attachments = HashMap::new();
+    let mut link_units = crate::artifacts::link_table::LinkTableBuilder::default();
+    // Inbound attachments, decided for every revision (carried ones included)
+    // from the unit's staged metering block, all doors probed side by side
+    // (each probe bounded), before any revision loads. A misconfigured door
+    // refuses the activation; a door that is down for now leaves the unit
+    // serving without attachments until a background re-probe turns them on.
+    crate::artifacts::unserved::warn_unserved_channels(env);
+    let mut activated_attachments = {
+        let mut planned = Vec::with_capacity(rc.revisions.len());
+        for block in &rc.revisions {
+            let meta = deployments
+                .get(block.deployment_id.as_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "deployment `{}` vanished between validation and activation",
+                        block.deployment_id
+                    )
+                })?;
+            let deployment_id = DeploymentId(parse_ulid(&block.deployment_id, "deployment_id")?);
+            let revision_id = RevisionId(parse_ulid(&block.revision_id, "revision_id")?);
+            let unit_metering = meter_decisions
+                .metering_for(
+                    host.secrets_manager().as_ref(),
+                    &secrets_env,
+                    &meta.tenant,
+                    &meta.bundle_id,
+                )
+                .await;
+            planned.push((
+                (deployment_id, revision_id),
+                block.revision_id.clone(),
+                unit_metering,
+            ));
+        }
+        let secrets: Arc<dyn crate::artifacts::fetch::SecretLookup> =
+            Arc::new(crate::artifacts::secrets::HostSecrets::new(
+                host.secrets_manager(),
+                secrets_env.clone(),
+            ));
+        crate::artifacts::activate::activate_all(
+            planned,
+            secrets,
+            crate::artifacts::activate::PROBE_BUDGET,
+        )
+        .await?
+    };
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
         // block's deployment is present, and registered a host config for its
@@ -612,6 +659,69 @@ pub(crate) async fn activate_runtime_config(
         // `Environment` entry the route table's `dep.bundle_id` comes from), so
         // boot and the serve path name the unit from ONE value. It equals
         // `block.bundle_id` by the cross-check in the validation loop above.
+        let crate::artifacts::activate::ActivatedUnit {
+            state: unit_state,
+            host: unit_artifacts,
+            recovery: unit_recovery,
+        } = activated_attachments
+            .remove(&(deployment_id, revision_id))
+            .ok_or_else(|| {
+                anyhow!(
+                    "revision `{}` has no attachments decision from the activation pass",
+                    block.revision_id
+                )
+            })?;
+        if matches!(
+            unit_state,
+            crate::artifacts::unit::UnitAttachments::Enabled { .. }
+        ) {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "inbound attachments enabled for revision `{}`",
+                    block.revision_id
+                ),
+            );
+        }
+        let unit_cell = Arc::new(crate::artifacts::unit::UnitCell::new(unit_state));
+        if let Some(recovery) = unit_recovery {
+            crate::artifacts::recovery::spawn_recovery(
+                Arc::downgrade(&unit_cell),
+                recovery,
+                crate::artifacts::recovery::RECOVERY_BACKOFF,
+            );
+        }
+        // The unit's signed-link signer (docs/outbound-artifacts.md). Every
+        // revision of one deployment (a traffic split) writes into the
+        // deployment's one provenance record and gates its one signer.
+        let unit_artifacts = unit_artifacts
+            .map(|access| link_units.share_recent(deployment_id, access.bound_to(&unit_cell)));
+        if let Some(access) = unit_artifacts.as_ref() {
+            let metering = if link_units.needs_signer(&deployment_id) {
+                meter_decisions
+                    .metering_for(
+                        host.secrets_manager().as_ref(),
+                        &secrets_env,
+                        &meta.tenant,
+                        &meta.bundle_id,
+                    )
+                    .await
+            } else {
+                None
+            };
+            link_units.add_revision(
+                deployment_id,
+                metering.as_ref(),
+                access,
+                &unit_cell,
+                &meta.bundle_id,
+            );
+        }
+        attachments.insert((deployment_id, revision_id), unit_cell);
+
+        // The agent's artifact reader and the extensions' artifact port come
+        // from THIS revision's own decision, over its own door: never another
+        // unit's door, never a host-wide port.
         let unit_options = meter_decisions
             .options_for_revision(
                 host.secrets_manager().as_ref(),
@@ -620,6 +730,7 @@ pub(crate) async fn activate_runtime_config(
                 deployment_id,
                 &meta.bundle_id,
                 revision_id,
+                unit_artifacts.as_ref(),
             )
             .await;
 
@@ -692,6 +803,8 @@ pub(crate) async fn activate_runtime_config(
         app_packs: pack_indexing.app_packs,
         triggers: crate::triggers::TriggerTable::build(trigger_entries, &trigger_prefixes),
         runtime_metered: meter_decisions.into_metered(),
+        attachments: crate::artifacts::unit::AttachmentsTable::new(attachments),
+        artifact_links: link_units.finish(),
     };
 
     // Commit only now that every revision loaded: `retained` holds exactly the
@@ -803,6 +916,8 @@ pub(crate) fn reactivate_routing_only(
         app_packs: prev.app_packs.clone(),
         triggers: prev.triggers.clone(),
         runtime_metered: prev.runtime_metered.clone(),
+        attachments: prev.attachments.clone(),
+        artifact_links: prev.artifact_links.clone(),
         deployment_routes,
         bundle_index,
         endpoint_admit: Arc::new(EndpointAdmit::from_environment(env)),
@@ -2664,6 +2779,8 @@ mod tests {
             app_packs: index.app_packs,
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
+            artifact_links: Default::default(),
         };
         let next = reactivate_routing_only(&prev, &env);
         let got = next.app_packs.get("fast2flow", rev).expect("carried");

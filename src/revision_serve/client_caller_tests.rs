@@ -293,6 +293,10 @@ fn every_runner_entry_is_fed_by_a_builder_that_decided_about_the_caller() {
         "build_activity must strip a client-supplied caller"
     );
     assert!(
+        code_only(fn_body(&serve, "build_activity")).contains("strip_reserved_json("),
+        "build_activity must strip client-supplied artifact references and host notes"
+    );
+    assert!(
         !code_only(fn_body(&serve, "envelope_to_activity")).contains("without_client_caller("),
         "the provider path must keep the provider-stamped caller"
     );

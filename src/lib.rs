@@ -12,6 +12,14 @@ mod agent_provenance;
 // bridge against a real NATS without a bundle or a Slack workspace.
 #[doc(hidden)]
 pub mod approval_rail;
+mod artifacts;
+/// Test-only access to the isolated PDF text worker, for
+/// `tests/artifacts_pdf_isolation.rs`, which drives the real binary.
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod artifacts_test_support {
+    pub use crate::artifacts::pdf_isolation::pdf_text_via;
+}
 mod bin_resolver;
 mod bundle_config;
 mod bundle_ref;
@@ -52,12 +60,14 @@ mod http_helpers;
 mod http_ingress;
 mod http_routes;
 mod identify_payload;
+mod inbound_verify;
 mod ingress;
 mod ingress_auth;
 mod ingress_dispatch;
 #[doc(hidden)]
 pub mod ingress_types;
 mod interop;
+mod jwks_cache;
 mod llm;
 #[doc(hidden)]
 pub mod messaging_app;
@@ -360,6 +370,12 @@ fn stop_env_runtime(env_dir: &std::path::Path, env_id: &str) -> anyhow::Result<(
 }
 
 pub fn run_from_env() -> anyhow::Result<()> {
+    // Re-executed as the isolated PDF text worker (src/artifacts): do that and
+    // nothing else, before any argument parsing or runtime start-up.
+    if let Some(code) = artifacts::pdf_isolation::run_worker_if_invoked() {
+        std::process::exit(code);
+    }
+    artifacts::pdf_isolation::enable_worker_from_current_exe();
     let raw_tail: Vec<String> = std::env::args().skip(1).collect();
     let tunnel_explicit = raw_tail.iter().any(|a| {
         a.starts_with("--cloudflared") || a.starts_with("--ngrok") || a.starts_with("--gtunnel")
@@ -1079,6 +1095,9 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 let service = std::env::var("K_SERVICE").unwrap_or_default();
                 std::sync::Arc::new(revision_serve::PublicUrlCapture::new(service))
             });
+        // Filled once the tunnel (if any) is up, below; read only by signed
+        // artifact links (docs/outbound-artifacts.md).
+        let tunnel_public_url = std::sync::Arc::new(std::sync::OnceLock::new());
         let server = revision_serve::RevisionServer::start(revision_serve::RevisionServeConfig {
             bind_addr,
             activation: std::sync::Arc::clone(&activation),
@@ -1090,6 +1109,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             exe_path: Some(own_exe.clone()),
             public_base_url: boot_configured_url.clone(),
             public_url_capture: cloud_run_capture.clone(),
+            tunnel_public_url: std::sync::Arc::clone(&tunnel_public_url),
         })
         .context("starting the revision ingress server")?;
         let listen = std::net::SocketAddr::new(bind_addr.ip(), server.actual_port());
@@ -1172,6 +1192,8 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
             &log_dir,
         )?;
         let tunnel_url = tunnel.map(|t| {
+            // First writer wins; this is the only writer.
+            let _ = tunnel_public_url.set(t.url.clone());
             let line = format!("public URL: {} ({} tunnel)", t.url, t.service);
             operator_log::info(module_path!(), line.clone());
             println!("{line}");
@@ -3544,6 +3566,8 @@ mod tests {
             app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
+            artifact_links: Default::default(),
         }
     }
 

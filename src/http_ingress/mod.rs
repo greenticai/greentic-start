@@ -1,8 +1,16 @@
 mod admin_relay;
+mod client_key;
+#[cfg(test)]
+mod client_key_tests;
 mod conv_dedup;
+#[cfg(test)]
+mod conversation_key_tests;
 mod directline_session;
 mod flow_owner;
 mod helpers;
+pub(crate) mod limits;
+#[cfg(test)]
+mod limits_tests;
 mod messaging;
 mod setup_gate;
 pub(crate) use messaging::decode_injected_config_for_provider;
@@ -2671,6 +2679,8 @@ mod tests {
             app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
+            artifact_links: Default::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));
@@ -2720,6 +2730,8 @@ mod tests {
             app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
+            artifact_links: Default::default(),
         };
 
         let state = runtime.block_on(build_test_state(vec![Domain::Events], Some(routing)));

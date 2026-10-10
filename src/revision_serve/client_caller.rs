@@ -50,3 +50,7 @@ pub(super) fn without_client_caller(payload: &Value) -> Value {
 #[cfg(test)]
 #[path = "client_caller_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "client_artifacts_tests.rs"]
+mod artifacts_tests;

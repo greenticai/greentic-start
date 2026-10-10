@@ -28,8 +28,9 @@ pub(super) fn route_messaging_envelopes(
     runner_host: &Arc<DemoRunnerHost>,
     provider: &str,
     ctx: &OperatorContext,
-    envelopes: Vec<ChannelMessageEnvelope>,
+    mut envelopes: Vec<ChannelMessageEnvelope>,
 ) -> anyhow::Result<()> {
+    crate::artifacts::legacy::declare_unserved(&mut envelopes);
     let team = ctx.team.as_deref();
     let app_pack_path = app::resolve_app_pack_path(bundle, &ctx.tenant, team, None)
         .context("resolve app pack for messaging pipeline")?;
@@ -119,6 +120,8 @@ pub(super) fn route_messaging_envelopes(
             // `{{i18n:KEY}}` tokens.  Re-read the card from the pack and apply
             // i18n as a safety net.
             ensure_card_i18n_resolved(&mut out_envelope, &app_pack_path);
+            // No raw `artifact://` url leaves this host (docs/outbound-artifacts.md).
+            crate::artifacts::outbound::strip_logged(&mut out_envelope);
 
             // Standard egress pipeline: render → encode → send_payload.
             // All providers (including webchat) use this path. The webchat provider's

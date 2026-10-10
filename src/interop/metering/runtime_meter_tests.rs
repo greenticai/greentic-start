@@ -16,11 +16,11 @@ use super::*;
 use crate::interop::config::InteropConfig;
 
 const ENDPOINT: &str = "https://admin.example/api/v1/ingest/worker-usage";
-const TOKEN: &str = "gtm_staged-usage-token";
+pub(super) const TOKEN: &str = "gtm_staged-usage-token";
 const TENANT: &str = "acme";
-const BUNDLE: &str = "support-bot";
+pub(super) const BUNDLE: &str = "support-bot";
 
-fn metering() -> MeteringConfig {
+pub(super) fn metering() -> MeteringConfig {
     MeteringConfig {
         endpoint: ENDPOINT.into(),
         token: MeteringToken(TOKEN.into()),
@@ -38,7 +38,7 @@ fn metering() -> MeteringConfig {
 /// `operala-in-process` (Cargo.toml), and `host_options_for_unit` would not
 /// compile without it; the assertion below turns a silent loss of the feature
 /// (every option reading "no meter") into a loud failure.
-fn installs_a_meter(options: &RevisionHostOptions) -> bool {
+pub(super) fn installs_a_meter(options: &RevisionHostOptions) -> bool {
     let rendered = format!("{options:?}");
     assert!(
         rendered.contains("billing_meter"),
@@ -97,6 +97,7 @@ fn a_staged_block_installs_the_worker_usage_meter() {
         DeploymentId::new(),
         BUNDLE,
         RevisionId::new(),
+        None,
     );
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
@@ -129,7 +130,7 @@ fn an_absent_block_keeps_the_default_options() {
             .expect("absence is not an error")
             .is_none()
     );
-    let unit = host_options_for_unit(None, DeploymentId::new(), BUNDLE, RevisionId::new());
+    let unit = host_options_for_unit(None, DeploymentId::new(), BUNDLE, RevisionId::new(), None);
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
@@ -145,7 +146,13 @@ fn an_absent_block_keeps_the_default_options() {
 fn an_underivable_run_outcome_door_keeps_the_meter_and_drops_only_the_sink() {
     let mut block = metering();
     block.endpoint = "https://admin.example/api/v1/ingest/other".into();
-    let unit = host_options_for_unit(Some(&block), DeploymentId::new(), BUNDLE, RevisionId::new());
+    let unit = host_options_for_unit(
+        Some(&block),
+        DeploymentId::new(),
+        BUNDLE,
+        RevisionId::new(),
+        None,
+    );
     assert!(unit.meters_usage);
     assert!(installs_a_meter(&unit.options));
     assert!(!installs_a_sink(&unit.options));
@@ -176,6 +183,7 @@ fn a_meter_that_cannot_be_built_leaves_the_revision_unmetered() {
         DeploymentId::new(),
         &too_long,
         RevisionId::new(),
+        None,
     );
     assert!(!unit.meters_usage);
     assert!(!installs_a_meter(&unit.options));
@@ -423,7 +431,15 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
     let plain = DeploymentId::new();
     let mut decisions = UnitMeterDecisions::default();
     let options = decisions
-        .options_for_revision(&store, "local", TENANT, metered, BUNDLE, RevisionId::new())
+        .options_for_revision(
+            &store,
+            "local",
+            TENANT,
+            metered,
+            BUNDLE,
+            RevisionId::new(),
+            None,
+        )
         .await;
     assert!(installs_a_meter(&options));
     assert!(
@@ -438,6 +454,7 @@ async fn boot_records_exactly_the_units_it_installed_a_meter_for() {
             plain,
             "plain-bot",
             RevisionId::new(),
+            None,
         )
         .await;
     assert!(!installs_a_meter(&options));

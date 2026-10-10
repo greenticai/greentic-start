@@ -398,6 +398,14 @@ pub struct RevisionIngressRouting {
     /// carries it over; the interop reporter reads it to record tokens from
     /// ONE source (see [`crate::interop::metering::runtime_meter`]).
     pub(crate) runtime_metered: crate::interop::metering::runtime_meter::RuntimeMeteredDeployments,
+    /// Each loaded revision's inbound attachments decision (on, off and why),
+    /// taken at activation. Revision-derived like `runtime_metered`, so a
+    /// routing-only reload carries it over unchanged.
+    pub(crate) attachments: crate::artifacts::unit::AttachmentsTable,
+    /// Each unit's signed artifact-link signer, keyed by deployment
+    /// (docs/outbound-artifacts.md). Revision-derived like `attachments`: a
+    /// routing-only reload carries it over unchanged.
+    pub(crate) artifact_links: crate::artifacts::link_table::ArtifactLinkTable,
 }
 
 /// Strip a trailing `:port` from a host header value. IPv6 literals are bracketed

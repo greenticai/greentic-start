@@ -156,7 +156,8 @@ async fn a_handshake_that_never_completes_is_a_connect_timeout() {
 /// and the detail carries the OS's own word for it.
 #[tokio::test]
 async fn a_refused_connection_is_a_connect_failure_and_says_so() {
-    let port = closed_port().await;
+    let closed = closed_port().await;
+    let port = closed.port;
     let client = test_client(Duration::from_secs(2), Duration::from_secs(5));
     let err = client
         .post(format!("http://127.0.0.1:{port}/ingest"))
