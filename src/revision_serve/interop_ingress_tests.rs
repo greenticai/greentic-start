@@ -357,6 +357,19 @@ impl Exchange {
 
 /// Serve `state` on a fresh loopback listener and send one request.
 async fn exchange(state: &Arc<ServeState>, trust_loopback_peers: bool, request: &str) -> Exchange {
+    exchange_raw(state, trust_loopback_peers, request.as_bytes()).await
+}
+
+/// The same, for a request that is not valid UTF-8.
+async fn exchange_bytes(state: &Arc<ServeState>, request: &[u8]) -> Exchange {
+    exchange_raw(state, false, request).await
+}
+
+async fn exchange_raw(
+    state: &Arc<ServeState>,
+    trust_loopback_peers: bool,
+    request: &[u8],
+) -> Exchange {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind");
@@ -371,7 +384,7 @@ async fn exchange(state: &Arc<ServeState>, trust_loopback_peers: bool, request: 
     // A write error is tolerated: a server that refuses before reading the
     // whole body (an unauthenticated oversized POST, say) legitimately closes
     // the connection mid-write, and the RESPONSE is what this asserts on.
-    let _ = stream.write_all(request.as_bytes()).await;
+    let _ = stream.write_all(request).await;
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).await.expect("read response");
     accept.await.expect("accept loop");
@@ -2059,4 +2072,23 @@ async fn a_public_unit_advertises_no_bearer_scheme_and_a_private_one_does() {
         card["securityRequirements"].as_array().map(Vec::len),
         Some(1)
     );
+}
+
+/// A non-ASCII `Authorization` header is a credential presented and invalid:
+/// 401 on a public unit on both surfaces, never an anonymous turn.
+#[tokio::test]
+async fn an_unreadable_authorization_header_is_refused_on_a_public_unit() {
+    let state = public_state(public_access(20, None));
+    let body = send_message_body("c-1");
+    let mut raw = format!(
+        "POST /a2a HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\nAuthorization: Bearer ",
+        body.len()
+    )
+    .into_bytes();
+    raw.extend_from_slice(&[0xE9, 0xFF]);
+    raw.extend_from_slice(b"\r\n\r\n");
+    raw.extend_from_slice(body.as_bytes());
+    let response = exchange_bytes(&state, &raw).await;
+    assert_eq!(response.status, 401, "{}", response.body);
 }

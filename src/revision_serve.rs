@@ -1394,6 +1394,10 @@ async fn serve(
     // Phase 0b: read before the body consumes `req`. Only the generic-JSON
     // branch reads it; provider routes carry their own verification.
     let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
+    // Present but not text (non-ASCII): the interop gate counts that as a
+    // credential presented and invalid, not as none.
+    let authorization_unreadable =
+        authorization_header.is_none() && req.headers().contains_key(header::AUTHORIZATION);
     let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
     let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
     let mcp_method_header = header_str(req.headers(), crate::interop::mcp::MCP_METHOD_HEADER);
@@ -1467,6 +1471,7 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: if_none_match.as_deref(),
                         mcp_method: None,
+                        authorization_unreadable,
                         client: &interop_client,
                     },
                 )
@@ -1497,6 +1502,7 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: None,
                         mcp_method: mcp_method_header.as_deref(),
+                        authorization_unreadable,
                         client: &interop_client,
                     },
                 )
@@ -2250,10 +2256,14 @@ async fn serve_interop_inner(
     // `Authorization` header, so an unauthenticated peer must not be able to
     // make this process read (and buffer) a megabyte per request. `/mcp`
     // already had this order; this path did not.
-    let caller =
-        crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization, headers.client)
-            .await
-            .map_err(|response| *response)?;
+    let caller = crate::interop::a2a::rpc::authenticate(
+        &ctx,
+        headers.authorization,
+        headers.authorization_unreadable,
+        headers.client,
+    )
+    .await
+    .map_err(|response| *response)?;
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         trace.outcome(crate::interop::telemetry::Outcome::Rejected);
         error_response(
@@ -2350,6 +2360,7 @@ async fn serve_mcp(
         &unit.config,
         resource.as_deref(),
         authorization,
+        headers.authorization_unreadable,
         crate::ingress_auth::now_ms(),
         headers.client,
     )
@@ -2526,6 +2537,8 @@ impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
 /// consumed.
 struct InteropRequestHeaders<'a> {
     authorization: Option<&'a str>,
+    /// An `Authorization` header was sent that could not be read as text.
+    authorization_unreadable: bool,
     /// `A2A-Version`.
     version: Option<&'a str>,
     query: Option<&'a str>,

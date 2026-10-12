@@ -177,7 +177,7 @@ async fn rpc_call(
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
     let ctx = fixture.ctx();
-    match crate::interop::a2a::rpc::authenticate(&ctx, authorization, "test-client").await {
+    match crate::interop::a2a::rpc::authenticate(&ctx, authorization, false, "test-client").await {
         Ok(caller) => handle_jsonrpc(&ctx, req, &caller, runner).await,
         Err(response) => *response,
     }
@@ -191,7 +191,7 @@ async fn rest_call(
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
     let ctx = fixture.ctx();
-    match crate::interop::a2a::rpc::authenticate(&ctx, authorization, "test-client").await {
+    match crate::interop::a2a::rpc::authenticate(&ctx, authorization, false, "test-client").await {
         Ok(caller) => handle_rest_send(&ctx, req, &caller, runner).await,
         Err(response) => *response,
     }
@@ -892,7 +892,7 @@ async fn an_anonymous_turn_is_recorded_as_anonymous_with_no_credential() {
     let fixture = Fixture::new(config);
     let runner = FakeRunner::replying(vec![dw_agent_reply("ok")]);
     let body = rpc(methods::SEND_MESSAGE, send_params(Some("ctx-a")));
-    let caller = match authenticate(&fixture.ctx(), None, "203.0.113.7").await {
+    let caller = match authenticate(&fixture.ctx(), None, false, "203.0.113.7").await {
         Ok(caller) => caller,
         Err(response) => panic!("a public unit must serve it: {}", response.status()),
     };
@@ -929,7 +929,7 @@ async fn a_staged_credentials_event_carries_no_caller_kind() {
 #[tokio::test]
 async fn a_private_unit_answers_no_credential_with_a_challenge() {
     let fixture = Fixture::new(config());
-    let refused = authenticate(&fixture.ctx(), None, "c").await;
+    let refused = authenticate(&fixture.ctx(), None, false, "c").await;
     let Err(response) = refused else {
         panic!("a private unit must refuse a request with no credential");
     };

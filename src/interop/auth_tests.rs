@@ -50,7 +50,7 @@ fn bearer(token: &str) -> String {
 }
 
 async fn gate(config: &InteropConfig, audience: Option<&str>, header: Option<&str>) -> Auth {
-    authenticate(config, audience, header, 0, CLIENT).await
+    authenticate(config, audience, header, false, 0, CLIENT).await
 }
 
 /// A Direct Line style token: HS256 under a provider signing key, naming this
@@ -434,4 +434,19 @@ async fn an_hmac_token_in_the_other_hmac_widths_is_a_direct_line_token_too() {
     }
     assert!(!is_direct_line_token("not-a-jwt"));
     assert!(!is_direct_line_token(BEARER_TOKEN));
+}
+
+/// A header that is present but not text is a credential the caller tried to
+/// present: a 401 on a public unit, never anonymous.
+#[tokio::test]
+async fn an_unreadable_authorization_header_is_presented_and_invalid() {
+    let cfg = config(None, public(&[Mechanism::ApiKey, Mechanism::Oauth]));
+    let outcome = authenticate(&cfg, Some(A2A_RESOURCE), None, true, 0, CLIENT).await;
+    assert_eq!(outcome, Auth::Unauthorized);
+    let private = config(None, both());
+    let outcome = authenticate(&private, Some(A2A_RESOURCE), None, true, 0, CLIENT).await;
+    assert_eq!(outcome, Auth::Unauthorized);
+    // The same request with the header genuinely absent is still anonymous.
+    let outcome = authenticate(&cfg, Some(A2A_RESOURCE), None, false, 0, CLIENT).await;
+    assert_eq!(outcome, Auth::Allowed(Caller::anonymous(CLIENT)));
 }

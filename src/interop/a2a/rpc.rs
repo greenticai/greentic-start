@@ -83,12 +83,14 @@ pub(crate) trait TurnRunner: Send + Sync {
 pub(crate) async fn authenticate(
     ctx: &A2aContext<'_>,
     authorization: Option<&str>,
+    unreadable: bool,
     client: &str,
 ) -> Result<Caller, Box<HttpResponse>> {
     match crate::interop::auth::authenticate(
         ctx.config,
         ctx.config.a2a_resource.as_deref(),
         authorization,
+        unreadable,
         ctx.now_ms,
         client,
     )

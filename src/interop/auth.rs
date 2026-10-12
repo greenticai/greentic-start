@@ -38,7 +38,13 @@ enum Presented<'a> {
     Token(&'a str),
 }
 
-fn presented(authorization: Option<&str>) -> Presented<'_> {
+fn presented(authorization: Option<&str>, unreadable: bool) -> Presented<'_> {
+    // A header that is there but is not text (non-ASCII bytes) is a credential
+    // the caller tried to present, not an absent one: on a public unit it must
+    // be a 401, not anonymous.
+    if unreadable {
+        return Presented::Malformed;
+    }
     match authorization.map(str::trim) {
         None | Some("") => Presented::Nothing,
         Some(_) => match bearer_token(authorization) {
@@ -80,17 +86,19 @@ fn oauth_available(config: &InteropConfig, audience: Option<&str>) -> bool {
 /// refused (and logged once) rather than quietly weakened. The default policy
 /// (no `access` block) lists both mechanisms, so its bearer is accepted
 /// whether or not OAuth is available, exactly as before the policy existed.
-/// `client` labels the peer for an anonymous caller.
+/// `client` labels the peer for an anonymous caller. `unreadable` says the
+/// request carried an `Authorization` header that could not be read as text.
 pub(crate) async fn authenticate(
     config: &InteropConfig,
     audience: Option<&str>,
     authorization: Option<&str>,
+    unreadable: bool,
     now_ms: u64,
     client: &str,
 ) -> Auth {
     let public = config.access.visibility == Visibility::Public;
     let anonymous = || McpAuth::Allowed(Caller::anonymous(client));
-    let token = match presented(authorization) {
+    let token = match presented(authorization, unreadable) {
         Presented::Nothing => {
             return if public {
                 anonymous()
