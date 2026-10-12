@@ -83,7 +83,8 @@ context id is the caller's own choice:
   request gets a fresh random namespace, so nothing can be continued or read
   across callers. A public unit read with hops 0 logs this once.
 
-The `anon_` prefix is reserved: an OAuth token whose `sub` starts with it is
+The `anon_` prefix is reserved: a staged credential id starting with it is dropped
+at parse time (error log), and an OAuth token whose `sub` starts with it is
 refused. An `Authorization` header that is present but unreadable (non-ASCII) is
 a presented, invalid credential (401), not an absent one.
 

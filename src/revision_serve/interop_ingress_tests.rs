@@ -2092,3 +2092,33 @@ async fn an_unreadable_authorization_header_is_refused_on_a_public_unit() {
     let response = exchange_bytes(&state, &raw).await;
     assert_eq!(response.status, 401, "{}", response.body);
 }
+
+/// A staged credential whose id is in the reserved anonymous namespace is
+/// dropped at parse time: its bearer authenticates nothing, while a sibling
+/// credential in the same document keeps working.
+#[tokio::test]
+async fn a_credential_in_the_anonymous_namespace_authenticates_nothing() {
+    let mut doc: Value = serde_json::from_slice(&staged_config(true)).expect("doc");
+    let sha = |token: &str| {
+        Sha256::digest(token.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    doc["credentials"] = json!([
+        {"id": "anon_evil", "sha256": sha("gtw_evil-token")},
+        {"id": "c_ok", "sha256": sha(TOKEN)}
+    ]);
+    let (activation, _) = activation_with(Store::Custom(doc.to_string().into_bytes()));
+    let state = state_with(activation, interop_with_base_url(reply_ok()));
+    let evil = [("Authorization", "Bearer gtw_evil-token")];
+    let response = exchange(&state, false, &post("/a2a", &evil, &send_message_body("c"))).await;
+    assert_eq!(response.status, 401, "{}", response.body);
+    let response = exchange(
+        &state,
+        false,
+        &post("/a2a", &[AUTH], &send_message_body("c")),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+}

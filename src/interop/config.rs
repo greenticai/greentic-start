@@ -475,6 +475,21 @@ fn parse_credential(entry: Value, unit: &str) -> Option<Credential> {
             return None;
         }
     };
+    // `anon_` is the namespace of anonymous callers. A credential in it would
+    // authenticate into an anonymous caller's session namespace, so it is
+    // dropped like any malformed one: that can only refuse a caller.
+    if raw.id.starts_with(crate::interop::caller::ANONYMOUS_PREFIX) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "interop config for unit `{unit}`: dropping credential `{}`: the `{}` id prefix \
+                 is reserved for anonymous callers",
+                raw.id,
+                crate::interop::caller::ANONYMOUS_PREFIX
+            ),
+        );
+        return None;
+    }
     if !valid_credential_id(&raw.id) {
         warn(
             unit,
@@ -628,6 +643,22 @@ mod tests {
         let config = parse(doc.to_string().as_bytes(), "unit").expect("parses");
         let ids: Vec<_> = config.credentials.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["ok"]);
+    }
+
+    #[test]
+    fn a_credential_in_the_reserved_anonymous_namespace_is_dropped_alone() {
+        let doc = json!({
+            "v": 1,
+            "credentials": [
+                {"id": "anon_evil", "sha256": HASH},
+                {"id": "anon_", "sha256": HASH},
+                {"id": "c_01J", "sha256": HASH},
+                {"id": "anonymous", "sha256": HASH}
+            ]
+        });
+        let config = parse(doc.to_string().as_bytes(), "unit").expect("parses");
+        let ids: Vec<_> = config.credentials.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["c_01J", "anonymous"]);
     }
 
     #[test]
