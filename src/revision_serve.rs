@@ -1394,6 +1394,10 @@ async fn serve(
     // Phase 0b: read before the body consumes `req`. Only the generic-JSON
     // branch reads it; provider routes carry their own verification.
     let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
+    // Present but not text (non-ASCII): the interop gate counts that as a
+    // credential presented and invalid, not as none.
+    let authorization_unreadable =
+        authorization_header.is_none() && req.headers().contains_key(header::AUTHORIZATION);
     let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
     let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
     let mcp_method_header = header_str(req.headers(), crate::interop::mcp::MCP_METHOD_HEADER);
@@ -1427,6 +1431,22 @@ async fn serve(
         .deployment_routes
         .resolve_mount(host_header.as_deref(), &path);
     let interop_path = interop_mount.map_or(path.as_str(), |mount| mount.remainder(&path));
+    // Only an interop request needs the client behind it, and only a public
+    // unit uses it; computed here because `req` is consumed below.
+    let interop_client = if interop_mount.is_some()
+        && (crate::interop::a2a::route_for(interop_path).is_some()
+            || crate::interop::mcp::route_for(interop_path).is_some())
+    {
+        crate::interop::anonymous::client_label(
+            req.extensions()
+                .get::<crate::http_ingress::limits::PeerIp>()
+                .map(|peer| peer.0),
+            req.headers(),
+            state.interop.trusted_proxy_hops,
+        )
+    } else {
+        None
+    };
 
     // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
     // provider routing, and only for a unit whose staged config enables the
@@ -1451,6 +1471,8 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: if_none_match.as_deref(),
                         mcp_method: None,
+                        authorization_unreadable,
+                        client: interop_client.as_deref(),
                     },
                 )
                 .await;
@@ -1480,6 +1502,8 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: None,
                         mcp_method: mcp_method_header.as_deref(),
+                        authorization_unreadable,
+                        client: interop_client.as_deref(),
                     },
                 )
                 .await;
@@ -2004,15 +2028,47 @@ async fn resolve_interop_unit(
                 "the ingress credential store is unavailable",
             )
         })?;
-    Ok(config
-        .filter(|config| feature.enabled_in(config))
-        .map(|config| InteropUnit {
-            deployment_id,
-            tenant,
-            bundle_id,
-            mount: mount.prefix.to_string(),
-            config,
-        }))
+    let config = config.filter(|config| feature.enabled_in(config));
+    if let Some(config) = config.as_ref() {
+        warn_public_unit_without_proxy_hops(state, &bundle_id, config);
+    }
+    Ok(config.map(|config| InteropUnit {
+        deployment_id,
+        tenant,
+        bundle_id,
+        mount: mount.prefix.to_string(),
+        config,
+    }))
+}
+
+/// Say once per unit, the first time its config is read, that a PUBLIC unit is
+/// served with no trusted proxy hop: behind a load balancer every anonymous
+/// caller then looks like one client, so none gets a per-client bucket and none
+/// can continue a conversation. Set `GREENTIC_TRUSTED_PROXY_HOPS` to the number
+/// of proxies that append to `X-Forwarded-For`.
+fn warn_public_unit_without_proxy_hops(
+    state: &ServeState,
+    bundle_id: &str,
+    config: &crate::interop::config::InteropConfig,
+) {
+    static SAID: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if !config.access.is_public() || state.interop.trusted_proxy_hops > 0 {
+        return;
+    }
+    let first = SAID
+        .lock()
+        .is_ok_and(|mut said| said.len() < 1024 && said.insert(bundle_id.to_string()));
+    if first {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "unit `{bundle_id}` is public but GREENTIC_TRUSTED_PROXY_HOPS is 0: callers behind a \
+                 proxy cannot be told apart, so anonymous callers get no per-client limit and no \
+                 resumable conversations (set the variable to the number of proxies in front)"
+            ),
+        );
+    }
 }
 
 /// The public base URL the interop surfaces advertise themselves at: the
@@ -2232,8 +2288,14 @@ async fn serve_interop_inner(
     // `Authorization` header, so an unauthenticated peer must not be able to
     // make this process read (and buffer) a megabyte per request. `/mcp`
     // already had this order; this path did not.
-    let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
-        .map_err(|response| *response)?;
+    let caller = crate::interop::a2a::rpc::authenticate(
+        &ctx,
+        headers.authorization,
+        headers.authorization_unreadable,
+        headers.client,
+    )
+    .await
+    .map_err(|response| *response)?;
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         trace.outcome(crate::interop::telemetry::Outcome::Rejected);
         error_response(
@@ -2255,11 +2317,9 @@ async fn serve_interop_inner(
     };
     Ok(match route {
         crate::interop::a2a::A2aRoute::JsonRpc => {
-            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, credential_id, &runner).await
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, &caller, &runner).await
         }
-        _ => {
-            crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, credential_id, &runner).await
-        }
+        _ => crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, &caller, &runner).await,
     })
 }
 
@@ -2328,11 +2388,13 @@ async fn serve_mcp(
     let metadata_url = resource.as_deref().map(|resource| {
         crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), resource)
     });
-    let caller = match crate::interop::mcp::auth::authenticate(
+    let caller = match crate::interop::auth::authenticate(
         &unit.config,
         resource.as_deref(),
         authorization,
+        headers.authorization_unreadable,
         crate::ingress_auth::now_ms(),
+        headers.client,
     )
     .await
     {
@@ -2353,7 +2415,13 @@ async fn serve_mcp(
     // so it is a pre-filter and never the final price: the `ask` tool settles
     // the remainder of a turn's cost against this same bucket.
     let cost = crate::interop::mcp::request_cost(mcp_method);
-    if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
+    if let Err(retry_after) = state.interop.limiter.admit(
+        &caller,
+        &unit.config.access,
+        &unit.deployment_id.to_string(),
+        crate::interop::limits::Charge::priced(cost),
+        crate::ingress_auth::now_ms(),
+    ) {
         let mut response = error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests from this connection; wait and retry",
@@ -2377,14 +2445,8 @@ async fn serve_mcp(
         deployment_id: unit.deployment_id,
         tenant: unit.tenant.clone(),
         bundle_id: unit.bundle_id.clone(),
-        caller_key: caller.key().to_string(),
-        // Only a STAGED credential may be named as one; an OAuth `sub` is
-        // minted by the authorization server and is not a credential the
-        // designer issued.
-        credential_id: match &caller {
-            crate::interop::mcp::auth::McpCaller::Bearer(id) => Some(id.clone()),
-            crate::interop::mcp::auth::McpCaller::Oauth(_) => None,
-        },
+        caller: caller.clone(),
+        access: unit.config.access.clone(),
         metering: crate::interop::metering::TurnMetering::for_unit(
             &state.interop.meter,
             &unit.config,
@@ -2507,6 +2569,8 @@ impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
 /// consumed.
 struct InteropRequestHeaders<'a> {
     authorization: Option<&'a str>,
+    /// An `Authorization` header was sent that could not be read as text.
+    authorization_unreadable: bool,
     /// `A2A-Version`.
     version: Option<&'a str>,
     query: Option<&'a str>,
@@ -2514,6 +2578,9 @@ struct InteropRequestHeaders<'a> {
     /// `Mcp-Method` (SEP-2243), which the MCP limiter meters on so it never
     /// has to parse a body.
     mcp_method: Option<&'a str>,
+    /// The client behind the request, for an anonymous caller of a public
+    /// unit ([`crate::interop::anonymous::client_label`]).
+    client: Option<&'a str>,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the

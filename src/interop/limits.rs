@@ -49,31 +49,63 @@ pub(crate) const DEFAULT_MAX_CONCURRENT_TURNS: usize = 16;
 /// The env var overriding [`DEFAULT_MAX_CONCURRENT_TURNS`].
 pub(crate) const MAX_CONCURRENT_TURNS_ENV: &str = "GREENTIC_INTEROP_MAX_CONCURRENT_TURNS";
 
-struct Bucket {
-    tokens: f64,
-    last_seen: Instant,
+pub(super) struct Bucket {
+    pub(super) tokens: f64,
+    pub(super) last_seen: Instant,
+    /// The most tokens held, and what a newly-seen caller starts with.
+    capacity: f64,
+    /// Tokens per second.
+    refill_per_sec: f64,
 }
 
 impl Bucket {
     fn seen_at(now: Instant) -> Self {
+        Self::with_rate(BURST_CAPACITY, REFILL_TOKENS_PER_SEC, now)
+    }
+
+    /// A full bucket with its own size and refill, for the anonymous tables.
+    pub(super) fn with_rate(capacity: f64, refill_per_sec: f64, now: Instant) -> Self {
         Self {
-            tokens: BURST_CAPACITY,
+            tokens: capacity,
             last_seen: now,
+            capacity,
+            refill_per_sec,
         }
+    }
+
+    /// Adopt a new size without forgiving or punishing a spender: the policy
+    /// can change between deploys while this process keeps running.
+    pub(super) fn resize(&mut self, capacity: f64, refill_per_sec: f64) {
+        self.capacity = capacity;
+        self.refill_per_sec = refill_per_sec;
+        self.tokens = self.tokens.min(capacity);
+    }
+
+    /// Give back tokens spent on a request that a later check refused.
+    pub(super) fn refund(&mut self, cost: f64) {
+        self.tokens = (self.tokens + cost).min(self.capacity);
+    }
+
+    /// Whether an untouched bucket has refilled to full by `now`. An entry
+    /// for which this holds can be dropped and recreated full at no gain to
+    /// its owner.
+    pub(super) fn is_idle_full(&self, now: Instant) -> bool {
+        let idle = now.saturating_duration_since(self.last_seen).as_secs_f64();
+        self.tokens + idle * self.refill_per_sec >= self.capacity
     }
 
     /// Refill for elapsed time, then spend `cost`. `Err(retry_after_secs)` —
     /// always >= 1 — when the bucket cannot pay.
-    fn try_consume(&mut self, cost: f64, now: Instant) -> Result<(), u64> {
+    pub(super) fn try_consume(&mut self, cost: f64, now: Instant) -> Result<(), u64> {
         let elapsed_secs = now.saturating_duration_since(self.last_seen).as_secs_f64();
         self.last_seen = now;
-        self.tokens = (self.tokens + elapsed_secs * REFILL_TOKENS_PER_SEC).min(BURST_CAPACITY);
+        self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.capacity);
         if self.tokens >= cost {
             self.tokens -= cost;
             Ok(())
         } else {
             let deficit = cost - self.tokens;
-            let secs = (deficit / REFILL_TOKENS_PER_SEC).ceil();
+            let secs = (deficit / self.refill_per_sec).ceil();
             // `secs` is small and positive here; the cast cannot truncate a
             // meaningful value.
             Err((secs as u64).max(1))
@@ -85,9 +117,43 @@ impl Bucket {
 #[derive(Default)]
 pub(crate) struct RateLimiter {
     buckets: DashMap<String, Bucket>,
+    /// Anonymous callers of public units; see [`super::anonymous`].
+    pub(super) anonymous: super::anonymous::AnonymousLimiter,
 }
 
 impl RateLimiter {
+    /// Charge `cost` to `caller`, by the rules of its kind.
+    ///
+    /// A staged credential or an OAuth subject has its own bucket, created
+    /// only AFTER it authenticated. An anonymous caller has none of its own:
+    /// it is charged to the unit's public limits ([`super::anonymous`]).
+    /// `counts_as_turn` says whether this charge is a turn for the daily cap
+    /// (which an MCP request announced as cheap and later turned out to be a
+    /// turn settles separately).
+    pub(crate) fn admit(
+        &self,
+        caller: &super::caller::Caller,
+        access: &super::config::AccessPolicy,
+        deployment: &str,
+        charge: Charge,
+        now_ms: u64,
+    ) -> Result<(), u64> {
+        match caller {
+            super::caller::Caller::Anonymous { .. } => self.anonymous.check(
+                deployment,
+                caller.fairness_client(),
+                &access.public,
+                charge,
+                Instant::now(),
+                now_ms,
+            ),
+            other => match other.bucket_key() {
+                Some(key) => self.check(key, charge.cost),
+                None => Ok(()),
+            },
+        }
+    }
+
     /// Charge `cost` to `key`. `Err(retry_after_secs)` when refused.
     pub(crate) fn check(&self, key: &str, cost: f64) -> Result<(), u64> {
         self.check_at(key, cost, Instant::now())
@@ -101,6 +167,39 @@ impl RateLimiter {
             .entry(key.to_string())
             .or_insert_with(|| Bucket::seen_at(now))
             .try_consume(cost, now)
+    }
+}
+
+/// One charge against a limiter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Charge {
+    pub cost: f64,
+    /// Counts against the daily turn cap of a public unit.
+    pub turn: bool,
+}
+
+impl Charge {
+    /// A turn.
+    pub(crate) const TURN: Charge = Charge {
+        cost: TURN_COST,
+        turn: true,
+    };
+    /// A request that is not a turn.
+    pub(crate) const CHEAP: Charge = Charge {
+        cost: CHEAP_COST,
+        turn: false,
+    };
+    /// The remainder of a turn already partly paid for.
+    pub(crate) fn remainder(cost: f64) -> Charge {
+        Charge { cost, turn: true }
+    }
+    /// A request priced `cost` up front, a turn exactly when it pays the full
+    /// turn price.
+    pub(crate) fn priced(cost: f64) -> Charge {
+        Charge {
+            cost,
+            turn: cost >= TURN_COST,
+        }
     }
 }
 
@@ -124,9 +223,22 @@ fn sweep_map(buckets: &DashMap<String, Bucket>, now: Instant) {
 /// A cap on concurrent interop turns per deployment. A refused turn is a
 /// `429` with `Retry-After: 1`; nothing queues, because an agent caller holds
 /// its connection open for the whole turn.
+///
+/// Anonymous callers of a public unit share the same pool but may never fill
+/// it: they hold at most half of it ([`Self::anonymous_cap`]), and every
+/// anonymous turn also holds one of the shared permits, so authenticated
+/// callers always have at least the other half. Sixteen slow anonymous turns
+/// cannot turn a credentialed caller away.
 pub(crate) struct TurnGate {
     max: usize,
     per_deployment: DashMap<DeploymentId, Arc<Semaphore>>,
+    anonymous: DashMap<DeploymentId, Arc<Semaphore>>,
+}
+
+/// The permits one turn holds; released together on drop.
+pub(crate) struct TurnPermit {
+    _shared: OwnedSemaphorePermit,
+    _anonymous: Option<OwnedSemaphorePermit>,
 }
 
 impl TurnGate {
@@ -134,19 +246,60 @@ impl TurnGate {
         Self {
             max: max.max(1),
             per_deployment: DashMap::new(),
+            anonymous: DashMap::new(),
         }
     }
 
-    /// A permit for one turn on `deployment`, or `None` when the cap is
-    /// reached. The permit releases on drop.
-    pub(crate) fn try_acquire(&self, deployment: DeploymentId) -> Option<OwnedSemaphorePermit> {
-        let semaphore = Arc::clone(
+    /// The most permits anonymous turns may hold at once: half, at least one.
+    pub(crate) fn anonymous_cap(&self) -> usize {
+        (self.max / 2).max(1)
+    }
+
+    fn pool(&self, deployment: DeploymentId) -> Arc<Semaphore> {
+        Arc::clone(
             self.per_deployment
                 .entry(deployment)
                 .or_insert_with(|| Arc::new(Semaphore::new(self.max)))
                 .value(),
+        )
+    }
+
+    /// A permit for one turn on `deployment`, or `None` when the cap is
+    /// reached. The permit releases on drop.
+    pub(crate) fn try_acquire(&self, deployment: DeploymentId) -> Option<TurnPermit> {
+        Some(TurnPermit {
+            _shared: self.pool(deployment).try_acquire_owned().ok()?,
+            _anonymous: None,
+        })
+    }
+
+    /// The same for an ANONYMOUS turn: it must fit under the anonymous cap AND
+    /// take a shared permit, so it can never hold more than half the pool.
+    pub(crate) fn try_acquire_anonymous(&self, deployment: DeploymentId) -> Option<TurnPermit> {
+        let reserved = Arc::clone(
+            self.anonymous
+                .entry(deployment)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.anonymous_cap())))
+                .value(),
         );
-        semaphore.try_acquire_owned().ok()
+        let anonymous = reserved.try_acquire_owned().ok()?;
+        Some(TurnPermit {
+            _shared: self.pool(deployment).try_acquire_owned().ok()?,
+            _anonymous: Some(anonymous),
+        })
+    }
+
+    /// The permit for a turn of `caller`.
+    pub(crate) fn try_acquire_for(
+        &self,
+        deployment: DeploymentId,
+        caller: &super::caller::Caller,
+    ) -> Option<TurnPermit> {
+        if caller.is_anonymous() {
+            self.try_acquire_anonymous(deployment)
+        } else {
+            self.try_acquire(deployment)
+        }
     }
 }
 
@@ -227,6 +380,48 @@ mod tests {
             gate.try_acquire(a).is_some(),
             "a released permit is reusable"
         );
+    }
+
+    #[test]
+    fn anonymous_turns_can_never_take_the_last_permits() {
+        let gate = TurnGate::new(16);
+        let dep = DeploymentId::new();
+        let held: Vec<_> = (0..16)
+            .filter_map(|_| gate.try_acquire_anonymous(dep))
+            .collect();
+        assert_eq!(held.len(), 8, "anonymous turns are capped at half");
+        // A credentialed caller still gets the other half.
+        let authed: Vec<_> = (0..16).filter_map(|_| gate.try_acquire(dep)).collect();
+        assert_eq!(authed.len(), 8);
+        assert!(gate.try_acquire(dep).is_none());
+        drop(held);
+        assert!(
+            gate.try_acquire(dep).is_some(),
+            "released anonymous permits return to the pool"
+        );
+    }
+
+    #[test]
+    fn a_small_gate_still_admits_one_anonymous_turn() {
+        let gate = TurnGate::new(1);
+        let dep = DeploymentId::new();
+        assert_eq!(gate.anonymous_cap(), 1);
+        assert!(gate.try_acquire_anonymous(dep).is_some());
+    }
+
+    #[test]
+    fn a_full_shared_pool_refuses_anonymous_and_frees_its_reservation() {
+        let gate = TurnGate::new(4);
+        let dep = DeploymentId::new();
+        let authed: Vec<_> = (0..4).filter_map(|_| gate.try_acquire(dep)).collect();
+        assert_eq!(authed.len(), 4);
+        assert!(gate.try_acquire_anonymous(dep).is_none());
+        drop(authed);
+        // The failed attempt must not have leaked its anonymous slot.
+        let held: Vec<_> = (0..4)
+            .filter_map(|_| gate.try_acquire_anonymous(dep))
+            .collect();
+        assert_eq!(held.len(), 2);
     }
 
     #[test]

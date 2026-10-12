@@ -72,6 +72,11 @@ pub(crate) struct UsageEvent {
     pub agent_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credential_id: Option<String>,
+    /// `"anonymous"` for a caller of a public unit who presented nothing.
+    /// **Absent for every other caller**, so an event for a private unit is
+    /// byte-identical to what it was before public mode existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caller_kind: Option<&'static str>,
     pub surface: &'static str,
     pub tokens_in: u64,
     pub tokens_out: u64,

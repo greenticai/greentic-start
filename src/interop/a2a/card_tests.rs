@@ -167,3 +167,55 @@ async fn the_card_falls_back_to_the_bundle_and_a_converse_skill() {
     assert_eq!(card["skills"][0]["id"], "converse");
     assert_eq!(card["version"], "1.0.0");
 }
+
+async fn card_for(config: InteropConfig) -> Value {
+    let fixture = Fixture::new(config);
+    body_json(card_response(&fixture.ctx(), &request(b""))).await
+}
+
+/// A card that declares a bearer requirement tells a client it must
+/// authenticate. A public unit serves a caller that presents nothing, so its
+/// card advertises no scheme at all.
+#[tokio::test]
+async fn a_public_units_card_advertises_no_security_scheme() {
+    let mut cfg = config();
+    cfg.access.visibility = crate::interop::config::Visibility::Public;
+    let card = card_for(cfg).await;
+    assert!(card.get("securitySchemes").is_none(), "{card}");
+    assert!(card.get("securityRequirements").is_none(), "{card}");
+}
+
+#[tokio::test]
+async fn oauth_is_advertised_only_when_allowed_and_verifiable_on_a2a() {
+    let mut cfg = config();
+    cfg.issuer = Some("https://admin.example/".into());
+    cfg.tenant_slug = Some("acme".into());
+    // Allowed but no `a2a_resource`: the unit cannot verify a token here.
+    let card = card_for(cfg.clone()).await;
+    assert!(card["securitySchemes"]["oauth"].is_null(), "{card}");
+    assert!(card["securitySchemes"]["bearer"].is_object());
+
+    cfg.a2a_resource = Some("https://w.example/a2a".into());
+    let card = card_for(cfg.clone()).await;
+    assert!(card["securitySchemes"]["bearer"].is_object(), "{card}");
+    assert_eq!(
+        card["securitySchemes"]["oauth"]["oauth2SecurityScheme"]["flows"]["clientCredentials"]["tokenUrl"],
+        "https://admin.example/oauth/token"
+    );
+    assert_eq!(
+        card["securityRequirements"].as_array().map(Vec::len),
+        Some(2)
+    );
+
+    // An OAuth-only policy drops the bearer from the card.
+    cfg.access.mechanisms = vec![crate::interop::config::Mechanism::Oauth];
+    let card = card_for(cfg.clone()).await;
+    assert!(card["securitySchemes"]["bearer"].is_null(), "{card}");
+    assert!(card["securitySchemes"]["oauth"].is_object());
+
+    // An API-key-only policy drops OAuth.
+    cfg.access.mechanisms = vec![crate::interop::config::Mechanism::ApiKey];
+    let card = card_for(cfg).await;
+    assert!(card["securitySchemes"]["oauth"].is_null(), "{card}");
+    assert!(card["securitySchemes"]["bearer"].is_object());
+}

@@ -202,6 +202,7 @@ pub(crate) fn queued(endpoint: &str) -> Queued {
             bundle_id: "support-bot".into(),
             agent_id: "support-bot".into(),
             credential_id: Some("c_01J".into()),
+            caller_kind: None,
             surface: Surface::A2a.as_str(),
             tokens_in: 12,
             tokens_out: 4,

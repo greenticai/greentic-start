@@ -37,24 +37,9 @@ struct McpClaims {
     tenant: String,
 }
 
-/// Who the request authenticated as.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum McpCaller {
-    /// An OAuth token's `sub`.
-    Oauth(String),
-    /// A staged A2A credential's id.
-    Bearer(String),
-}
-
-impl McpCaller {
-    /// The rate-limit bucket and conversation namespace for this caller.
-    pub(crate) fn key(&self) -> &str {
-        match self {
-            McpCaller::Oauth(sub) => sub,
-            McpCaller::Bearer(id) => id,
-        }
-    }
-}
+/// Who the request authenticated as. One type for both interop surfaces; see
+/// [`crate::interop::caller::Caller`].
+pub(crate) use crate::interop::caller::Caller as McpCaller;
 
 /// What the gate decided.
 #[derive(Debug, PartialEq, Eq)]
@@ -67,30 +52,23 @@ pub(crate) enum McpAuth {
     IssuerUnavailable,
 }
 
-/// Authenticate one `/mcp` request.
-///
-/// `resource` is the audience an OAuth token must carry — the staged
-/// `mcp_resource`, else `<public base>/mcp`. `None` means this deployment can
-/// name neither, which only the OAuth half needs: a caller holding the staged
-/// A2A bearer is unaffected, so the bearer check runs first and a missing
-/// resource refuses just the token path.
+/// The gate with the unit's own policy and the A2A bearer's rules, for the
+/// tests that predate the shared [`crate::interop::auth::authenticate`]. A
+/// test unit is private, so no client label is needed.
+#[cfg(test)]
 pub(crate) async fn authenticate(
     config: &InteropConfig,
     resource: Option<&str>,
     authorization: Option<&str>,
     now_ms: u64,
 ) -> McpAuth {
-    // Cheap first: a staged A2A credential is a constant-time hash compare
-    // with no I/O, and a JWT cannot match one.
-    if let Ok(id) = crate::ingress_auth::verify_bearer(config, authorization, now_ms) {
-        return McpAuth::Allowed(McpCaller::Bearer(id.to_string()));
-    }
-    verify_oauth(config, resource, authorization).await
+    crate::interop::auth::authenticate(config, resource, authorization, false, now_ms, Some("test"))
+        .await
 }
 
 /// The OAuth half. Every refusal is the same `401` to the caller; the detail
 /// goes to the log.
-async fn verify_oauth(
+pub(crate) async fn verify_oauth(
     config: &InteropConfig,
     resource: Option<&str>,
     authorization: Option<&str>,
@@ -159,15 +137,17 @@ async fn verify_oauth(
     // reach subject `u1:x`'s conversations by asking for `x:<their id>` (see
     // `crate::interop::valid_caller_key`). Neither is the caller's doing —
     // the token is signed — which is exactly why an issuer bug must refuse
-    // rather than degrade.
-    if !crate::interop::valid_caller_key(data.claims.sub.trim()) {
+    // rather than degrade. A service client's `svc:<id>@<tenant>` subject is
+    // the one accepted exception, and it is MAPPED, not admitted as-is.
+    let Some(caller_key) = caller_key_for_sub(&data.claims.sub, tenant_slug) else {
         crate::operator_log::warn(
             module_path!(),
             "MCP: a validly-signed token carried a `sub` that is empty, too long, or \
-             outside [A-Za-z0-9_-]; refusing rather than namespacing a session with it",
+             outside [A-Za-z0-9_-] (and not a service-client subject); refusing rather \
+             than namespacing a session with it",
         );
         return McpAuth::Unauthorized;
-    }
+    };
     // The tenant claim is the cross-tenant boundary: a token minted for
     // another workspace must not run a turn here, however valid its signature.
     if data.claims.tenant.trim() != tenant_slug.trim() {
@@ -177,14 +157,44 @@ async fn verify_oauth(
         );
         return McpAuth::Unauthorized;
     }
-    McpAuth::Allowed(McpCaller::Oauth(data.claims.sub.trim().to_string()))
+    McpAuth::Allowed(McpCaller::Oauth(caller_key))
+}
+
+/// The caller key an OAuth `sub` namespaces its sessions under.
+///
+/// A user `sub` is its own key when it passes
+/// [`crate::interop::valid_caller_key`]. A service client's subject,
+/// `svc:<client_id>@<tenant_slug>` (access-policy spec §5.2), contains a colon
+/// and so can never pass it: a colon in a caller key is what lets two
+/// different `(caller, conversation)` pairs build one session hint. It is
+/// mapped to `svc~<client_id>~<tenant_slug>` instead. `~` is outside the
+/// alphabet every other key obeys, so the mapped key cannot equal any user's,
+/// and it has no colon, so the hint stays injective. The slug in the subject
+/// must be this unit's own tenant: a service token for another workspace is
+/// refused even though its `tenant` claim was checked separately.
+pub(crate) fn caller_key_for_sub(sub: &str, tenant_slug: &str) -> Option<String> {
+    let sub = sub.trim();
+    // `anon_` is the namespace of anonymous callers of a public unit
+    // ([`crate::interop::caller::ANONYMOUS_PREFIX`]). A token whose subject
+    // started with it would resume an anonymous caller's conversations.
+    if sub.starts_with(crate::interop::caller::ANONYMOUS_PREFIX) {
+        return None;
+    }
+    if crate::interop::valid_caller_key(sub) {
+        return Some(sub.to_string());
+    }
+    let (client_id, slug) = sub.strip_prefix("svc:")?.split_once('@')?;
+    (crate::interop::valid_caller_key(client_id)
+        && crate::interop::valid_caller_key(slug)
+        && slug == tenant_slug.trim())
+    .then(|| format!("svc~{client_id}~{slug}"))
 }
 
 /// The token of an `Authorization: Bearer <token>` header. The scheme is
 /// case-insensitive (RFC 7235); an empty token is no token. Only
 /// `Authorization` is ever read — a cookie fallback here would make the
 /// surface drivable cross-origin by any logged-in browser.
-fn bearer_token(authorization: Option<&str>) -> Option<&str> {
+pub(crate) fn bearer_token(authorization: Option<&str>) -> Option<&str> {
     let raw = authorization?.trim();
     let (scheme, token) = raw.split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("bearer") {

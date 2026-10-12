@@ -126,6 +126,33 @@ pub(crate) enum SecurityScheme {
     HttpAuth(HttpAuthSecurityScheme),
     #[serde(rename = "apiKeySecurityScheme")]
     ApiKey(ApiKeySecurityScheme),
+    #[serde(rename = "oauth2SecurityScheme")]
+    OAuth2(OAuth2SecurityScheme),
+}
+
+/// OAuth 2.0 as the card advertises it. Only the `client_credentials` flow is
+/// listed: it is the one a machine caller can use unattended, and the
+/// authorization server's interactive flows are advertised by the MCP
+/// discovery document, not here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OAuth2SecurityScheme {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    pub flows: OAuthFlows,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct OAuthFlows {
+    pub client_credentials: ClientCredentialsFlow,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ClientCredentialsFlow {
+    pub token_url: String,
+    pub scopes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

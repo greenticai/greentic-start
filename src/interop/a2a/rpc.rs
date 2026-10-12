@@ -22,8 +22,10 @@ use serde_json::{Value, json};
 
 use greentic_runner_host::Activity;
 
+use super::super::caller::Caller;
 use super::super::input_request::INPUT_REQUEST_MEDIA_TYPE;
-use super::super::limits::{CHEAP_COST, TURN_COST};
+use super::super::limits::Charge;
+use super::super::mcp::auth::McpAuth;
 use super::super::metering::event::{Surface, usage_from_replies};
 use super::super::reply::{ProjectedReply, ReplyItem, project_replies};
 use super::super::telemetry::Outcome;
@@ -57,45 +59,84 @@ pub(crate) trait TurnRunner: Send + Sync {
     ) -> Result<Vec<Activity>, TurnFailure>;
 }
 
-/// Bearer check. `Ok(credential id)` or a ready `401`.
+/// Authenticate the caller. `Ok(caller)` or a ready refusal.
 ///
 /// Called by the ingress BEFORE the request body is read, so an
 /// unauthenticated peer cannot make this process read a megabyte per request.
 /// It needs only the `Authorization` header, so nothing forces the body to be
-/// available first — the handlers below take the verified id as a parameter
-/// rather than re-deriving it.
+/// available first — the handlers below take the verified caller as a
+/// parameter rather than re-deriving it.
+///
+/// What is accepted follows the unit's staged access policy
+/// ([`crate::interop::auth`]): the staged bearer and/or an OAuth token whose
+/// audience is the unit's `a2a_resource`, and on a public unit no credential
+/// at all. `client` labels the peer for an anonymous caller.
 ///
 /// The error is boxed because a `hyper::Response` is ~144 bytes — the same
 /// reason `revision_serve::resolve_endpoint_admission` boxes its own.
 ///
-/// Both arms are traced here rather than at the call site: the verified
+/// Every outcome is traced here rather than at the call site: the verified
 /// credential ID is what contract §6 means by auditing caller identity, and
 /// recording it where it is produced is what stops a new binding forgetting
 /// to. The TOKEN is never recorded anywhere — see
 /// [`super::super::telemetry`].
-pub(crate) fn authenticate<'c>(
-    ctx: &'c A2aContext<'_>,
+pub(crate) async fn authenticate(
+    ctx: &A2aContext<'_>,
     authorization: Option<&str>,
-) -> Result<&'c str, Box<HttpResponse>> {
-    let verified = crate::ingress_auth::verify_bearer(ctx.config, authorization, ctx.now_ms)
-        .map_err(|_| {
+    unreadable: bool,
+    client: Option<&str>,
+) -> Result<Caller, Box<HttpResponse>> {
+    match crate::interop::auth::authenticate(
+        ctx.config,
+        ctx.config.a2a_resource.as_deref(),
+        authorization,
+        unreadable,
+        ctx.now_ms,
+        client,
+    )
+    .await
+    {
+        McpAuth::Allowed(caller) => {
+            if let Some(id) = caller.credential_id() {
+                ctx.trace.credential(id);
+            }
+            Ok(caller)
+        }
+        McpAuth::Unauthorized => {
             ctx.trace.outcome(Outcome::Unauthenticated);
             let mut response = plain(StatusCode::UNAUTHORIZED, "a valid bearer token is required");
             response.headers_mut().insert(
                 header::WWW_AUTHENTICATE,
                 header::HeaderValue::from_static("Bearer realm=\"a2a\""),
             );
-            Box::new(response)
-        })?;
-    ctx.trace.credential(verified);
-    Ok(verified)
+            Err(Box::new(response))
+        }
+        McpAuth::IssuerUnavailable => {
+            ctx.trace.outcome(Outcome::Rejected);
+            Err(Box::new(plain(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the authorization server could not be reached to verify this token",
+            )))
+        }
+    }
+}
+
+/// Charge `charge` to `caller`; `Err(retry_after_secs)` when refused.
+fn admit(ctx: &A2aContext<'_>, caller: &Caller, charge: Charge) -> Result<(), u64> {
+    ctx.limiter.admit(
+        caller,
+        &ctx.config.access,
+        &ctx.deployment_id.to_string(),
+        charge,
+        ctx.now_ms,
+    )
 }
 
 fn rate_limited(ctx: &A2aContext<'_>, outcome: Outcome, retry_after_secs: u64) -> HttpResponse {
     ctx.trace.outcome(outcome);
     let mut response = plain(
         StatusCode::TOO_MANY_REQUESTS,
-        "too many requests for this credential; wait and retry",
+        "too many requests; wait and retry",
     );
     if let Ok(value) = header::HeaderValue::from_str(&retry_after_secs.to_string()) {
         response.headers_mut().insert(header::RETRY_AFTER, value);
@@ -168,7 +209,7 @@ enum SendError {
 /// ARTIFACTS, ignoring `status.message` entirely. See [`artifacts_for`].
 async fn send_message(
     ctx: &A2aContext<'_>,
-    credential_id: &str,
+    caller: &Caller,
     request: SendMessageRequest,
     runner: &dyn TurnRunner,
 ) -> Result<SendMessageResponse, SendError> {
@@ -180,12 +221,16 @@ async fn send_message(
             .to_string(),
         None => ulid::Ulid::new().to_string(),
     };
-    let session_hint = crate::interop::session_hint("a2a", credential_id, &context_id);
-    let user = format!("a2a:{credential_id}");
-    let _permit = ctx.turns.try_acquire(ctx.deployment_id).ok_or_else(|| {
-        ctx.trace.outcome(Outcome::Busy);
-        SendError::Busy
-    })?;
+    let namespace = caller.session_key(&context_id);
+    let session_hint = crate::interop::session_hint("a2a", &namespace, &context_id);
+    let user = format!("a2a:{namespace}");
+    let _permit = ctx
+        .turns
+        .try_acquire_for(ctx.deployment_id, caller)
+        .ok_or_else(|| {
+            ctx.trace.outcome(Outcome::Busy);
+            SendError::Busy
+        })?;
     // One event per turn that RAN, recorded whether or not the turn
     // succeeded: a turn that failed after calling the model still spent, and
     // the honest reading of one that failed before is zeros. Everything
@@ -199,7 +244,7 @@ async fn send_message(
             .as_ref()
             .map(|replies| usage_from_replies(replies))
             .unwrap_or_default();
-        metering.record(Surface::A2a, Some(credential_id), usage, elapsed);
+        metering.record_for(Surface::A2a, caller, usage, elapsed);
     }
     // Traced beside the meter, and separately: the meter records only a turn
     // that RAN, while the span records every request. `interop.duration_ms`
@@ -493,7 +538,7 @@ fn valid_context_id(id: &str) -> Option<&str> {
 pub(crate) async fn handle_jsonrpc(
     ctx: &A2aContext<'_>,
     req: &A2aRequest<'_>,
-    credential_id: &str,
+    caller: &Caller,
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
     let value: Value = match serde_json::from_slice(req.body) {
@@ -528,12 +573,12 @@ pub(crate) async fn handle_jsonrpc(
     if let Some(known) = methods::known(&request.method) {
         ctx.trace.method(known);
     }
-    let cost = if request.method == methods::SEND_MESSAGE {
-        TURN_COST
+    let charge = if request.method == methods::SEND_MESSAGE {
+        Charge::TURN
     } else {
-        CHEAP_COST
+        Charge::CHEAP
     };
-    if let Err(retry_after) = ctx.limiter.check(credential_id, cost) {
+    if let Err(retry_after) = admit(ctx, caller, charge) {
         return rate_limited(ctx, Outcome::RateLimited, retry_after);
     }
     if let Err(requested) = check_version(req) {
@@ -563,7 +608,7 @@ pub(crate) async fn handle_jsonrpc(
                     );
                 }
             };
-            match send_message(ctx, credential_id, parsed, runner).await {
+            match send_message(ctx, caller, parsed, runner).await {
                 Ok(answer) => match serde_json::to_value(answer) {
                     Ok(result) => rpc_ok(ctx, id, result),
                     Err(_) => rpc_error(ctx, id, codes::INTERNAL_ERROR, "internal error", None),
@@ -712,13 +757,13 @@ fn rpc_body(response: &JsonRpcResponse) -> HttpResponse {
 pub(crate) async fn handle_rest_send(
     ctx: &A2aContext<'_>,
     req: &A2aRequest<'_>,
-    credential_id: &str,
+    caller: &Caller,
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
     // This binding serves exactly one RPC, so it names it up front rather
     // than reading one off the request.
     ctx.trace.method(methods::SEND_MESSAGE);
-    if let Err(retry_after) = ctx.limiter.check(credential_id, TURN_COST) {
+    if let Err(retry_after) = admit(ctx, caller, Charge::TURN) {
         return rate_limited(ctx, Outcome::RateLimited, retry_after);
     }
     if check_version(req).is_err() {
@@ -741,7 +786,7 @@ pub(crate) async fn handle_rest_send(
             );
         }
     };
-    match send_message(ctx, credential_id, parsed, runner).await {
+    match send_message(ctx, caller, parsed, runner).await {
         Ok(answer) => match serde_json::to_vec(&answer) {
             Ok(body) => json_response(StatusCode::OK, body),
             Err(_) => rest_error(

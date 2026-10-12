@@ -5,65 +5,17 @@
 //! issuer would let one test's key set — or its refresh floor — decide another
 //! test's outcome.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::Ordering;
 
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use super::*;
 use crate::interop::config::{Credential, InteropConfig};
-use crate::interop::mcp::testkit;
+use crate::interop::mcp::testkit::{self, StubIssuer};
 
 const TENANT: &str = "acme";
 const RESOURCE: &str = "https://w.example/mcp";
 const BEARER_TOKEN: &str = "gtw_staged-token";
-
-/// A stub authorization server that answers `/.well-known/jwks.json`.
-struct StubIssuer {
-    url: String,
-    fetches: Arc<AtomicUsize>,
-}
-
-impl StubIssuer {
-    /// Serve `connections` requests, then stop. The caller's issuer URL is
-    /// unique to this listener's port.
-    async fn start(connections: usize, body: String) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        let fetches = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&fetches);
-        tokio::spawn(async move {
-            for _ in 0..connections {
-                let Ok((mut stream, _)) = listener.accept().await else {
-                    return;
-                };
-                counted.fetch_add(1, Ordering::Relaxed);
-                let body = body.clone();
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 2048];
-                    let _ = stream.read(&mut buf).await;
-                    let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.flush().await;
-                });
-            }
-        });
-        let url = format!("http://127.0.0.1:{port}");
-        crate::interop::mcp::jwks::clear_issuer_for_tests(&url);
-        Self { url, fetches }
-    }
-
-    async fn serving_keys(connections: usize) -> Self {
-        Self::start(connections, testkit::jwks_document().to_string()).await
-    }
-}
 
 fn config(issuer: Option<&str>) -> InteropConfig {
     InteropConfig {
@@ -101,7 +53,7 @@ async fn a_valid_token_authenticates_as_its_subject() {
     // The caller key is the `sub` — the rate-limit bucket and the conversation
     // namespace.
     if let McpAuth::Allowed(caller) = outcome {
-        assert_eq!(caller.key(), sub);
+        assert_eq!(caller.session_key("x"), sub);
     }
     assert_eq!(issuer.fetches.load(Ordering::Relaxed), 1);
 }
