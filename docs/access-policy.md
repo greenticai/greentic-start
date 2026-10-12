@@ -22,7 +22,7 @@ widens it:
 - an empty list, one with no known entry, or one that is not a list invalidates
   the whole block: private with both mechanisms, logged at **error** level
   naming the value;
-- an unknown `visibility`, malformed or non-positive public limits, or a
+- an unknown `visibility`, malformed or non-positive public limits (a `daily_turn_cap` of 0 included; an absent or null cap means no cap), or a
   malformed `daily_turn_cap` force private but KEEP the readable list, so an
   `["oauth"]` unit stays OAuth-only;
 - a non-object `access` or an absent block: private with both mechanisms.

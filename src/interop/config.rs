@@ -389,7 +389,15 @@ fn parse_access(value: Value, unit: &str) -> AccessPolicy {
             Some(value) => match read_limits(value) {
                 Some(limits) => limits,
                 None => {
-                    return private("`access.public` limits are malformed or not positive");
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "interop config for unit `{unit}`: `access.public` {value} has a \
+                             malformed or non-positive limit (rate_per_min, burst or \
+                             daily_turn_cap); forcing the unit private"
+                        ),
+                    );
+                    return private("`access.public` limits are unusable");
                 }
             },
         }
@@ -415,7 +423,14 @@ fn read_limits(value: &Value) -> Option<PublicLimits> {
     };
     let daily_turn_cap = match object.get("daily_turn_cap") {
         None | Some(Value::Null) => None,
-        Some(cap) => Some(cap.as_u64().and_then(|n| u32::try_from(n).ok())?).filter(|n| *n > 0),
+        // Zero is not "no cap": a cap of zero turns would refuse every
+        // anonymous turn, which is as unusable as a zero rate, so it is
+        // rejected like one rather than read as unlimited.
+        Some(cap) => Some(
+            cap.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)?,
+        ),
     };
     Some(PublicLimits {
         rate_per_min: positive("rate_per_min")?,
@@ -755,6 +770,42 @@ mod tests {
         // Even malformed limits on a private unit change nothing.
         let c = parse_doc(json!({"access": {"visibility": "private", "public": "junk"}}));
         assert_eq!(c.access.visibility, Visibility::Private);
+    }
+
+    fn public_with_cap(cap: Value) -> InteropConfig {
+        parse_doc(json!({"access": {
+            "visibility": "public",
+            "mechanisms": ["oauth"],
+            "public": {"rate_per_min": 30, "burst": 5, "daily_turn_cap": cap}
+        }}))
+    }
+
+    #[test]
+    fn a_daily_cap_of_zero_forces_private_and_keeps_the_mechanisms() {
+        let c = public_with_cap(json!(0));
+        assert_eq!(c.access.visibility, Visibility::Private);
+        assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth]);
+        assert_eq!(c.access.public, PublicLimits::default());
+    }
+
+    #[test]
+    fn an_absent_or_null_daily_cap_means_no_cap() {
+        let c = public_with_cap(Value::Null);
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.public.daily_turn_cap, None);
+        let c = parse_doc(json!({"access": {
+            "visibility": "public",
+            "public": {"rate_per_min": 30, "burst": 5}
+        }}));
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.public.daily_turn_cap, None);
+    }
+
+    #[test]
+    fn a_positive_daily_cap_is_kept() {
+        let c = public_with_cap(json!(5));
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.public.daily_turn_cap, Some(5));
     }
 
     #[test]
