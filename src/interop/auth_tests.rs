@@ -262,6 +262,29 @@ fn only_an_exact_service_subject_for_this_tenant_is_mapped() {
     }
 }
 
+/// The `anon_` namespace belongs to anonymous callers: a signed token whose
+/// subject starts with it is refused, not namespaced into one.
+#[tokio::test]
+async fn a_subject_in_the_anonymous_namespace_is_refused() {
+    use crate::interop::mcp::auth::caller_key_for_sub;
+    let anon = Caller::anonymous(CLIENT);
+    assert_eq!(caller_key_for_sub(anon.key(), TENANT), None);
+    assert_eq!(caller_key_for_sub("anon_x", TENANT), None);
+    assert_eq!(
+        caller_key_for_sub("anonymous", TENANT).as_deref(),
+        Some("anonymous")
+    );
+    let issuer = StubIssuer::serving_keys(1).await;
+    let token = testkit::mint_token(&issuer.url, A2A_RESOURCE, anon.key(), TENANT, 600);
+    let outcome = gate(
+        &config(Some(&issuer.url), both()),
+        Some(A2A_RESOURCE),
+        Some(&bearer(&token)),
+    )
+    .await;
+    assert_eq!(outcome, Auth::Unauthorized);
+}
+
 #[test]
 fn a_mapped_service_key_cannot_equal_any_user_key() {
     // The mapping's separator is outside the alphabet every user key obeys.

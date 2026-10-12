@@ -5,6 +5,11 @@
 
 use sha2::{Digest, Sha256};
 
+/// The prefix of every anonymous caller's key. Reserved: no OAuth subject may
+/// start with it (see `caller_key_for_sub`), so a signed token can never land in
+/// an anonymous caller's session namespace.
+pub(crate) const ANONYMOUS_PREFIX: &str = "anon_";
+
 /// An authenticated (or, on a public unit, anonymous) interop caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Caller {
@@ -30,7 +35,7 @@ impl Caller {
         hasher.update(label.as_bytes());
         let digest = hasher.finalize();
         let hex: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-        Caller::Anonymous(format!("anon_{hex}"))
+        Caller::Anonymous(format!("{ANONYMOUS_PREFIX}{hex}"))
     }
 
     /// The rate-limit key and conversation namespace. Always passes

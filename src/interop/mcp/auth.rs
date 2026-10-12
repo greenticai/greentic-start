@@ -173,6 +173,12 @@ pub(crate) async fn verify_oauth(
 /// refused even though its `tenant` claim was checked separately.
 pub(crate) fn caller_key_for_sub(sub: &str, tenant_slug: &str) -> Option<String> {
     let sub = sub.trim();
+    // `anon_` is the namespace of anonymous callers of a public unit
+    // ([`crate::interop::caller::ANONYMOUS_PREFIX`]). A token whose subject
+    // started with it would resume an anonymous caller's conversations.
+    if sub.starts_with(crate::interop::caller::ANONYMOUS_PREFIX) {
+        return None;
+    }
     if crate::interop::valid_caller_key(sub) {
         return Some(sub.to_string());
     }
