@@ -74,3 +74,7 @@ tokens back.
 Anonymous usage events carry no `credential_id` and `caller_kind: "anonymous"`;
 every other event is byte-identical to before. The agent card of a public unit
 advertises no security scheme.
+
+Anonymous turns also share the unit's concurrent-turn gate without being able to
+fill it: they hold at most half of the permits (at least one), so a credentialed
+caller always has the other half.

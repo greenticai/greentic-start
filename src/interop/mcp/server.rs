@@ -185,7 +185,11 @@ worker reads its own secrets from the credentials staged for it, never from a to
         // The cap is per deployment and nothing queues: an MCP caller holds
         // its connection open for the whole turn, so a queue would convert a
         // burst into a pile of timeouts.
-        let Some(_permit) = self.ctx.turns.try_acquire(self.ctx.deployment_id) else {
+        let Some(_permit) = self
+            .ctx
+            .turns
+            .try_acquire_for(self.ctx.deployment_id, &self.ctx.caller)
+        else {
             return Ok(busy(&conversation_id));
         };
 

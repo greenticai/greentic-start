@@ -220,9 +220,22 @@ fn sweep_map(buckets: &DashMap<String, Bucket>, now: Instant) {
 /// A cap on concurrent interop turns per deployment. A refused turn is a
 /// `429` with `Retry-After: 1`; nothing queues, because an agent caller holds
 /// its connection open for the whole turn.
+///
+/// Anonymous callers of a public unit share the same pool but may never fill
+/// it: they hold at most half of it ([`Self::anonymous_cap`]), and every
+/// anonymous turn also holds one of the shared permits, so authenticated
+/// callers always have at least the other half. Sixteen slow anonymous turns
+/// cannot turn a credentialed caller away.
 pub(crate) struct TurnGate {
     max: usize,
     per_deployment: DashMap<DeploymentId, Arc<Semaphore>>,
+    anonymous: DashMap<DeploymentId, Arc<Semaphore>>,
+}
+
+/// The permits one turn holds; released together on drop.
+pub(crate) struct TurnPermit {
+    _shared: OwnedSemaphorePermit,
+    _anonymous: Option<OwnedSemaphorePermit>,
 }
 
 impl TurnGate {
@@ -230,19 +243,60 @@ impl TurnGate {
         Self {
             max: max.max(1),
             per_deployment: DashMap::new(),
+            anonymous: DashMap::new(),
         }
     }
 
-    /// A permit for one turn on `deployment`, or `None` when the cap is
-    /// reached. The permit releases on drop.
-    pub(crate) fn try_acquire(&self, deployment: DeploymentId) -> Option<OwnedSemaphorePermit> {
-        let semaphore = Arc::clone(
+    /// The most permits anonymous turns may hold at once: half, at least one.
+    pub(crate) fn anonymous_cap(&self) -> usize {
+        (self.max / 2).max(1)
+    }
+
+    fn pool(&self, deployment: DeploymentId) -> Arc<Semaphore> {
+        Arc::clone(
             self.per_deployment
                 .entry(deployment)
                 .or_insert_with(|| Arc::new(Semaphore::new(self.max)))
                 .value(),
+        )
+    }
+
+    /// A permit for one turn on `deployment`, or `None` when the cap is
+    /// reached. The permit releases on drop.
+    pub(crate) fn try_acquire(&self, deployment: DeploymentId) -> Option<TurnPermit> {
+        Some(TurnPermit {
+            _shared: self.pool(deployment).try_acquire_owned().ok()?,
+            _anonymous: None,
+        })
+    }
+
+    /// The same for an ANONYMOUS turn: it must fit under the anonymous cap AND
+    /// take a shared permit, so it can never hold more than half the pool.
+    pub(crate) fn try_acquire_anonymous(&self, deployment: DeploymentId) -> Option<TurnPermit> {
+        let reserved = Arc::clone(
+            self.anonymous
+                .entry(deployment)
+                .or_insert_with(|| Arc::new(Semaphore::new(self.anonymous_cap())))
+                .value(),
         );
-        semaphore.try_acquire_owned().ok()
+        let anonymous = reserved.try_acquire_owned().ok()?;
+        Some(TurnPermit {
+            _shared: self.pool(deployment).try_acquire_owned().ok()?,
+            _anonymous: Some(anonymous),
+        })
+    }
+
+    /// The permit for a turn of `caller`.
+    pub(crate) fn try_acquire_for(
+        &self,
+        deployment: DeploymentId,
+        caller: &super::caller::Caller,
+    ) -> Option<TurnPermit> {
+        if caller.is_anonymous() {
+            self.try_acquire_anonymous(deployment)
+        } else {
+            self.try_acquire(deployment)
+        }
     }
 }
 
@@ -323,6 +377,48 @@ mod tests {
             gate.try_acquire(a).is_some(),
             "a released permit is reusable"
         );
+    }
+
+    #[test]
+    fn anonymous_turns_can_never_take_the_last_permits() {
+        let gate = TurnGate::new(16);
+        let dep = DeploymentId::new();
+        let held: Vec<_> = (0..16)
+            .filter_map(|_| gate.try_acquire_anonymous(dep))
+            .collect();
+        assert_eq!(held.len(), 8, "anonymous turns are capped at half");
+        // A credentialed caller still gets the other half.
+        let authed: Vec<_> = (0..16).filter_map(|_| gate.try_acquire(dep)).collect();
+        assert_eq!(authed.len(), 8);
+        assert!(gate.try_acquire(dep).is_none());
+        drop(held);
+        assert!(
+            gate.try_acquire(dep).is_some(),
+            "released anonymous permits return to the pool"
+        );
+    }
+
+    #[test]
+    fn a_small_gate_still_admits_one_anonymous_turn() {
+        let gate = TurnGate::new(1);
+        let dep = DeploymentId::new();
+        assert_eq!(gate.anonymous_cap(), 1);
+        assert!(gate.try_acquire_anonymous(dep).is_some());
+    }
+
+    #[test]
+    fn a_full_shared_pool_refuses_anonymous_and_frees_its_reservation() {
+        let gate = TurnGate::new(4);
+        let dep = DeploymentId::new();
+        let authed: Vec<_> = (0..4).filter_map(|_| gate.try_acquire(dep)).collect();
+        assert_eq!(authed.len(), 4);
+        assert!(gate.try_acquire_anonymous(dep).is_none());
+        drop(authed);
+        // The failed attempt must not have leaked its anonymous slot.
+        let held: Vec<_> = (0..4)
+            .filter_map(|_| gate.try_acquire_anonymous(dep))
+            .collect();
+        assert_eq!(held.len(), 2);
     }
 
     #[test]

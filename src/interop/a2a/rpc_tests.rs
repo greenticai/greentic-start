@@ -937,6 +937,46 @@ async fn a_private_unit_answers_no_credential_with_a_challenge() {
     assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
 }
 
+/// Sixteen slow anonymous turns on a public unit cannot turn a credentialed
+/// caller away: anonymous turns never hold more than half of the pool.
+#[tokio::test]
+async fn slow_anonymous_turns_cannot_starve_a_bearer_caller() {
+    let mut fixture = Fixture::new(config());
+    fixture.turns = TurnGate::new(16);
+    let anonymous = Caller::anonymous("203.0.113.7");
+    let held: Vec<_> = (0..16)
+        .filter_map(|_| {
+            fixture
+                .turns
+                .try_acquire_for(fixture.deployment_id, &anonymous)
+        })
+        .collect();
+    assert_eq!(held.len(), 8);
+    let runner = FakeRunner::replying(vec![Activity::text("ok")]);
+    let body = rpc("SendMessage", send_params(Some("c")));
+    let response = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(runner.calls().len(), 1, "the bearer caller's turn ran");
+    // …and the anonymous half is genuinely full.
+    let mut open = config();
+    open.access.visibility = crate::interop::config::Visibility::Public;
+    let mut fixture_open = Fixture::new(open);
+    fixture_open.turns = TurnGate::new(16);
+    let held: Vec<_> = (0..8)
+        .filter_map(|_| {
+            fixture_open
+                .turns
+                .try_acquire_for(fixture_open.deployment_id, &anonymous)
+        })
+        .collect();
+    assert_eq!(held.len(), 8);
+    let runner = FakeRunner::replying(vec![Activity::text("ok")]);
+    let ctx = fixture_open.ctx();
+    let response = handle_jsonrpc(&ctx, &request(&body), &anonymous, &runner).await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(runner.calls().is_empty());
+}
+
 /// A turn that produced no measurable usage still produces an event: "a turn
 /// ran and cost nothing measurable" and "no turn ran" are different facts.
 #[tokio::test]

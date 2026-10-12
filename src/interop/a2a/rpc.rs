@@ -223,10 +223,13 @@ async fn send_message(
     };
     let session_hint = crate::interop::session_hint("a2a", caller.key(), &context_id);
     let user = format!("a2a:{}", caller.key());
-    let _permit = ctx.turns.try_acquire(ctx.deployment_id).ok_or_else(|| {
-        ctx.trace.outcome(Outcome::Busy);
-        SendError::Busy
-    })?;
+    let _permit = ctx
+        .turns
+        .try_acquire_for(ctx.deployment_id, caller)
+        .ok_or_else(|| {
+            ctx.trace.outcome(Outcome::Busy);
+            SendError::Busy
+        })?;
     // One event per turn that RAN, recorded whether or not the turn
     // succeeded: a turn that failed after calling the model still spent, and
     // the honest reading of one that failed before is zeros. Everything
