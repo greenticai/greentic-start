@@ -72,9 +72,14 @@ fn oauth_available(config: &InteropConfig, audience: Option<&str>) -> bool {
 /// Authenticate one interop request.
 ///
 /// `audience` is the surface's own resource URL (`mcp_resource` or
-/// `a2a_resource`); `None` means OAuth cannot be verified on it, in which case
-/// the staged bearer is accepted whatever `mechanisms` says — a policy that
-/// names only a mechanism this unit cannot run must not lock its owner out.
+/// `a2a_resource`). **The policy is strict**: a mechanism the policy does not
+/// list is never accepted, and OAuth that cannot be verified on this surface
+/// (no issuer, tenant or audience) is a refusal, not a reason to accept the
+/// staged bearer instead. The designer guarantees it stages an OAuth-only
+/// policy only together with what OAuth needs; a document that breaks that is
+/// refused (and logged once) rather than quietly weakened. The default policy
+/// (no `access` block) lists both mechanisms, so its bearer is accepted
+/// whether or not OAuth is available, exactly as before the policy existed.
 /// `client` labels the peer for an anonymous caller.
 pub(crate) async fn authenticate(
     config: &InteropConfig,
@@ -103,11 +108,14 @@ pub(crate) async fn authenticate(
             McpAuth::Unauthorized
         };
     }
-    let api_key_allowed =
-        config.access.allows(Mechanism::ApiKey) || !oauth_available(config, audience);
+    if !config.access.allows(Mechanism::ApiKey) && !oauth_available(config, audience) {
+        // OAuth-only, and OAuth cannot run here: nothing can authenticate.
+        log_unusable_policy_once(config, audience);
+        return McpAuth::Unauthorized;
+    }
     // Cheap first: a staged credential is a constant-time hash compare with no
     // I/O, and a JWT cannot match one.
-    if api_key_allowed
+    if config.access.allows(Mechanism::ApiKey)
         && let Ok(id) = crate::ingress_auth::verify_bearer(config, authorization, now_ms)
     {
         return McpAuth::Allowed(Caller::Bearer(id.to_string()));
@@ -116,6 +124,40 @@ pub(crate) async fn authenticate(
         return verify_oauth(config, audience, authorization).await;
     }
     McpAuth::Unauthorized
+}
+
+/// Say once per unit and surface why an OAuth-only policy refuses everyone.
+fn log_unusable_policy_once(config: &InteropConfig, audience: Option<&str>) {
+    use std::collections::HashSet;
+    use std::sync::{LazyLock, Mutex};
+    static SAID: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(Mutex::default);
+    let key = format!(
+        "{}|{}|{}",
+        config.tenant_slug.as_deref().unwrap_or(""),
+        config.issuer.as_deref().unwrap_or(""),
+        audience.unwrap_or("")
+    );
+    let first = SAID
+        .lock()
+        .is_ok_and(|mut said| said.len() < 1024 && said.insert(key));
+    if first {
+        let missing: Vec<&str> = [
+            ("issuer", config.issuer.is_none()),
+            ("tenant_slug", config.tenant_slug.is_none()),
+            ("the surface's resource URL", audience.is_none()),
+        ]
+        .iter()
+        .filter_map(|(name, absent)| absent.then_some(*name))
+        .collect();
+        crate::operator_log::error(
+            module_path!(),
+            format!(
+                "interop: this unit's access policy allows only OAuth but the document does not \
+                 stage what OAuth needs (missing: {}); every request is refused",
+                missing.join(", ")
+            ),
+        );
+    }
 }
 
 #[cfg(test)]

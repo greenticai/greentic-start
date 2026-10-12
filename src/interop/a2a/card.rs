@@ -108,8 +108,7 @@ pub(crate) fn build_card(ctx: &A2aContext<'_>, base_url: &str) -> AgentCard {
 /// - **Public**: none. A card with a bearer scheme and a requirement tells a
 ///   client it must authenticate, and a public unit serves a caller who
 ///   presents nothing. A credential is still honoured if sent.
-/// - **Private**: the bearer when `api_key` is allowed (or OAuth cannot run
-///   here, in which case the bearer is all there is), plus the OAuth scheme
+/// - **Private**: the bearer when `api_key` is allowed, plus the OAuth scheme
 ///   when `oauth` is allowed and this unit can verify a token on `/a2a`.
 fn security_schemes(ctx: &A2aContext<'_>) -> BTreeMap<String, SecurityScheme> {
     let config = ctx.config;
@@ -124,7 +123,7 @@ fn security_schemes(ctx: &A2aContext<'_>) -> BTreeMap<String, SecurityScheme> {
         .issuer
         .as_deref()
         .map(|issuer| issuer.trim_end_matches('/'));
-    if config.access.allows(Mechanism::ApiKey) || !oauth_here {
+    if config.access.allows(Mechanism::ApiKey) {
         schemes.insert(
             BEARER_SCHEME_NAME.to_string(),
             SecurityScheme::HttpAuth(HttpAuthSecurityScheme {

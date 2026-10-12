@@ -39,10 +39,14 @@ kept only when it is `https://` (or loopback `http://`).
 | public | none | served as anonymous, within the limits |
 | any | a Direct Line (HS256) token | never an identity: 401 on private, anonymous on public |
 
-- `mechanisms` is a filter. If OAuth cannot be verified on a surface (no issuer,
-  tenant, or audience: `a2a_resource` for `/a2a`, `mcp_resource` or the public
-  base URL for `/mcp`) the staged bearer is accepted whatever the list says, so a
-  policy cannot lock an owner out of a surface that cannot run it.
+- `mechanisms` is a strict filter. A mechanism the policy does not list is never
+  accepted. If the policy is OAuth-only and OAuth cannot be verified on the
+  surface (no issuer, tenant or audience: `a2a_resource` for `/a2a`,
+  `mcp_resource` or the public base URL for `/mcp`) every credential is refused
+  (401) and the reason is logged once at error level; the staged bearer is NOT
+  accepted instead. The designer stages an OAuth-only policy only together with
+  what OAuth needs. The default policy (no `access` block) lists both mechanisms,
+  so its bearer works whether or not OAuth is available, as before.
 - An OAuth token's `aud` must equal the surface's own resource URL, so an MCP
   token cannot call `/a2a` and the reverse. Service-client tokens
   (`sub = svc:<client_id>@<tenant>`) are namespaced as `svc~<client_id>~<tenant>`:

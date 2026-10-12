@@ -157,10 +157,10 @@ async fn the_oauth_only_policy_rejects_a_valid_bearer() {
     );
 }
 
-/// Without an `a2a_resource` OAuth cannot be verified on `/a2a`, and a policy
-/// naming only OAuth must not lock the unit's owner out of the surface.
+/// Strict: an OAuth-only policy on a surface where OAuth cannot be verified
+/// refuses everyone, the staged bearer included. It is never quietly relaxed.
 #[tokio::test]
-async fn without_an_audience_only_the_bearer_works_whatever_the_policy_says() {
+async fn an_oauth_only_policy_without_an_audience_refuses_the_bearer_too() {
     let issuer = StubIssuer::serving_keys(1).await;
     let cfg = config(
         Some(&issuer.url),
@@ -175,12 +175,45 @@ async fn without_an_audience_only_the_bearer_works_whatever_the_policy_says() {
     );
     assert_eq!(
         gate(&cfg, None, Some(&bearer(BEARER_TOKEN))).await,
-        Auth::Allowed(Caller::Bearer("c1".into()))
+        Auth::Unauthorized
     );
     assert_eq!(
         gate(&cfg, None, Some(&bearer(&token))).await,
         Auth::Unauthorized
     );
+    // The same for each missing prerequisite.
+    let mut no_issuer = config(None, policy(Visibility::Private, &[Mechanism::Oauth]));
+    assert_eq!(
+        gate(&no_issuer, Some(A2A_RESOURCE), Some(&bearer(BEARER_TOKEN))).await,
+        Auth::Unauthorized
+    );
+    no_issuer.issuer = Some(issuer.url.clone());
+    no_issuer.tenant_slug = None;
+    assert_eq!(
+        gate(&no_issuer, Some(A2A_RESOURCE), Some(&bearer(BEARER_TOKEN))).await,
+        Auth::Unauthorized
+    );
+}
+
+/// The default policy (no `access` block) is unchanged: both mechanisms, and
+/// the bearer works whether or not OAuth can run.
+#[tokio::test]
+async fn the_default_policy_accepts_the_bearer_without_any_oauth_prerequisite() {
+    let cfg = config(None, both());
+    assert_eq!(
+        gate(&cfg, None, Some(&bearer(BEARER_TOKEN))).await,
+        Auth::Allowed(Caller::Bearer("c1".into()))
+    );
+    let bare = InteropConfig {
+        issuer: None,
+        tenant_slug: None,
+        ..cfg
+    };
+    assert_eq!(
+        gate(&bare, None, Some(&bearer(BEARER_TOKEN))).await,
+        Auth::Allowed(Caller::Bearer("c1".into()))
+    );
+    assert_eq!(gate(&bare, None, None).await, Auth::Unauthorized);
 }
 
 #[tokio::test]
@@ -334,10 +367,10 @@ async fn a_valid_credential_beats_anonymous_on_a_public_unit() {
 #[tokio::test]
 async fn a_valid_credential_of_an_unlisted_mechanism_is_refused_on_a_public_unit() {
     let cfg = config(None, public(&[Mechanism::Oauth]));
-    // OAuth cannot run on this unit (no issuer), so the bearer is allowed.
+    // OAuth cannot run on this unit (no issuer): still a refusal, not a bearer.
     assert_eq!(
         gate(&cfg, Some(A2A_RESOURCE), Some(&bearer(BEARER_TOKEN))).await,
-        Auth::Allowed(Caller::Bearer("c1".into()))
+        Auth::Unauthorized
     );
     let issuer = StubIssuer::serving_keys(1).await;
     let cfg = config(Some(&issuer.url), public(&[Mechanism::Oauth]));
