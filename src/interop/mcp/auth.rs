@@ -62,7 +62,8 @@ pub(crate) async fn authenticate(
     authorization: Option<&str>,
     now_ms: u64,
 ) -> McpAuth {
-    crate::interop::auth::authenticate(config, resource, authorization, false, now_ms, "test").await
+    crate::interop::auth::authenticate(config, resource, authorization, false, now_ms, Some("test"))
+        .await
 }
 
 /// The OAuth half. Every refusal is the same `401` to the caller; the detail

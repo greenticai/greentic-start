@@ -1445,7 +1445,7 @@ async fn serve(
             state.interop.trusted_proxy_hops,
         )
     } else {
-        String::new()
+        None
     };
 
     // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
@@ -1472,7 +1472,7 @@ async fn serve(
                         if_none_match: if_none_match.as_deref(),
                         mcp_method: None,
                         authorization_unreadable,
-                        client: &interop_client,
+                        client: interop_client.as_deref(),
                     },
                 )
                 .await;
@@ -1503,7 +1503,7 @@ async fn serve(
                         if_none_match: None,
                         mcp_method: mcp_method_header.as_deref(),
                         authorization_unreadable,
-                        client: &interop_client,
+                        client: interop_client.as_deref(),
                     },
                 )
                 .await;
@@ -2028,15 +2028,47 @@ async fn resolve_interop_unit(
                 "the ingress credential store is unavailable",
             )
         })?;
-    Ok(config
-        .filter(|config| feature.enabled_in(config))
-        .map(|config| InteropUnit {
-            deployment_id,
-            tenant,
-            bundle_id,
-            mount: mount.prefix.to_string(),
-            config,
-        }))
+    let config = config.filter(|config| feature.enabled_in(config));
+    if let Some(config) = config.as_ref() {
+        warn_public_unit_without_proxy_hops(state, &bundle_id, config);
+    }
+    Ok(config.map(|config| InteropUnit {
+        deployment_id,
+        tenant,
+        bundle_id,
+        mount: mount.prefix.to_string(),
+        config,
+    }))
+}
+
+/// Say once per unit, the first time its config is read, that a PUBLIC unit is
+/// served with no trusted proxy hop: behind a load balancer every anonymous
+/// caller then looks like one client, so none gets a per-client bucket and none
+/// can continue a conversation. Set `GREENTIC_TRUSTED_PROXY_HOPS` to the number
+/// of proxies that append to `X-Forwarded-For`.
+fn warn_public_unit_without_proxy_hops(
+    state: &ServeState,
+    bundle_id: &str,
+    config: &crate::interop::config::InteropConfig,
+) {
+    static SAID: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if !config.access.is_public() || state.interop.trusted_proxy_hops > 0 {
+        return;
+    }
+    let first = SAID
+        .lock()
+        .is_ok_and(|mut said| said.len() < 1024 && said.insert(bundle_id.to_string()));
+    if first {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "unit `{bundle_id}` is public but GREENTIC_TRUSTED_PROXY_HOPS is 0: callers behind a \
+                 proxy cannot be told apart, so anonymous callers get no per-client limit and no \
+                 resumable conversations (set the variable to the number of proxies in front)"
+            ),
+        );
+    }
 }
 
 /// The public base URL the interop surfaces advertise themselves at: the
@@ -2548,7 +2580,7 @@ struct InteropRequestHeaders<'a> {
     mcp_method: Option<&'a str>,
     /// The client behind the request, for an anonymous caller of a public
     /// unit ([`crate::interop::anonymous::client_label`]).
-    client: &'a str,
+    client: Option<&'a str>,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the

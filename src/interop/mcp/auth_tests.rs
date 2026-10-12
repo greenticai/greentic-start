@@ -53,7 +53,7 @@ async fn a_valid_token_authenticates_as_its_subject() {
     // The caller key is the `sub` — the rate-limit bucket and the conversation
     // namespace.
     if let McpAuth::Allowed(caller) = outcome {
-        assert_eq!(caller.key(), sub);
+        assert_eq!(caller.session_key("x"), sub);
     }
     assert_eq!(issuer.fetches.load(Ordering::Relaxed), 1);
 }

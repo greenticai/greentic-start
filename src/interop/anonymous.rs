@@ -60,13 +60,15 @@ pub(crate) struct AnonymousLimiter {
 impl AnonymousLimiter {
     /// Charge one anonymous request. `Err(retry_after_secs)` when refused.
     ///
-    /// `deployment` names the unit and `client` the (hashed) client. The
+    /// `deployment` names the unit and `client` the (hashed) client, or `None`
+    /// when clients cannot be told apart, in which case there is NO per-client
+    /// bucket and the unit bucket alone governs. The
     /// daily count is taken last and only for a turn that passed the buckets,
     /// so a refused request spends none of it.
     pub(crate) fn check(
         &self,
         deployment: &str,
-        client: &str,
+        client: Option<&str>,
         limits: &PublicLimits,
         charge: Charge,
         now: Instant,
@@ -85,7 +87,10 @@ impl AnonymousLimiter {
                 return Err(secs_to_midnight(now_ms));
             }
         }
-        let client_key = self.charge_client(deployment, client, limits, charge.cost, now)?;
+        let client_key = match client {
+            Some(client) => self.charge_client(deployment, client, limits, charge.cost, now)?,
+            None => None,
+        };
         let (capacity, refill) = unit_share(limits);
         let unit_verdict = {
             let mut bucket = self
@@ -177,23 +182,36 @@ fn warn_table_full_once() {
     });
 }
 
-/// The label of the client behind a request: the trusted-proxy rule the
-/// upload and file-link routes use (`http_ingress::client_key`), as a string.
+/// The label of the client behind a request, or `None` when requests cannot
+/// be told apart by client.
 ///
-/// With `trusted_hops == 0` it is the TCP peer and `X-Forwarded-For` is
-/// ignored. With `N` it is the N-th entry from the right, the one the
-/// outermost trusted proxy appended; a client cannot write that entry, only
-/// the ones to its left. No usable address at all is the fixed label
-/// `unknown`, so such requests share one fairness bucket.
+/// With `trusted_hops == N > 0` the client is the N-th `X-Forwarded-For` entry
+/// from the right, the one the outermost trusted proxy appended; a client can
+/// only write the entries to its left. Otherwise the TCP peer is the client
+/// **only if it is a public address**: a private, loopback or otherwise
+/// non-public peer is a load balancer or a sidecar hiding every client behind
+/// one address (an ALB or Cloudflare tunnel with no hops configured), and
+/// calling that "the client" would make all callers one — so it is `None`.
+/// IPv6 clients are counted per /64.
 pub(crate) fn client_label(
     peer: Option<IpAddr>,
     headers: &HeaderMap,
     trusted_hops: usize,
-) -> String {
+) -> Option<String> {
     use crate::http_ingress::limits::{ClientKey, client_key};
-    match client_key(peer, headers, trusted_hops) {
-        Some(ClientKey::Ip(ip)) => ip.to_string(),
-        Some(ClientKey::Conversation(_)) | None => "unknown".to_string(),
+    let label = |key: ClientKey| match key {
+        ClientKey::Ip(ip) => Some(ip.to_string()),
+        ClientKey::Conversation(_) => None,
+    };
+    // A forwarded entry alone, so a peer fallback can be judged separately.
+    if let Some(key) = client_key(None, headers, trusted_hops) {
+        return label(key);
+    }
+    match peer {
+        Some(ip) if crate::artifacts::dns::is_public_ip(ip) => {
+            client_key(Some(ip), headers, 0).and_then(label)
+        }
+        _ => None,
     }
 }
 

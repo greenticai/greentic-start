@@ -50,7 +50,7 @@ fn bearer(token: &str) -> String {
 }
 
 async fn gate(config: &InteropConfig, audience: Option<&str>, header: Option<&str>) -> Auth {
-    authenticate(config, audience, header, false, 0, CLIENT).await
+    authenticate(config, audience, header, false, 0, Some(CLIENT)).await
 }
 
 /// A Direct Line style token: HS256 under a provider signing key, naming this
@@ -232,7 +232,7 @@ async fn a_service_client_subject_is_mapped_to_a_colon_free_key() {
     };
     assert_eq!(caller, Caller::Oauth("svc~mcpc_01J~acme".into()));
     assert!(
-        !caller.key().contains(':'),
+        !caller.session_key("x").contains(':'),
         "a colon would break the session hint"
     );
     assert_eq!(caller.credential_id(), None);
@@ -267,15 +267,21 @@ fn only_an_exact_service_subject_for_this_tenant_is_mapped() {
 #[tokio::test]
 async fn a_subject_in_the_anonymous_namespace_is_refused() {
     use crate::interop::mcp::auth::caller_key_for_sub;
-    let anon = Caller::anonymous(CLIENT);
-    assert_eq!(caller_key_for_sub(anon.key(), TENANT), None);
+    let anon = Caller::anonymous(Some(CLIENT));
+    assert_eq!(caller_key_for_sub(&anon.session_key("x"), TENANT), None);
     assert_eq!(caller_key_for_sub("anon_x", TENANT), None);
     assert_eq!(
         caller_key_for_sub("anonymous", TENANT).as_deref(),
         Some("anonymous")
     );
     let issuer = StubIssuer::serving_keys(1).await;
-    let token = testkit::mint_token(&issuer.url, A2A_RESOURCE, anon.key(), TENANT, 600);
+    let token = testkit::mint_token(
+        &issuer.url,
+        A2A_RESOURCE,
+        &anon.session_key("x"),
+        TENANT,
+        600,
+    );
     let outcome = gate(
         &config(Some(&issuer.url), both()),
         Some(A2A_RESOURCE),
@@ -304,7 +310,7 @@ async fn a_public_unit_serves_a_caller_with_no_credential_as_anonymous() {
         let outcome = gate(&cfg, Some(A2A_RESOURCE), header).await;
         assert_eq!(
             outcome,
-            Auth::Allowed(Caller::anonymous(CLIENT)),
+            Auth::Allowed(Caller::anonymous(Some(CLIENT))),
             "{header:?}"
         );
     }
@@ -432,7 +438,7 @@ async fn a_direct_line_token_never_authenticates() {
         let outcome = gate(&open, Some(audience), Some(&bearer(&token))).await;
         assert_eq!(
             outcome,
-            Auth::Allowed(Caller::anonymous(CLIENT)),
+            Auth::Allowed(Caller::anonymous(Some(CLIENT))),
             "public, {audience}"
         );
         let Auth::Allowed(caller) = outcome else {
@@ -464,12 +470,12 @@ async fn an_hmac_token_in_the_other_hmac_widths_is_a_direct_line_token_too() {
 #[tokio::test]
 async fn an_unreadable_authorization_header_is_presented_and_invalid() {
     let cfg = config(None, public(&[Mechanism::ApiKey, Mechanism::Oauth]));
-    let outcome = authenticate(&cfg, Some(A2A_RESOURCE), None, true, 0, CLIENT).await;
+    let outcome = authenticate(&cfg, Some(A2A_RESOURCE), None, true, 0, Some(CLIENT)).await;
     assert_eq!(outcome, Auth::Unauthorized);
     let private = config(None, both());
-    let outcome = authenticate(&private, Some(A2A_RESOURCE), None, true, 0, CLIENT).await;
+    let outcome = authenticate(&private, Some(A2A_RESOURCE), None, true, 0, Some(CLIENT)).await;
     assert_eq!(outcome, Auth::Unauthorized);
     // The same request with the header genuinely absent is still anonymous.
-    let outcome = authenticate(&cfg, Some(A2A_RESOURCE), None, false, 0, CLIENT).await;
-    assert_eq!(outcome, Auth::Allowed(Caller::anonymous(CLIENT)));
+    let outcome = authenticate(&cfg, Some(A2A_RESOURCE), None, false, 0, Some(CLIENT)).await;
+    assert_eq!(outcome, Auth::Allowed(Caller::anonymous(Some(CLIENT))));
 }

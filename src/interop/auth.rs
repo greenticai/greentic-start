@@ -94,7 +94,7 @@ pub(crate) async fn authenticate(
     authorization: Option<&str>,
     unreadable: bool,
     now_ms: u64,
-    client: &str,
+    client: Option<&str>,
 ) -> Auth {
     let public = config.access.visibility == Visibility::Public;
     let anonymous = || McpAuth::Allowed(Caller::anonymous(client));

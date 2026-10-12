@@ -84,7 +84,7 @@ pub(crate) async fn authenticate(
     ctx: &A2aContext<'_>,
     authorization: Option<&str>,
     unreadable: bool,
-    client: &str,
+    client: Option<&str>,
 ) -> Result<Caller, Box<HttpResponse>> {
     match crate::interop::auth::authenticate(
         ctx.config,
@@ -221,8 +221,9 @@ async fn send_message(
             .to_string(),
         None => ulid::Ulid::new().to_string(),
     };
-    let session_hint = crate::interop::session_hint("a2a", caller.key(), &context_id);
-    let user = format!("a2a:{}", caller.key());
+    let namespace = caller.session_key(&context_id);
+    let session_hint = crate::interop::session_hint("a2a", &namespace, &context_id);
+    let user = format!("a2a:{namespace}");
     let _permit = ctx
         .turns
         .try_acquire_for(ctx.deployment_id, caller)

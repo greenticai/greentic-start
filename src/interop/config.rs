@@ -146,6 +146,10 @@ impl Default for AccessPolicy {
 }
 
 impl AccessPolicy {
+    pub(crate) fn is_public(&self) -> bool {
+        self.visibility == Visibility::Public
+    }
+
     pub(crate) fn allows(&self, mechanism: Mechanism) -> bool {
         self.mechanisms.contains(&mechanism)
     }

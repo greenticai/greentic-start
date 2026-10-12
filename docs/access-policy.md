@@ -65,14 +65,34 @@ kept only when it is `https://` (or loopback `http://`).
    never below one turn), fairness only. The table holds at most 1024 buckets;
    when full of active clients a new client gets none and only (1) applies.
 
-The client is the TCP peer, or with `GREENTIC_TRUSTED_PROXY_HOPS=N` (default 1 on
-Cloud Run, else 0) the N-th `X-Forwarded-For` entry from the right. The header is
-client-writable, which is why only (1) is a guarantee. A refused request spends
-none of the daily cap, and a client turned away by the unit bucket gets its own
-tokens back.
+The client is the N-th `X-Forwarded-For` entry from the right when
+`GREENTIC_TRUSTED_PROXY_HOPS=N` (default 1 on Cloud Run, else 0), else the TCP
+peer **only if it is a public address**. A private or loopback peer is a load
+balancer hiding every caller (an ALB, ECS or Cloudflare tunnel with no hops set),
+so the client is then **unknown**. The header is client-writable, which is why
+only (1) is a guarantee. A refused request spends none of the daily cap, and a
+client turned away by the unit bucket gets its own tokens back.
+
+Conversations are never namespaced by the client label alone, because the
+context id is the caller's own choice:
+
+- identifiable client: namespace `anon_` + `hash(client, context id)`, so two
+  clients using the same context id never share state and one client continues
+  its own conversation;
+- unknown client: no per-client bucket (the unit bucket alone governs), and every
+  request gets a fresh random namespace, so nothing can be continued or read
+  across callers. A public unit read with hops 0 logs this once.
+
+The `anon_` prefix is reserved: an OAuth token whose `sub` starts with it is
+refused. An `Authorization` header that is present but unreadable (non-ASCII) is
+a presented, invalid credential (401), not an absent one.
+
+The daily cap is counted per process: scale-to-zero or a restart resets it
+(documented limitation until the runtime policy door reads the admin's count).
 
 Anonymous usage events carry no `credential_id` and `caller_kind: "anonymous"`;
-every other event is byte-identical to before. The agent card of a public unit
+every other event is byte-identical to before. `caller_kind` is advisory for the
+admin until the admin persists it. The agent card of a public unit
 advertises no security scheme.
 
 Anonymous turns also share the unit's concurrent-turn gate without being able to

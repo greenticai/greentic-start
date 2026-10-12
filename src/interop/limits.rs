@@ -139,15 +139,18 @@ impl RateLimiter {
         now_ms: u64,
     ) -> Result<(), u64> {
         match caller {
-            super::caller::Caller::Anonymous(client) => self.anonymous.check(
+            super::caller::Caller::Anonymous { .. } => self.anonymous.check(
                 deployment,
-                client,
+                caller.fairness_client(),
                 &access.public,
                 charge,
                 Instant::now(),
                 now_ms,
             ),
-            other => self.check(other.key(), charge.cost),
+            other => match other.bucket_key() {
+                Some(key) => self.check(key, charge.cost),
+                None => Ok(()),
+            },
         }
     }
 

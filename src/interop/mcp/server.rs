@@ -158,9 +158,9 @@ worker reads its own secrets from the credentials staged for it, never from a to
             }
             _ => ulid::Ulid::new().to_string(),
         };
-        let session_hint =
-            crate::interop::session_hint("mcp", self.ctx.caller.key(), &conversation_id);
-        let user = format!("mcp:{}", self.ctx.caller.key());
+        let namespace = self.ctx.caller.session_key(&conversation_id);
+        let session_hint = crate::interop::session_hint("mcp", &namespace, &conversation_id);
+        let user = format!("mcp:{namespace}");
 
         // Settle the true price BEFORE running anything. The transport priced
         // this request from the caller's own `Mcp-Method` header, which a
