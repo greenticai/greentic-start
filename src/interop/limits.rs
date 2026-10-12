@@ -49,31 +49,63 @@ pub(crate) const DEFAULT_MAX_CONCURRENT_TURNS: usize = 16;
 /// The env var overriding [`DEFAULT_MAX_CONCURRENT_TURNS`].
 pub(crate) const MAX_CONCURRENT_TURNS_ENV: &str = "GREENTIC_INTEROP_MAX_CONCURRENT_TURNS";
 
-struct Bucket {
-    tokens: f64,
-    last_seen: Instant,
+pub(super) struct Bucket {
+    pub(super) tokens: f64,
+    pub(super) last_seen: Instant,
+    /// The most tokens held, and what a newly-seen caller starts with.
+    capacity: f64,
+    /// Tokens per second.
+    refill_per_sec: f64,
 }
 
 impl Bucket {
     fn seen_at(now: Instant) -> Self {
+        Self::with_rate(BURST_CAPACITY, REFILL_TOKENS_PER_SEC, now)
+    }
+
+    /// A full bucket with its own size and refill, for the anonymous tables.
+    pub(super) fn with_rate(capacity: f64, refill_per_sec: f64, now: Instant) -> Self {
         Self {
-            tokens: BURST_CAPACITY,
+            tokens: capacity,
             last_seen: now,
+            capacity,
+            refill_per_sec,
         }
+    }
+
+    /// Adopt a new size without forgiving or punishing a spender: the policy
+    /// can change between deploys while this process keeps running.
+    pub(super) fn resize(&mut self, capacity: f64, refill_per_sec: f64) {
+        self.capacity = capacity;
+        self.refill_per_sec = refill_per_sec;
+        self.tokens = self.tokens.min(capacity);
+    }
+
+    /// Give back tokens spent on a request that a later check refused.
+    pub(super) fn refund(&mut self, cost: f64) {
+        self.tokens = (self.tokens + cost).min(self.capacity);
+    }
+
+    /// Whether an untouched bucket has refilled to full by `now`. An entry
+    /// for which this holds can be dropped and recreated full at no gain to
+    /// its owner.
+    pub(super) fn is_idle_full(&self, now: Instant) -> bool {
+        let idle = now.saturating_duration_since(self.last_seen).as_secs_f64();
+        self.tokens + idle * self.refill_per_sec >= self.capacity
     }
 
     /// Refill for elapsed time, then spend `cost`. `Err(retry_after_secs)` —
     /// always >= 1 — when the bucket cannot pay.
-    fn try_consume(&mut self, cost: f64, now: Instant) -> Result<(), u64> {
+    pub(super) fn try_consume(&mut self, cost: f64, now: Instant) -> Result<(), u64> {
         let elapsed_secs = now.saturating_duration_since(self.last_seen).as_secs_f64();
         self.last_seen = now;
-        self.tokens = (self.tokens + elapsed_secs * REFILL_TOKENS_PER_SEC).min(BURST_CAPACITY);
+        self.tokens = (self.tokens + elapsed_secs * self.refill_per_sec).min(self.capacity);
         if self.tokens >= cost {
             self.tokens -= cost;
             Ok(())
         } else {
             let deficit = cost - self.tokens;
-            let secs = (deficit / REFILL_TOKENS_PER_SEC).ceil();
+            let secs = (deficit / self.refill_per_sec).ceil();
             // `secs` is small and positive here; the cast cannot truncate a
             // meaningful value.
             Err((secs as u64).max(1))
@@ -85,9 +117,40 @@ impl Bucket {
 #[derive(Default)]
 pub(crate) struct RateLimiter {
     buckets: DashMap<String, Bucket>,
+    /// Anonymous callers of public units; see [`super::anonymous`].
+    pub(super) anonymous: super::anonymous::AnonymousLimiter,
 }
 
 impl RateLimiter {
+    /// Charge `cost` to `caller`, by the rules of its kind.
+    ///
+    /// A staged credential or an OAuth subject has its own bucket, created
+    /// only AFTER it authenticated. An anonymous caller has none of its own:
+    /// it is charged to the unit's public limits ([`super::anonymous`]).
+    /// `counts_as_turn` says whether this charge is a turn for the daily cap
+    /// (which an MCP request announced as cheap and later turned out to be a
+    /// turn settles separately).
+    pub(crate) fn admit(
+        &self,
+        caller: &super::caller::Caller,
+        access: &super::config::AccessPolicy,
+        deployment: &str,
+        charge: Charge,
+        now_ms: u64,
+    ) -> Result<(), u64> {
+        match caller {
+            super::caller::Caller::Anonymous(client) => self.anonymous.check(
+                deployment,
+                client,
+                &access.public,
+                charge,
+                Instant::now(),
+                now_ms,
+            ),
+            other => self.check(other.key(), charge.cost),
+        }
+    }
+
     /// Charge `cost` to `key`. `Err(retry_after_secs)` when refused.
     pub(crate) fn check(&self, key: &str, cost: f64) -> Result<(), u64> {
         self.check_at(key, cost, Instant::now())
@@ -101,6 +164,39 @@ impl RateLimiter {
             .entry(key.to_string())
             .or_insert_with(|| Bucket::seen_at(now))
             .try_consume(cost, now)
+    }
+}
+
+/// One charge against a limiter.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct Charge {
+    pub cost: f64,
+    /// Counts against the daily turn cap of a public unit.
+    pub turn: bool,
+}
+
+impl Charge {
+    /// A turn.
+    pub(crate) const TURN: Charge = Charge {
+        cost: TURN_COST,
+        turn: true,
+    };
+    /// A request that is not a turn.
+    pub(crate) const CHEAP: Charge = Charge {
+        cost: CHEAP_COST,
+        turn: false,
+    };
+    /// The remainder of a turn already partly paid for.
+    pub(crate) fn remainder(cost: f64) -> Charge {
+        Charge { cost, turn: true }
+    }
+    /// A request priced `cost` up front, a turn exactly when it pays the full
+    /// turn price.
+    pub(crate) fn priced(cost: f64) -> Charge {
+        Charge {
+            cost,
+            turn: cost >= TURN_COST,
+        }
     }
 }
 

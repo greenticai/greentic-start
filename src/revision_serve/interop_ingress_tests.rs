@@ -136,6 +136,8 @@ enum Store {
     Empty,
     /// The backend cannot answer.
     Down,
+    /// Exactly these staged bytes.
+    Custom(Vec<u8>),
     /// A2A and MCP on, plus a staged `metering` block — the unit whose usage
     /// is recorded (see `interop_ingress_metering_tests`).
     Metered,
@@ -202,6 +204,11 @@ fn activation_full(
                 config_uri(),
                 staged_interop_config(false, true, issuer.as_deref()),
             );
+            Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
+        }
+        Store::Custom(bytes) => {
+            let mut entries = HashMap::new();
+            entries.insert(config_uri(), bytes);
             Arc::new(TestSecrets::with(entries, Arc::clone(&reads)))
         }
         Store::Empty => Arc::new(TestSecrets::with(HashMap::new(), Arc::clone(&reads))),
@@ -1787,4 +1794,269 @@ async fn a_static_route_no_setup_descriptor_declares_is_not_gated() {
     assert_eq!(response.status, 200, "body: {}", response.body);
     assert!(response.body.contains("chat"));
     assert_eq!(response.header("x-frame-options"), None);
+}
+
+// ---------------------------------------------------------------------------
+// Access policy: public mode, wired end to end (access-policy spec §6.2)
+// ---------------------------------------------------------------------------
+
+/// The staged document with A2A and MCP on and this `access` block.
+fn staged_with_access(access: Value) -> Vec<u8> {
+    let mut doc: Value = serde_json::from_slice(&staged_interop_config_with(
+        true,
+        true,
+        None,
+        Some("https://w.example/mcp"),
+    ))
+    .expect("staged doc");
+    doc["access"] = access;
+    doc.to_string().into_bytes()
+}
+
+fn public_access(burst: u32, daily_cap: Option<u32>) -> Value {
+    json!({
+        "visibility": "public",
+        "mechanisms": ["api_key", "oauth"],
+        "public": {"rate_per_min": 60, "burst": burst, "daily_turn_cap": daily_cap},
+        "generation": 3
+    })
+}
+
+fn reply_ok() -> Vec<Activity> {
+    vec![Activity::custom(
+        "response",
+        json!({"reply": "hello there"}),
+    )]
+}
+
+fn public_state(access: Value) -> Arc<ServeState> {
+    let (activation, _) = activation_with(Store::Custom(staged_with_access(access)));
+    state_with(activation, interop_with_base_url(reply_ok()))
+}
+
+/// A Direct Line style token: HS256 under a provider signing key.
+fn direct_line_token() -> String {
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+    jsonwebtoken::encode(
+        &header,
+        &json!({"sub": "webchat-user", "exp": 4_000_000_000u64}),
+        &jsonwebtoken::EncodingKey::from_secret(b"jwt_signing_key"),
+    )
+    .expect("token")
+}
+
+#[tokio::test]
+async fn a_public_unit_answers_a_send_message_with_no_credential() {
+    let state = public_state(public_access(20, None));
+    let response = exchange(&state, false, &post("/a2a", &[], &send_message_body("c-1"))).await;
+    assert_eq!(response.status, 200, "{}", response.body);
+    assert_eq!(
+        response.json()["result"]["message"]["parts"][0]["text"],
+        "hello there"
+    );
+}
+
+#[tokio::test]
+async fn a_public_unit_still_refuses_a_credential_that_is_presented_and_wrong() {
+    let state = public_state(public_access(20, None));
+    let wrong = [("Authorization", "Bearer gtw_a-typo")];
+    let response = exchange(
+        &state,
+        false,
+        &post("/a2a", &wrong, &send_message_body("c-1")),
+    )
+    .await;
+    assert_eq!(response.status, 401, "{}", response.body);
+    let response = exchange(
+        &state,
+        false,
+        &post(
+            "/mcp",
+            &[
+                wrong[0],
+                ("Accept", "application/json, text/event-stream"),
+                ("Mcp-Method", "tools/call"),
+            ],
+            &tools_call("hi", None),
+        ),
+    )
+    .await;
+    assert_eq!(response.status, 401, "{}", response.body);
+    // …while the right bearer is still honoured on the same unit.
+    let response = exchange(
+        &state,
+        false,
+        &post("/a2a", &[AUTH], &send_message_body("c-1")),
+    )
+    .await;
+    assert_eq!(response.status, 200, "{}", response.body);
+}
+
+#[tokio::test]
+async fn a_direct_line_token_is_refused_on_a_private_unit_and_anonymous_on_a_public_one() {
+    let token = format!("Bearer {}", direct_line_token());
+    let header = [("Authorization", token.as_str())];
+    let mcp_headers = [
+        header[0],
+        ("Accept", "application/json, text/event-stream"),
+        ("Mcp-Method", "tools/call"),
+    ];
+
+    let (activation, _) = activation_with(Store::Config(true));
+    let private = state_with(activation, interop_with_base_url(reply_ok()));
+    let response = exchange(
+        &private,
+        false,
+        &post("/a2a", &header, &send_message_body("c")),
+    )
+    .await;
+    assert_eq!(response.status, 401, "private /a2a: {}", response.body);
+
+    let (activation, _) = activation_with(Store::Mcp(None));
+    let private_mcp = state_with(activation, interop_with_base_url(reply_ok()));
+    let response = exchange(
+        &private_mcp,
+        false,
+        &post("/mcp", &mcp_headers, &tools_call("hi", None)),
+    )
+    .await;
+    assert_eq!(response.status, 401, "private /mcp: {}", response.body);
+
+    let open = public_state(public_access(20, None));
+    let response = exchange(
+        &open,
+        false,
+        &post("/a2a", &header, &send_message_body("c")),
+    )
+    .await;
+    assert_eq!(response.status, 200, "public /a2a: {}", response.body);
+    let response = exchange(
+        &open,
+        false,
+        &post("/mcp", &mcp_headers, &tools_call("hi", None)),
+    )
+    .await;
+    assert_eq!(response.status, 200, "public /mcp: {}", response.body);
+}
+
+#[tokio::test]
+async fn an_unreadable_access_block_leaves_the_unit_private() {
+    for access in [
+        json!({"visibility": "public", "mechanisms": "nope"}),
+        json!({"visibility": "public", "public": {"rate_per_min": 0, "burst": 0}}),
+        json!("public"),
+    ] {
+        let state = public_state(access.clone());
+        let response = exchange(&state, false, &post("/a2a", &[], &send_message_body("c"))).await;
+        assert_eq!(response.status, 401, "{access}: {}", response.body);
+    }
+}
+
+/// The per-unit bucket is the guarantee: rotating `X-Forwarded-For` on every
+/// request mints a fresh per-client bucket each time and still cannot take
+/// more than the unit's burst.
+#[tokio::test]
+async fn a_spoofed_forwarded_for_cannot_defeat_the_per_unit_bucket() {
+    let burst = 4u32;
+    let state = public_state(public_access(burst, None));
+    let mut served = 0;
+    let mut refused = 0;
+    for i in 0..(burst * 3) {
+        let xff = format!("198.51.100.{}", i + 1);
+        let response = exchange(
+            &state,
+            false,
+            &post(
+                "/a2a",
+                &[("X-Forwarded-For", xff.as_str())],
+                &send_message_body("c"),
+            ),
+        )
+        .await;
+        match response.status {
+            200 => served += 1,
+            429 => {
+                refused += 1;
+                assert!(response.header("retry-after").is_some());
+            }
+            other => panic!("unexpected {other}: {}", response.body),
+        }
+    }
+    assert_eq!(served, burst, "exactly the unit's burst may be served");
+    assert_eq!(refused, burst * 2);
+}
+
+#[tokio::test]
+async fn an_anonymous_mcp_turn_is_held_to_the_same_unit_bucket() {
+    let burst = 3u32;
+    let state = public_state(public_access(burst, None));
+    let mut served = 0;
+    for i in 0..(burst * 3) {
+        let xff = format!("198.51.100.{}", i + 1);
+        let response = exchange(
+            &state,
+            false,
+            &post(
+                "/mcp",
+                &[
+                    ("X-Forwarded-For", xff.as_str()),
+                    ("Accept", "application/json, text/event-stream"),
+                    ("Mcp-Method", "tools/call"),
+                ],
+                &tools_call("hi", None),
+            ),
+        )
+        .await;
+        if response.status == 200 {
+            served += 1;
+        } else {
+            assert_eq!(response.status, 429, "{}", response.body);
+        }
+    }
+    assert_eq!(served, burst);
+}
+
+#[tokio::test]
+async fn the_daily_cap_refuses_until_the_next_utc_midnight() {
+    let state = public_state(public_access(20, Some(2)));
+    for expected in [200, 200, 429] {
+        let response = exchange(&state, false, &post("/a2a", &[], &send_message_body("c"))).await;
+        assert_eq!(response.status, expected, "{}", response.body);
+        if expected == 429 {
+            let retry: u64 = response
+                .header("retry-after")
+                .and_then(|v| v.parse().ok())
+                .expect("a numeric Retry-After");
+            assert!((1..=86_400).contains(&retry), "{retry}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn a_public_unit_advertises_no_bearer_scheme_and_a_private_one_does() {
+    let state = public_state(public_access(20, None));
+    let card = exchange(&state, false, &get("/.well-known/agent-card.json", &[])).await;
+    assert_eq!(card.status, 200, "{}", card.body);
+    let card = card.json();
+    assert!(
+        card.get("securitySchemes")
+            .is_none_or(|v| v.as_object().is_some_and(|o| o.is_empty())),
+        "{card}"
+    );
+    assert!(
+        card.get("securityRequirements")
+            .is_none_or(|v| v.as_array().is_some_and(|a| a.is_empty())),
+        "{card}"
+    );
+
+    let (activation, _) = activation_with(Store::Config(true));
+    let private = state_with(activation, interop_with_base_url(reply_ok()));
+    let card = exchange(&private, false, &get("/.well-known/agent-card.json", &[]))
+        .await
+        .json();
+    assert!(card["securitySchemes"]["bearer"].is_object(), "{card}");
+    assert_eq!(
+        card["securityRequirements"].as_array().map(Vec::len),
+        Some(1)
+    );
 }

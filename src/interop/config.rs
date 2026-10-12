@@ -145,6 +145,12 @@ impl Default for AccessPolicy {
     }
 }
 
+impl AccessPolicy {
+    pub(crate) fn allows(&self, mechanism: Mechanism) -> bool {
+        self.mechanisms.contains(&mechanism)
+    }
+}
+
 /// A parsed, validated interop config.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InteropConfig {

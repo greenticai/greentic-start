@@ -177,8 +177,8 @@ async fn rpc_call(
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
     let ctx = fixture.ctx();
-    match crate::interop::a2a::rpc::authenticate(&ctx, authorization) {
-        Ok(credential_id) => handle_jsonrpc(&ctx, req, credential_id, runner).await,
+    match crate::interop::a2a::rpc::authenticate(&ctx, authorization, "test-client").await {
+        Ok(caller) => handle_jsonrpc(&ctx, req, &caller, runner).await,
         Err(response) => *response,
     }
 }
@@ -191,8 +191,8 @@ async fn rest_call(
     runner: &dyn TurnRunner,
 ) -> HttpResponse {
     let ctx = fixture.ctx();
-    match crate::interop::a2a::rpc::authenticate(&ctx, authorization) {
-        Ok(credential_id) => handle_rest_send(&ctx, req, credential_id, runner).await,
+    match crate::interop::a2a::rpc::authenticate(&ctx, authorization, "test-client").await {
+        Ok(caller) => handle_rest_send(&ctx, req, &caller, runner).await,
         Err(response) => *response,
     }
 }
@@ -862,6 +862,81 @@ async fn a_request_refused_before_the_turn_records_nothing() {
     assert!(runner.calls().is_empty());
 }
 
+/// An OAuth caller is namespaced by its own key and is not a credential the
+/// designer staged, so its usage event names none.
+#[tokio::test]
+async fn an_oauth_caller_runs_in_its_own_namespace_and_names_no_credential() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![dw_agent_reply("ok")]);
+    let body = rpc(methods::SEND_MESSAGE, send_params(Some("ctx-o")));
+    let caller = Caller::Oauth("svc~client-1~acme".into());
+    let response = handle_jsonrpc(&fixture.ctx(), &request(&body), &caller, &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let calls = runner.calls();
+    assert_eq!(calls[0].0, "a2a:svc~client-1~acme:ctx-o");
+    assert_eq!(calls[0].1, "a2a:svc~client-1~acme");
+    let queued = fixture.meter.drain();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].event.credential_id, None);
+    assert_eq!(queued[0].event.caller_kind, None);
+}
+
+/// An anonymous turn is recorded, marked as such, and names no credential.
+#[tokio::test]
+async fn an_anonymous_turn_is_recorded_as_anonymous_with_no_credential() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    config.access.visibility = crate::interop::config::Visibility::Public;
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![dw_agent_reply("ok")]);
+    let body = rpc(methods::SEND_MESSAGE, send_params(Some("ctx-a")));
+    let caller = match authenticate(&fixture.ctx(), None, "203.0.113.7").await {
+        Ok(caller) => caller,
+        Err(response) => panic!("a public unit must serve it: {}", response.status()),
+    };
+    assert!(caller.is_anonymous());
+    let response = handle_jsonrpc(&fixture.ctx(), &request(&body), &caller, &runner).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(runner.calls()[0].0.starts_with("a2a:anon_"));
+    let queued = fixture.meter.drain();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].event.credential_id, None);
+    assert_eq!(queued[0].event.caller_kind, Some("anonymous"));
+    let wire = serde_json::to_value(&queued[0].event).expect("event");
+    assert_eq!(wire["caller_kind"], "anonymous");
+    assert!(wire.get("credential_id").is_none());
+    assert!(!wire.to_string().contains("203.0.113.7"), "{wire}");
+}
+
+/// A private unit's usage event is unchanged: no `caller_kind` key at all.
+#[tokio::test]
+async fn a_staged_credentials_event_carries_no_caller_kind() {
+    let mut config = config();
+    config.metering = Some(unreachable_metering());
+    let fixture = Fixture::new(config);
+    let runner = FakeRunner::replying(vec![dw_agent_reply("ok")]);
+    let body = rpc(methods::SEND_MESSAGE, send_params(None));
+    let _ = rpc_call(&fixture, Some(BEARER), &request(&body), &runner).await;
+    let queued = fixture.meter.drain();
+    let wire = serde_json::to_value(&queued[0].event).expect("event");
+    assert!(wire.get("caller_kind").is_none(), "{wire}");
+    assert_eq!(wire["credential_id"], "c1");
+}
+
+/// The unauthenticated peer on a private unit is told so, with the challenge.
+#[tokio::test]
+async fn a_private_unit_answers_no_credential_with_a_challenge() {
+    let fixture = Fixture::new(config());
+    let refused = authenticate(&fixture.ctx(), None, "c").await;
+    let Err(response) = refused else {
+        panic!("a private unit must refuse a request with no credential");
+    };
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert!(response.headers().contains_key(header::WWW_AUTHENTICATE));
+}
+
 /// A turn that produced no measurable usage still produces an event: "a turn
 /// ran and cost nothing measurable" and "no turn ran" are different facts.
 #[tokio::test]
@@ -903,7 +978,8 @@ async fn the_rest_binding_records_the_same_event() {
     let runner = FakeRunner::replying(vec![dw_agent_reply("the answer")]);
     let body = send_params(None).to_string().into_bytes();
     let ctx = fixture.ctx();
-    let response = handle_rest_send(&ctx, &request(&body), "c1", &runner).await;
+    let response =
+        handle_rest_send(&ctx, &request(&body), &Caller::Bearer("c1".into()), &runner).await;
     assert_eq!(response.status(), StatusCode::OK);
     let queued = fixture.meter.drain();
     assert_eq!(queued.len(), 1);

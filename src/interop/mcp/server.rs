@@ -22,7 +22,7 @@ use serde_json::{Map, Value, json};
 
 use crate::interop::a2a::rpc::TurnRunner;
 use crate::interop::input_request::answer_payload;
-use crate::interop::limits::{RateLimiter, TURN_COST, TurnGate};
+use crate::interop::limits::{Charge, RateLimiter, TURN_COST, TurnGate};
 use crate::interop::metering::event::{Surface, usage_from_replies};
 use crate::interop::reply::{ReplyItem, project_replies};
 use greentic_deploy_spec::ids::DeploymentId;
@@ -49,14 +49,14 @@ pub(crate) struct McpContext {
     pub deployment_id: DeploymentId,
     pub tenant: String,
     pub bundle_id: String,
-    /// The OAuth `sub` or the staged credential id — the conversation
-    /// namespace, so two callers cannot resume each other's parked flow.
-    pub caller_key: String,
-    /// The staged credential id when the caller authenticated with the A2A
-    /// bearer, `None` for an OAuth one. Distinct from `caller_key`, which
-    /// collapses the two: a usage event may only name a credential the
-    /// designer staged, and an OAuth `sub` is not one.
-    pub credential_id: Option<String>,
+    /// Who the request authenticated as. Its key is the conversation
+    /// namespace, so two callers cannot resume each other's parked flow, and
+    /// it decides what a usage event may name: only a staged credential is
+    /// one, an OAuth subject or an anonymous caller is not.
+    pub caller: crate::interop::caller::Caller,
+    /// The unit's access policy, for the limits an anonymous caller is held
+    /// to when the tool settles a turn's price.
+    pub access: crate::interop::config::AccessPolicy,
     /// Where to record what this unit's turns spend. `None` when the unit
     /// stages no `metering` block.
     pub metering: Option<crate::interop::metering::TurnMetering>,
@@ -159,8 +159,8 @@ worker reads its own secrets from the credentials staged for it, never from a to
             _ => ulid::Ulid::new().to_string(),
         };
         let session_hint =
-            crate::interop::session_hint("mcp", &self.ctx.caller_key, &conversation_id);
-        let user = format!("mcp:{}", self.ctx.caller_key);
+            crate::interop::session_hint("mcp", self.ctx.caller.key(), &conversation_id);
+        let user = format!("mcp:{}", self.ctx.caller.key());
 
         // Settle the true price BEFORE running anything. The transport priced
         // this request from the caller's own `Mcp-Method` header, which a
@@ -168,7 +168,13 @@ worker reads its own secrets from the credentials staged for it, never from a to
         // cost a turn regardless.
         let owed = TURN_COST - self.ctx.prepaid;
         if owed > 0.0
-            && let Err(retry_after) = self.ctx.limiter.check(&self.ctx.caller_key, owed)
+            && let Err(retry_after) = self.ctx.limiter.admit(
+                &self.ctx.caller,
+                &self.ctx.access,
+                &self.ctx.deployment_id.to_string(),
+                Charge::remainder(owed),
+                crate::ingress_auth::now_ms(),
+            )
         {
             return Ok(failed(
                 &conversation_id,
@@ -208,12 +214,7 @@ worker reads its own secrets from the credentials staged for it, never from a to
                 .as_ref()
                 .map(|replies| usage_from_replies(replies))
                 .unwrap_or_default();
-            metering.record(
-                Surface::Mcp,
-                self.ctx.credential_id.as_deref(),
-                usage,
-                elapsed,
-            );
+            metering.record_for(Surface::Mcp, &self.ctx.caller, usage, elapsed);
         }
         let Ok(replies) = outcome else {
             // A tool-level error, not a protocol error: the request was valid

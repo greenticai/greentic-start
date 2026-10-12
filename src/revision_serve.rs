@@ -1427,6 +1427,22 @@ async fn serve(
         .deployment_routes
         .resolve_mount(host_header.as_deref(), &path);
     let interop_path = interop_mount.map_or(path.as_str(), |mount| mount.remainder(&path));
+    // Only an interop request needs the client behind it, and only a public
+    // unit uses it; computed here because `req` is consumed below.
+    let interop_client = if interop_mount.is_some()
+        && (crate::interop::a2a::route_for(interop_path).is_some()
+            || crate::interop::mcp::route_for(interop_path).is_some())
+    {
+        crate::interop::anonymous::client_label(
+            req.extensions()
+                .get::<crate::http_ingress::limits::PeerIp>()
+                .map(|peer| peer.0),
+            req.headers(),
+            state.interop.trusted_proxy_hops,
+        )
+    } else {
+        String::new()
+    };
 
     // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
     // provider routing, and only for a unit whose staged config enables the
@@ -1451,6 +1467,7 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: if_none_match.as_deref(),
                         mcp_method: None,
+                        client: &interop_client,
                     },
                 )
                 .await;
@@ -1480,6 +1497,7 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: None,
                         mcp_method: mcp_method_header.as_deref(),
+                        client: &interop_client,
                     },
                 )
                 .await;
@@ -2232,8 +2250,10 @@ async fn serve_interop_inner(
     // `Authorization` header, so an unauthenticated peer must not be able to
     // make this process read (and buffer) a megabyte per request. `/mcp`
     // already had this order; this path did not.
-    let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
-        .map_err(|response| *response)?;
+    let caller =
+        crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization, headers.client)
+            .await
+            .map_err(|response| *response)?;
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         trace.outcome(crate::interop::telemetry::Outcome::Rejected);
         error_response(
@@ -2255,11 +2275,9 @@ async fn serve_interop_inner(
     };
     Ok(match route {
         crate::interop::a2a::A2aRoute::JsonRpc => {
-            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, credential_id, &runner).await
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, &caller, &runner).await
         }
-        _ => {
-            crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, credential_id, &runner).await
-        }
+        _ => crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, &caller, &runner).await,
     })
 }
 
@@ -2328,11 +2346,12 @@ async fn serve_mcp(
     let metadata_url = resource.as_deref().map(|resource| {
         crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), resource)
     });
-    let caller = match crate::interop::mcp::auth::authenticate(
+    let caller = match crate::interop::auth::authenticate(
         &unit.config,
         resource.as_deref(),
         authorization,
         crate::ingress_auth::now_ms(),
+        headers.client,
     )
     .await
     {
@@ -2353,7 +2372,13 @@ async fn serve_mcp(
     // so it is a pre-filter and never the final price: the `ask` tool settles
     // the remainder of a turn's cost against this same bucket.
     let cost = crate::interop::mcp::request_cost(mcp_method);
-    if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
+    if let Err(retry_after) = state.interop.limiter.admit(
+        &caller,
+        &unit.config.access,
+        &unit.deployment_id.to_string(),
+        crate::interop::limits::Charge::priced(cost),
+        crate::ingress_auth::now_ms(),
+    ) {
         let mut response = error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests from this connection; wait and retry",
@@ -2377,14 +2402,8 @@ async fn serve_mcp(
         deployment_id: unit.deployment_id,
         tenant: unit.tenant.clone(),
         bundle_id: unit.bundle_id.clone(),
-        caller_key: caller.key().to_string(),
-        // Only a STAGED credential may be named as one; an OAuth `sub` is
-        // minted by the authorization server and is not a credential the
-        // designer issued.
-        credential_id: match &caller {
-            crate::interop::mcp::auth::McpCaller::Bearer(id) => Some(id.clone()),
-            crate::interop::mcp::auth::McpCaller::Oauth(_) => None,
-        },
+        caller: caller.clone(),
+        access: unit.config.access.clone(),
         metering: crate::interop::metering::TurnMetering::for_unit(
             &state.interop.meter,
             &unit.config,
@@ -2514,6 +2533,9 @@ struct InteropRequestHeaders<'a> {
     /// `Mcp-Method` (SEP-2243), which the MCP limiter meters on so it never
     /// has to parse a body.
     mcp_method: Option<&'a str>,
+    /// The client behind the request, for an anonymous caller of a public
+    /// unit ([`crate::interop::anonymous::client_label`]).
+    client: &'a str,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the

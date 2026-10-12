@@ -5,6 +5,9 @@
 //! Authentication of the generic ingress lives in [`crate::ingress_auth`].
 
 pub(crate) mod a2a;
+pub(crate) mod anonymous;
+pub(crate) mod auth;
+pub(crate) mod caller;
 pub(crate) mod config;
 pub(crate) mod config_cache;
 pub(crate) mod input_request;
@@ -81,6 +84,10 @@ pub(crate) struct InteropState {
     /// because the bound is what matters; each event carries its own unit's
     /// endpoint. See [`metering`].
     pub meter: std::sync::Arc<metering::Meter>,
+    /// How many proxies in front of this host append to `X-Forwarded-For`
+    /// (`GREENTIC_TRUSTED_PROXY_HOPS`; `1` on Cloud Run, else `0`), which
+    /// decides the client an anonymous caller is told apart by.
+    pub trusted_proxy_hops: usize,
     /// See [`TurnOverride`].
     #[cfg(test)]
     pub turn_override: Option<TurnOverride>,
@@ -101,6 +108,7 @@ impl InteropState {
                     .as_deref(),
             ))),
             meter: std::sync::Arc::new(metering::Meter::default()),
+            trusted_proxy_hops: crate::http_ingress::limits::trusted_proxy_hops(),
             #[cfg(test)]
             turn_override: None,
         }
@@ -117,6 +125,9 @@ impl Default for InteropState {
             limiter: std::sync::Arc::new(limits::RateLimiter::default()),
             turns: std::sync::Arc::new(limits::TurnGate::new(limits::DEFAULT_MAX_CONCURRENT_TURNS)),
             meter: std::sync::Arc::new(metering::Meter::default()),
+            // The Cloud Run default: the right-most `X-Forwarded-For` entry is
+            // the one the front end appended.
+            trusted_proxy_hops: 1,
             #[cfg(test)]
             turn_override: None,
         }

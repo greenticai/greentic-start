@@ -110,8 +110,12 @@ fn server_running(
         deployment_id,
         tenant: "default".into(),
         bundle_id: "support-bot".into(),
-        caller_key: caller_key.into(),
-        credential_id: credential_id.map(str::to_string),
+        // A staged credential names itself; anything else is an OAuth subject.
+        caller: match credential_id {
+            Some(id) => crate::interop::caller::Caller::Bearer(id.to_string()),
+            None => crate::interop::caller::Caller::Oauth(caller_key.to_string()),
+        },
+        access: config.access.clone(),
         metering: TurnMetering::for_unit(meter, config, deployment_id, "support-bot"),
         agent_name: "Support Bot".into(),
     }))
