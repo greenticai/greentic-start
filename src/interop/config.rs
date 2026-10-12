@@ -216,27 +216,6 @@ struct RawConfig {
     a2a_resource: Option<String>,
 }
 
-/// Wire form of the `access` block, before validation.
-#[derive(Deserialize)]
-struct RawAccess {
-    #[serde(default)]
-    visibility: Option<String>,
-    #[serde(default)]
-    mechanisms: Option<Vec<String>>,
-    #[serde(default)]
-    public: Option<RawPublicLimits>,
-    #[serde(default)]
-    generation: Option<u64>,
-}
-
-#[derive(Deserialize)]
-struct RawPublicLimits {
-    rate_per_min: u32,
-    burst: u32,
-    #[serde(default)]
-    daily_turn_cap: Option<u32>,
-}
-
 /// Parse the staged bytes. `None` means "treat as absent": the document is not
 /// JSON, carries no or an unknown `v`, or has a malformed top level. Each case
 /// is logged at `warn`, because a unit that staged a config and got none is a
@@ -321,83 +300,94 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
     })
 }
 
-/// Read the `access` block alone, like `metering`. **Any problem returns the
-/// default (private), never a partly-read public policy**: a block this build
-/// cannot fully understand must not open a unit to the internet. Callers that
-/// want to know why read the `warn`.
+/// Read the `access` block alone, like `metering`. **Any problem forces the
+/// unit private**, never a partly-read public policy: a block this build cannot
+/// fully understand must not open a unit to the internet.
+///
+/// The mechanisms list is read FIRST and on its own, because it is the one
+/// field that narrows access and must never be silently widened:
+///
+/// - a readable list keeps its known entries (an unknown name is dropped alone
+///   and logged);
+/// - an unreadable one, an empty one, or one with no known entry makes the
+///   whole block invalid: private with the DEFAULT mechanisms, logged at
+///   error level naming the offending value;
+/// - a problem anywhere ELSE (visibility, public limits, shape) forces private
+///   but keeps the readable mechanisms, so a narrowed list stays narrowed.
 fn parse_access(value: Value, unit: &str) -> AccessPolicy {
-    // serde reads a JSON ARRAY into a struct field by field, so `["public"]`
-    // would otherwise parse as `visibility: "public"`.
-    if !value.is_object() {
-        warn(
-            unit,
-            "`access` is not an object; treating the unit as private",
-        );
+    let Some(object) = value.as_object() else {
+        invalid(unit, "`access` is not an object");
         return AccessPolicy::default();
-    }
-    let raw: RawAccess = match serde_json::from_value(value) {
-        Ok(raw) => raw,
-        Err(err) => {
-            warn(
-                unit,
-                &format!("`access` is malformed ({err}); treating the unit as private"),
-            );
-            return AccessPolicy::default();
-        }
     };
-    let visibility = match raw.visibility.as_deref() {
-        None | Some("private") => Visibility::Private,
-        Some("public") => Visibility::Public,
-        Some(other) => {
-            warn(
-                unit,
-                &format!(
-                    "`access.visibility` `{other}` is not understood; treating the unit as private"
-                ),
-            );
-            Visibility::Private
-        }
-    };
-    let mechanisms = match raw.mechanisms {
+    let mechanisms = match object.get("mechanisms") {
         None => AccessPolicy::default().mechanisms,
-        Some(names) => {
+        Some(Value::Array(names)) => {
             let mut parsed = Vec::new();
-            for name in &names {
+            for name in names {
                 let mechanism = match name.as_str() {
-                    "api_key" => Mechanism::ApiKey,
-                    "oauth" => Mechanism::Oauth,
-                    // An unknown mechanism is dropped alone: it can only
-                    // narrow what a caller may present.
-                    _ => continue,
+                    Some("api_key") => Mechanism::ApiKey,
+                    Some("oauth") => Mechanism::Oauth,
+                    _ => {
+                        warn(
+                            unit,
+                            &format!("ignoring unknown `access.mechanisms` entry {name}"),
+                        );
+                        continue;
+                    }
                 };
                 if !parsed.contains(&mechanism) {
                     parsed.push(mechanism);
                 }
             }
             if parsed.is_empty() {
-                AccessPolicy::default().mechanisms
-            } else {
-                parsed
-            }
-        }
-    };
-    // Limits are read only for a public unit, and a public unit with limits
-    // that cannot work (zero) is not public at all.
-    let public = if visibility == Visibility::Public {
-        match raw.public {
-            None => PublicLimits::default(),
-            Some(limits) if limits.rate_per_min > 0 && limits.burst > 0 => PublicLimits {
-                rate_per_min: limits.rate_per_min,
-                burst: limits.burst,
-                daily_turn_cap: limits.daily_turn_cap.filter(|cap| *cap > 0),
-            },
-            Some(_) => {
-                warn(
+                invalid(
                     unit,
-                    "`access.public` limits must be positive; treating the unit as private",
+                    &format!(
+                        "`access.mechanisms` {} names no known mechanism",
+                        Value::Array(names.clone())
+                    ),
                 );
                 return AccessPolicy::default();
             }
+            parsed
+        }
+        Some(other) => {
+            invalid(unit, &format!("`access.mechanisms` {other} is not a list"));
+            return AccessPolicy::default();
+        }
+    };
+    let generation = object
+        .get("generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let private = |reason: &str| {
+        warn(unit, &format!("{reason}; treating the unit as private"));
+        AccessPolicy {
+            visibility: Visibility::Private,
+            mechanisms: mechanisms.clone(),
+            public: PublicLimits::default(),
+            generation,
+        }
+    };
+    let visibility = match object.get("visibility") {
+        None => Visibility::Private,
+        Some(Value::String(v)) if v == "private" => Visibility::Private,
+        Some(Value::String(v)) if v == "public" => Visibility::Public,
+        Some(other) => {
+            return private(&format!("`access.visibility` {other} is not understood"));
+        }
+    };
+    // Limits are read only for a public unit, and a public unit with limits
+    // that cannot work is not public at all.
+    let public = if visibility == Visibility::Public {
+        match object.get("public") {
+            None => PublicLimits::default(),
+            Some(value) => match read_limits(value) {
+                Some(limits) => limits,
+                None => {
+                    return private("`access.public` limits are malformed or not positive");
+                }
+            },
         }
     } else {
         PublicLimits::default()
@@ -406,8 +396,28 @@ fn parse_access(value: Value, unit: &str) -> AccessPolicy {
         visibility,
         mechanisms,
         public,
-        generation: raw.generation.unwrap_or(0),
+        generation,
     }
+}
+
+fn read_limits(value: &Value) -> Option<PublicLimits> {
+    let object = value.as_object()?;
+    let positive = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    };
+    let daily_turn_cap = match object.get("daily_turn_cap") {
+        None | Some(Value::Null) => None,
+        Some(cap) => Some(cap.as_u64().and_then(|n| u32::try_from(n).ok())?).filter(|n| *n > 0),
+    };
+    Some(PublicLimits {
+        rate_per_min: positive("rate_per_min")?,
+        burst: positive("burst")?,
+        daily_turn_cap,
+    })
 }
 
 /// `https://…`, or `http://` to a loopback host (local development). Anything
@@ -504,6 +514,17 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// An `access` block that had to be thrown away. Error level: an operator
+/// who narrowed access and got the default back needs to see it.
+fn invalid(unit: &str, message: &str) {
+    operator_log::error(
+        module_path!(),
+        format!(
+            "interop config for unit `{unit}`: {message}; treating the unit as private with the default mechanisms"
+        ),
+    );
 }
 
 fn warn(unit: &str, message: &str) {
@@ -679,6 +700,45 @@ mod tests {
         }
         let c = parse_doc(json!({"access": {"mechanisms": ["saml", "api_key", "api_key"]}}));
         assert_eq!(c.access.mechanisms, vec![Mechanism::ApiKey]);
+    }
+
+    /// A problem elsewhere in the block forces private but must not widen a
+    /// narrowed list back to both mechanisms.
+    #[test]
+    fn a_malformed_block_keeps_a_readable_narrowed_mechanism_list() {
+        for access in [
+            json!({"visibility": "public", "mechanisms": ["oauth"], "public": {"rate_per_min": 0, "burst": 5}}),
+            json!({"visibility": "public", "mechanisms": ["oauth"], "public": "junk"}),
+            json!({"visibility": "world", "mechanisms": ["oauth"]}),
+            json!({"visibility": true, "mechanisms": ["oauth"]}),
+            json!({"visibility": "public", "mechanisms": ["oauth"], "public": {"rate_per_min": 5, "burst": 5, "daily_turn_cap": "x"}}),
+        ] {
+            let c = parse_doc(json!({"access": access.clone()}));
+            assert_eq!(c.access.visibility, Visibility::Private, "{access}");
+            assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth], "{access}");
+        }
+    }
+
+    /// An unreadable, empty or all-unknown list invalidates the whole block.
+    #[test]
+    fn an_unusable_mechanism_list_invalidates_the_whole_block() {
+        for mechanisms in [
+            json!([]),
+            json!(["saml"]),
+            json!([1, null]),
+            json!("oauth"),
+            json!({"a": 1}),
+        ] {
+            let c = parse_doc(
+                json!({"access": {"visibility": "public", "mechanisms": mechanisms.clone()}}),
+            );
+            assert_eq!(c.access.visibility, Visibility::Private, "{mechanisms}");
+            assert_eq!(
+                c.access.mechanisms,
+                AccessPolicy::default().mechanisms,
+                "{mechanisms}"
+            );
+        }
     }
 
     #[test]

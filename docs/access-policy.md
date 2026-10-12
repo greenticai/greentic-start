@@ -14,8 +14,18 @@ them. Contract: designer repo
 
 ## Reading the block never opens a unit
 
-Absent, unparseable, an unknown `visibility`, non-positive public limits or a
-non-object `access` all read as **private with both mechanisms**. Never public.
+Any problem in the block forces the unit **private**; never public. The
+`mechanisms` list is read first and on its own, so a problem elsewhere never
+widens it:
+
+- readable list: its known entries are kept (an unknown name is dropped alone);
+- an empty list, one with no known entry, or one that is not a list invalidates
+  the whole block: private with both mechanisms, logged at **error** level
+  naming the value;
+- an unknown `visibility`, malformed or non-positive public limits, or a
+  malformed `daily_turn_cap` force private but KEEP the readable list, so an
+  `["oauth"]` unit stays OAuth-only;
+- a non-object `access` or an absent block: private with both mechanisms.
 `public` limits are read only when `visibility` is `public`. `a2a_resource` is
 kept only when it is `https://` (or loopback `http://`).
 
