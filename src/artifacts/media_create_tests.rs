@@ -119,7 +119,11 @@ fn a_file_this_unit_never_stored_is_refused() {
 // ── a file created mid-flow (runner `created_artifacts` list) ────────────────
 
 fn listed(ids: &[&str]) -> Value {
-    json!(ids.iter().map(|id| json!({"id": id, "mime_type": "application/pdf", "name": "n.pdf"})).collect::<Vec<_>>())
+    json!(
+        ids.iter()
+            .map(|id| json!({"id": id, "mime_type": "application/pdf", "name": "n.pdf"}))
+            .collect::<Vec<_>>()
+    )
 }
 
 fn other_id(n: u8) -> String {
@@ -183,7 +187,8 @@ fn the_list_is_removed_before_a_reply_is_shaped() {
     let mut payload = json!({"text": "hi", "created_artifacts": listed(&[ID])});
     super::outbound::strip_created_list(&mut payload);
     assert_eq!(payload, json!({"text": "hi"}));
-    let mut pending = json!({"status": "pending", "response": {"created_artifacts": listed(&[ID])}});
+    let mut pending =
+        json!({"status": "pending", "response": {"created_artifacts": listed(&[ID])}});
     super::outbound::strip_created_list(&mut pending);
     assert!(pending["response"].get("created_artifacts").is_none());
 }
@@ -217,8 +222,18 @@ async fn a_mid_flow_file_reaches_webchat_and_downloads() {
     };
     let out = prepare_replies(vec![reply], &side, &ingress, PROVIDER, &ctx, NOW);
     assert_eq!(out.len(), 1);
-    assert_eq!(out[0].attachments.len(), 1, "WebChat gets a typed attachment");
-    assert!(out[0].text.as_deref().unwrap_or("").contains("Here is your summary"));
+    assert_eq!(
+        out[0].attachments.len(),
+        1,
+        "WebChat gets a typed attachment"
+    );
+    assert!(
+        out[0]
+            .text
+            .as_deref()
+            .unwrap_or("")
+            .contains("Here is your summary")
+    );
     let url = out[0].attachments[0].url.clone().expect("signed link");
     assert!(!url.contains("artifact://"), "raw id leaked: {url}");
     let path = url.strip_prefix(BASE).unwrap_or(&url);

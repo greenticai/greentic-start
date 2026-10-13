@@ -9519,7 +9519,10 @@ mod tests {
         assert_eq!(envs.len(), 1);
         assert_eq!(envs[0].text.as_deref(), Some("Here is your summary"));
         let wire = serde_json::to_string(&envs).expect("json");
-        assert!(!wire.contains(&"d".repeat(64)), "id leaked into message: {wire}");
+        assert!(
+            !wire.contains(&"d".repeat(64)),
+            "id leaked into message: {wire}"
+        );
 
         // A file-only turn shapes no message; the egress loop builds one.
         let file_only = Activity::custom("response", json!({"created_artifacts": list}));
@@ -9528,7 +9531,10 @@ mod tests {
         assert_eq!(files.len(), 1);
         let envs = build_reply_envelopes(&ingress, &file_only, "pack", "acme");
         let wire = serde_json::to_string(&envs).expect("json");
-        assert!(!wire.contains(&"d".repeat(64)), "id leaked into message: {wire}");
+        assert!(
+            !wire.contains(&"d".repeat(64)),
+            "id leaked into message: {wire}"
+        );
     }
 
     #[test]
