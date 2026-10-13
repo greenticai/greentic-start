@@ -62,16 +62,56 @@ fn result_object(step: &Value) -> Option<Value> {
     }
 }
 
+/// Reserved key of a final reply payload: the files the RUNNER created for the
+/// end user during this turn (greentic-runner `media.create`), as
+/// `[{id, mime_type, name}]`. The runner is linked into this binary and is the
+/// only writer: it removes any copy a flow's own data puts there before adding
+/// its own, so unlike a top-level `artifact` the list is never something a
+/// node merely mentioned. Only the ids are read; the provenance gate still
+/// decides whether each one is linked.
+pub(crate) const CREATED_ARTIFACTS_KEY: &str = "created_artifacts";
+
+/// The well-formed ids of the runner's created-files list, in order.
+fn created_ids(payload: &Value) -> Vec<String> {
+    payload
+        .get(CREATED_ARTIFACTS_KEY)
+        .and_then(Value::as_array)
+        .map(|files| {
+            files
+                .iter()
+                .filter_map(|file| file.get("id")?.as_str())
+                .filter(|id| is_artifact_id(id))
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Remove the runner's created-files list from a payload that is about to be
+/// shaped into a message, so its ids can never show up as message content.
+/// A `session.wait` "pending" wrapper is handled too.
+pub(crate) fn strip_created_list(payload: &mut Value) {
+    if let Value::Object(map) = payload {
+        map.remove(CREATED_ARTIFACTS_KEY);
+        if let Some(inner) = map.get_mut("response") {
+            strip_created_list(inner);
+        }
+    }
+}
+
 /// The files a reply payload names, in order, deduplicated, at most
 /// [`MAX_OUTBOUND`]: every `tool_call` trail step whose result is `ok: true`
-/// with a well-formed `artifact.id`, then a top-level `artifact` or
-/// `response.artifact`. A payload that is itself a full envelope (a flow
-/// emitting one) names nothing: it cannot ask for a link.
+/// with a well-formed `artifact.id`, then the runner's created-files list
+/// ([`CREATED_ARTIFACTS_KEY`]: a `media.create` node anywhere in the turn),
+/// then a top-level `artifact` or `response.artifact`. A payload that is
+/// itself a full envelope (a flow emitting one) names only what the runner
+/// listed: the flow cannot ask for a link.
 pub(crate) fn collect(payload: &Value) -> Vec<C5Ref> {
-    if serde_json::from_value::<ChannelMessageEnvelope>(payload.clone()).is_ok() {
-        return Vec::new();
-    }
     let mut ids: Vec<String> = Vec::new();
+    if serde_json::from_value::<ChannelMessageEnvelope>(payload.clone()).is_ok() {
+        ids.extend(created_ids(payload));
+        return dedup_capped(ids);
+    }
     let steps = payload
         .get("trail")
         .and_then(Value::as_array)
@@ -89,8 +129,13 @@ pub(crate) fn collect(payload: &Value) -> Vec<C5Ref> {
         }
         ids.extend(artifact_id_of(&result));
     }
+    ids.extend(created_ids(payload));
     ids.extend(artifact_id_of(payload));
     ids.extend(payload.get("response").and_then(artifact_id_of));
+    dedup_capped(ids)
+}
+
+fn dedup_capped(ids: Vec<String>) -> Vec<C5Ref> {
     let mut refs: Vec<C5Ref> = Vec::new();
     for id in ids {
         if refs.len() == MAX_OUTBOUND {

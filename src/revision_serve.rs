@@ -6626,9 +6626,11 @@ pub(crate) fn build_reply_envelopes(
     // passed through, repairing only the route fields from the ingress.
     // `parse_envelopes` does not reconstruct a bare envelope, so keep this ahead
     // of the shared shaper.
-    if let Ok(mut envelope) =
-        serde_json::from_value::<ChannelMessageEnvelope>(reply.payload().clone())
-    {
+    // The runner's created-files list is delivery metadata (collected apart,
+    // see `artifacts::outbound`), never message content.
+    let mut payload = reply.payload().clone();
+    crate::artifacts::outbound::strip_created_list(&mut payload);
+    if let Ok(mut envelope) = serde_json::from_value::<ChannelMessageEnvelope>(payload) {
         if envelope.session_id.trim().is_empty() {
             envelope.session_id = ingress.session_id.clone();
         }
@@ -6649,6 +6651,7 @@ pub(crate) fn build_reply_envelopes(
     // resolve pack-scoped creds — the legacy messaging path does both before
     // shaping.
     let mut value = unwrap_pending_response(reply.payload()).clone();
+    crate::artifacts::outbound::strip_created_list(&mut value);
     let team = ingress
         .metadata
         .get("team")
@@ -9486,6 +9489,46 @@ mod tests {
         let parked = Activity::custom("response", json!({"status": "pending", "response": result}));
         let files = crate::artifacts::outbound::collect(unwrap_pending_response(parked.payload()));
         assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn a_runner_created_files_list_is_collected_and_never_shaped_into_the_message() {
+        // greentic-runner `media.create` anywhere in a turn: the final reply
+        // carries `created_artifacts`. The ids are delivery metadata.
+        let id = format!("artifact://{}", "d".repeat(64));
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-created",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-c",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "make me a pdf",
+        }))
+        .expect("ingress envelope");
+        let list = json!([{"id": id, "mime_type": "application/pdf", "name": "S.pdf"}]);
+
+        let with_text = Activity::custom(
+            "response",
+            json!({"text": "Here is your summary", "created_artifacts": list.clone()}),
+        );
+        let files =
+            crate::artifacts::outbound::collect(unwrap_pending_response(with_text.payload()));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, id);
+        let envs = build_reply_envelopes(&ingress, &with_text, "pack", "acme");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].text.as_deref(), Some("Here is your summary"));
+        let wire = serde_json::to_string(&envs).expect("json");
+        assert!(!wire.contains(&"d".repeat(64)), "id leaked into message: {wire}");
+
+        // A file-only turn shapes no message; the egress loop builds one.
+        let file_only = Activity::custom("response", json!({"created_artifacts": list}));
+        let files =
+            crate::artifacts::outbound::collect(unwrap_pending_response(file_only.payload()));
+        assert_eq!(files.len(), 1);
+        let envs = build_reply_envelopes(&ingress, &file_only, "pack", "acme");
+        let wire = serde_json::to_string(&envs).expect("json");
+        assert!(!wire.contains(&"d".repeat(64)), "id leaked into message: {wire}");
     }
 
     #[test]
