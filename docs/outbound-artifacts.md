@@ -44,11 +44,21 @@ user opens  GET /v1/artifacts/<deployment>/<artifact hex>/<exp>/<mac>
   or `response.artifact`; deduplicated, at most 5 per reply. A payload that is
   itself a full `ChannelMessageEnvelope` (a flow emitting one) names nothing.
 - **A plain flow's `media.create` node** (greentic-runner#850) answers a C5 value
-  `{ok, artifact, artifacts, warnings}`. With no `output:` key and the node ending
-  the flow, that value is the final reply payload, so the top-level `artifact` is
-  collected and linked like any other file (pinned by `media_create_tests`). A node
-  that binds its result under `output:` nests it one key deeper and nothing
-  collects it: v1 delivers only a `media.create` node that ends the flow.
+  `{ok, artifact, artifacts, warnings}`. If the node ends the flow with no `output:`
+  key that value is the final reply payload, so the top-level `artifact` is
+  collected (pinned by `media_create_tests`). Otherwise (bound under `output:`,
+  or followed by other nodes, or the turn parks) the RUNNER lists every file it
+  created this turn in a reserved `created_artifacts: [{id, ...}]` key of the
+  final reply (on the last reply of an emitted array; a file-only turn is just
+  that key). `collect` reads it after the trail steps and before the top-level
+  rule, even when the payload is a full envelope: the runner is linked into this
+  binary and removes any copy of the key that flow data carried, so unlike a
+  node merely naming an id the list is trustworthy. Only well-formed ids are
+  read, the same dedup and the 5-per-reply cap apply, and the provenance gate
+  below still decides each one. The key is stripped before the reply is shaped
+  (`outbound::strip_created_list`), so ids never become message content. A
+  failed `media.create` lists nothing. Pinned by the mid-flow tests in
+  `media_create_tests`.
 - **Provenance gate:** a link is minted only for an id THIS deployment's
   extension port stored within the link TTL. Every revision of a deployment (a
   traffic split) writes into the deployment's one record. The record is per
