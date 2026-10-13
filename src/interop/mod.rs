@@ -8,6 +8,7 @@ pub(crate) mod a2a;
 pub(crate) mod anonymous;
 pub(crate) mod auth;
 pub(crate) mod caller;
+pub(crate) mod cluster_host;
 pub(crate) mod config;
 pub(crate) mod config_cache;
 pub(crate) mod input_request;
