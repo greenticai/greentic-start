@@ -43,6 +43,12 @@ user opens  GET /v1/artifacts/<deployment>/<artifact hex>/<exp>/<mac>
   is `ok: true` with a well-formed `artifact.id`, then a top-level `artifact`
   or `response.artifact`; deduplicated, at most 5 per reply. A payload that is
   itself a full `ChannelMessageEnvelope` (a flow emitting one) names nothing.
+- **A plain flow's `media.create` node** (greentic-runner#850) answers a C5 value
+  `{ok, artifact, artifacts, warnings}`. With no `output:` key and the node ending
+  the flow, that value is the final reply payload, so the top-level `artifact` is
+  collected and linked like any other file (pinned by `media_create_tests`). A node
+  that binds its result under `output:` nests it one key deeper and nothing
+  collects it: v1 delivers only a `media.create` node that ends the flow.
 - **Provenance gate:** a link is minted only for an id THIS deployment's
   extension port stored within the link TTL. Every revision of a deployment (a
   traffic split) writes into the deployment's one record. The record is per

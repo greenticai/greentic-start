@@ -9433,6 +9433,27 @@ mod tests {
     }
 
     #[test]
+    fn a_media_create_result_reaches_the_collector_as_a_final_flow_reply() {
+        // greentic-runner#850: the `media.create` node (no `output:` key, ends
+        // the flow) answers a C5 value that is the flow's final reply payload.
+        let id = format!("artifact://{}", "c".repeat(64));
+        let result = json!({
+            "ok": true,
+            "artifact": {"id": id, "mime_type": "application/pdf", "name": "Summary.pdf"},
+            "artifacts": [{"id": id, "mime_type": "application/pdf", "name": "Summary.pdf"}],
+            "warnings": [],
+        });
+        let reply = Activity::custom("response", result.clone());
+        let files = crate::artifacts::outbound::collect(unwrap_pending_response(reply.payload()));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, id);
+        // A parked turn wraps the same value one level down.
+        let parked = Activity::custom("response", json!({"status": "pending", "response": result}));
+        let files = crate::artifacts::outbound::collect(unwrap_pending_response(parked.payload()));
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
     fn synthesize_provider_response_defaults_to_200_and_preserves_body() {
         let response = IngressHttpResponse {
             status: 0, // Not a real HTTP status — synth must fall back to 200.
