@@ -14,6 +14,7 @@ pub(crate) mod input_request;
 pub(crate) mod limits;
 pub(crate) mod mcp;
 pub(crate) mod metering;
+pub(crate) mod policy_door;
 pub(crate) mod reply;
 pub(crate) mod structured_output;
 pub(crate) mod telemetry;
@@ -88,6 +89,9 @@ pub(crate) struct InteropState {
     /// (`GREENTIC_TRUSTED_PROXY_HOPS`; `1` on Cloud Run, else `0`), which
     /// decides the client an anonymous caller is told apart by.
     pub trusted_proxy_hops: usize,
+    /// The admin's runtime access-policy door, for the units that ask for it.
+    /// See [`policy_door`].
+    pub policy_door: policy_door::PolicyDoor,
     /// See [`TurnOverride`].
     #[cfg(test)]
     pub turn_override: Option<TurnOverride>,
@@ -109,6 +113,7 @@ impl InteropState {
             ))),
             meter: std::sync::Arc::new(metering::Meter::default()),
             trusted_proxy_hops: crate::http_ingress::limits::trusted_proxy_hops(),
+            policy_door: policy_door::PolicyDoor::default(),
             #[cfg(test)]
             turn_override: None,
         }
@@ -128,6 +133,7 @@ impl Default for InteropState {
             // The Cloud Run default: the right-most `X-Forwarded-For` entry is
             // the one the front end appended.
             trusted_proxy_hops: 1,
+            policy_door: policy_door::PolicyDoor::default(),
             #[cfg(test)]
             turn_override: None,
         }

@@ -119,6 +119,18 @@ impl StubAdmin {
         }
     }
 
+    /// A staged block whose endpoint ends in `/worker-usage`, so the sibling
+    /// doors (`…/access-policy`, …) can be derived from it. The stub answers
+    /// every path alike.
+    pub(crate) fn metering_worker_usage(&self) -> MeteringConfig {
+        let base = self.url.trim_end_matches("/ingest");
+        MeteringConfig {
+            endpoint: format!("{base}/api/v1/ingest/worker-usage"),
+            token: MeteringToken(TEST_TOKEN.into()),
+            tenant_slug: TEST_TENANT.into(),
+        }
+    }
+
     /// Poll until the stub has seen `at_least` requests, or give up. Polling
     /// rather than sleeping a fixed time: the assertion is about what
     /// happened, not about how long it took.
@@ -186,6 +198,15 @@ pub(crate) async fn closed_port() -> ClosedPort {
     ClosedPort {
         port,
         _held: socket,
+    }
+}
+
+/// A staged block with this exact endpoint and the shared test token.
+pub(crate) fn metering_at(endpoint: &str) -> MeteringConfig {
+    MeteringConfig {
+        endpoint: endpoint.to_string(),
+        token: MeteringToken(TEST_TOKEN.into()),
+        tenant_slug: TEST_TENANT.into(),
     }
 }
 

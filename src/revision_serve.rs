@@ -1943,6 +1943,40 @@ async fn load_unit_config_cached(
     activation: &Activation,
     tenant: &str,
     bundle_id: &str,
+    deployment: Option<DeploymentId>,
+) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
+    let staged = load_staged_unit_config(state, activation, tenant, bundle_id).await?;
+    // The staged document is cached for a short TTL; what the admin's access
+    // door says on top of it is decided here, per request. A unit that did not
+    // stage `access.door` comes back untouched and nothing is fetched.
+    let Some(staged) = staged else {
+        return Ok(None);
+    };
+    let deployment = deployment.map(|id| id.to_string());
+    let unit = crate::interop::policy_door::UnitRef {
+        tenant,
+        bundle_id,
+        deployment: deployment.as_deref(),
+    };
+    Ok(Some(
+        state
+            .interop
+            .policy_door
+            .effective(
+                staged,
+                &unit,
+                &state.interop.limiter,
+                crate::ingress_auth::now_ms(),
+            )
+            .await,
+    ))
+}
+
+async fn load_staged_unit_config(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
 ) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
     if let Some(cached) = state.interop.configs.get(tenant, bundle_id) {
         return Ok(cached);
@@ -2016,18 +2050,19 @@ async fn resolve_interop_unit(
     let deployment_id = mount.deployment_id;
     let bundle_id = mount.bundle_id.as_str().to_string();
     let tenant = mount.tenant.to_string();
-    let config = load_unit_config_cached(state, activation, &tenant, &bundle_id)
-        .await
-        .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
-            operator_log::warn(
-                module_path!(),
-                format!("interop config for unit `{bundle_id}` could not be read: {message}"),
-            );
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the ingress credential store is unavailable",
-            )
-        })?;
+    let config =
+        load_unit_config_cached(state, activation, &tenant, &bundle_id, Some(deployment_id))
+            .await
+            .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
+                operator_log::warn(
+                    module_path!(),
+                    format!("interop config for unit `{bundle_id}` could not be read: {message}"),
+                );
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the ingress credential store is unavailable",
+                )
+            })?;
     let config = config.filter(|config| feature.enabled_in(config));
     if let Some(config) = config.as_ref() {
         warn_public_unit_without_proxy_hops(state, &bundle_id, config);
@@ -2604,7 +2639,7 @@ async fn gate_generic_ingress(
     if peer_is_loopback || !gate_enabled {
         return Ok(());
     }
-    let config = load_unit_config_cached(state, activation, tenant, bundle_id).await;
+    let config = load_unit_config_cached(state, activation, tenant, bundle_id, None).await;
     let gate = crate::ingress_auth::decide_generic(
         peer_is_loopback,
         gate_enabled,

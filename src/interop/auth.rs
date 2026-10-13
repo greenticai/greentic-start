@@ -116,6 +116,11 @@ pub(crate) async fn authenticate(
             McpAuth::Unauthorized
         };
     }
+    if config.access.mechanisms.is_empty() {
+        // The admin's access door allows none of the staged mechanisms. It was
+        // reported once when the answer arrived; every credential is refused.
+        return McpAuth::Unauthorized;
+    }
     if !config.access.allows(Mechanism::ApiKey) && !oauth_available(config, audience) {
         // OAuth-only, and OAuth cannot run here: nothing can authenticate.
         log_unusable_policy_once(config, audience);
