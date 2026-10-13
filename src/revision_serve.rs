@@ -1473,6 +1473,7 @@ async fn serve(
                         mcp_method: None,
                         authorization_unreadable,
                         client: interop_client.as_deref(),
+                        host: host_header.as_deref(),
                     },
                 )
                 .await;
@@ -1504,6 +1505,7 @@ async fn serve(
                         mcp_method: mcp_method_header.as_deref(),
                         authorization_unreadable,
                         client: interop_client.as_deref(),
+                        host: host_header.as_deref(),
                     },
                 )
                 .await;
@@ -2260,7 +2262,15 @@ async fn serve_interop_inner(
     headers: InteropRequestHeaders<'_>,
     trace: &crate::interop::telemetry::RequestTrace,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
-    let base_url = interop_unit_base_url(state, unit);
+    let mut base_url = interop_unit_base_url(state, unit);
+    if base_url.is_none() && route == crate::interop::a2a::A2aRoute::Card {
+        // No public address is known (a ClusterIP worker). Fall back to the
+        // in-cluster Service name the caller used, only for the card and only
+        // when it is shaped like one (see `interop::cluster_host`).
+        base_url = headers
+            .host
+            .and_then(|host| crate::interop::cluster_host::unit_base(host, &unit.mount));
+    }
     let ctx = crate::interop::a2a::A2aContext {
         config: &unit.config,
         base_url: base_url.as_deref(),
@@ -2616,6 +2626,9 @@ struct InteropRequestHeaders<'a> {
     /// The client behind the request, for an anonymous caller of a public
     /// unit ([`crate::interop::anonymous::client_label`]).
     client: Option<&'a str>,
+    /// The `Host` header, read only for the agent-card fallback
+    /// ([`crate::interop::cluster_host`]).
+    host: Option<&'a str>,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the

@@ -219,3 +219,23 @@ async fn oauth_is_advertised_only_when_allowed_and_verifiable_on_a2a() {
     assert!(card["securitySchemes"]["oauth"].is_null(), "{card}");
     assert!(card["securitySchemes"]["bearer"].is_object());
 }
+
+#[tokio::test]
+async fn a_cluster_derived_base_is_published_and_an_unknown_one_is_unavailable() {
+    let fixture = Fixture::new(config());
+    let mut ctx = fixture.ctx();
+    ctx.base_url = None;
+    let response = card_response(&ctx, &request(&[]));
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let base = crate::interop::cluster_host::unit_base("w.ns.svc:8080", "/support-bot");
+    let mut ctx = fixture.ctx();
+    ctx.base_url = base.as_deref();
+    let response = card_response(&ctx, &request(&[]));
+    assert_eq!(response.status(), StatusCode::OK);
+    let card = body_json(response).await;
+    assert_eq!(
+        card["supportedInterfaces"][0]["url"],
+        "http://w.ns.svc:8080/support-bot/a2a"
+    );
+}
