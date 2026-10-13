@@ -187,7 +187,7 @@ features = ["derive"]
 # ONE crate with the copy runner-host pulls through its `agentic-worker`
 # feature. No features: `test-mock` stays dev-only (below).
 [dependencies.greentic-aw-runtime]
-version = ">=1.2.0-dev.38028389461, <1.2.0"
+version = ">=1.2.0-dev.38358330671, <1.2.0"
 default-features = false
 
 # Matches the deploy-spec the pinned deployer was built against; `Environment`
@@ -267,6 +267,10 @@ features = ["pack-fetch"]
 [dependencies.greentic-ext-runtime]
 version = ">=1.2.38027318243, <1.3.0"
 
+# Floor `1.2.0-dev.38358330671` is the dev-lane publish built from greentic-runner
+# a3ebba61 (develop, #850): the native `media.create` flow node (txt, md, csv, pdf)
+# stores its file through the deployment's artifact port and answers the C5 shape.
+# The floor before it, `1.2.0-dev.38028389461`, predates it.
 # Floor `1.2.0-dev.37982835169` is the dev-lane publish built from greentic-runner
 # 41d28126 (develop, #842-#845): an `a2a` flow node can ask the agent for its
 # Adaptive Card (`card`), forward a card submit (`answer`) and retarget the
@@ -327,10 +331,10 @@ version = ">=1.2.38027318243, <1.3.0"
 # (greentic-runner#698), which the demo messaging host uses to name a flow node
 # as the flow's entry node.
 [dependencies.greentic-runner-desktop]
-version = ">=1.2.0-dev.38028389461, <1.2.0"
+version = ">=1.2.0-dev.38358330671, <1.2.0"
 
 [dependencies.greentic-runner-host]
-version = ">=1.2.0-dev.38028389461, <1.2.0"
+version = ">=1.2.0-dev.38358330671, <1.2.0"
 # `greentic-llm-backend` routes every in-process `dw.agent` LLM call through
 # greentic-llm's multi-provider backend. Without it runner-host compiles the
 # OpenAI-only client (`agent_node.rs`, "built WITHOUT the greentic-llm-backend
@@ -490,7 +494,7 @@ ed25519-dalek = { version = "2", features = ["pkcs8", "pem"] }
 # build (edition-2024 resolver keeps dev-dependency features out of it). Same
 # requirement runner-host has, so it is ONE crate with runner-host's, not a
 # second copy.
-greentic-aw-runtime = { version = ">=1.2.0-dev.38028389461, <1.2.0", features = ["test-mock"] }
+greentic-aw-runtime = { version = ">=1.2.0-dev.38358330671, <1.2.0", features = ["test-mock"] }
 # For `ExtensionRuntime::for_test()`. It must be the same SOURCE and a
 # compatible requirement to whatever greentic-aw-runtime declares, or the graph
 # holds two copies and the `ExtensionRuntime` handed across the boundary does
