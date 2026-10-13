@@ -1066,6 +1066,7 @@ mod tests {
                 pack_id: "app-pack".to_string(),
                 flows: vec![],
                 capabilities: Vec::new(),
+                flow_meta: None,
             },
             &AppFlowInfo {
                 id: "default".to_string(),
@@ -1126,6 +1127,7 @@ mod tests {
                     pack_id: "app-pack".to_string(),
                     flows: vec![],
                     capabilities: Vec::new(),
+                    flow_meta: None,
                 },
                 &AppFlowInfo {
                     id: "default".to_string(),

@@ -24,6 +24,8 @@ pub struct AppPackInfo {
     pub pack_id: String,
     pub flows: Vec<AppFlowInfo>,
     pub capabilities: Vec<String>,
+    /// `assets/flow-meta.json` (flow audience), when the pack ships a readable one.
+    pub flow_meta: Option<crate::flow_audience::FlowMeta>,
 }
 
 #[derive(Clone, Debug)]
@@ -187,11 +189,50 @@ pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
         .ok_or_else(|| anyhow::anyhow!("pack manifest missing pack id in {pack_path:?}"))?;
     let flows = extract_flows(&value);
     let capabilities = extract_capabilities(&value);
+    drop(manifest);
+    let flow_meta = read_flow_meta(&mut archive, pack_path);
     Ok(AppPackInfo {
         pack_id,
         flows,
         capabilities,
+        flow_meta,
     })
+}
+
+/// Read `assets/flow-meta.json`. Absent → `None`. Unreadable, oversized or of an
+/// unknown version → `None` with a warning (fail open: a broken sidecar must not
+/// take a flow offline, and the designer never writes one that is).
+fn read_flow_meta(
+    archive: &mut ZipArchive<File>,
+    pack_path: &Path,
+) -> Option<crate::flow_audience::FlowMeta> {
+    use crate::flow_audience::{FLOW_META_ENTRY, FlowMeta, MAX_FLOW_META_BYTES};
+    let entry = archive.by_name(FLOW_META_ENTRY).ok()?;
+    let mut bytes = Vec::new();
+    if let Err(err) = entry.take(MAX_FLOW_META_BYTES + 1).read_to_end(&mut bytes) {
+        operator_log::warn(
+            module_path!(),
+            format!("flow audience: cannot read {FLOW_META_ENTRY} in {pack_path:?}: {err}"),
+        );
+        return None;
+    }
+    if bytes.len() as u64 > MAX_FLOW_META_BYTES {
+        operator_log::warn(
+            module_path!(),
+            format!("flow audience: {FLOW_META_ENTRY} in {pack_path:?} is too large; ignored"),
+        );
+        return None;
+    }
+    match FlowMeta::parse(&bytes) {
+        Ok(meta) => Some(meta),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("flow audience: ignoring {FLOW_META_ENTRY} in {pack_path:?}: {err}"),
+            );
+            None
+        }
+    }
 }
 
 pub fn select_app_flow(info: &AppPackInfo) -> Result<&AppFlowInfo> {
@@ -1766,6 +1807,7 @@ mod tests {
                 },
             ],
             capabilities: Vec::new(),
+            flow_meta: None,
         };
         assert_eq!(select_app_flow(&info).expect("default flow").id, "default");
 
@@ -1786,6 +1828,7 @@ mod tests {
                 },
             ],
             capabilities: Vec::new(),
+            flow_meta: None,
         };
         assert_eq!(
             select_app_flow(&single_messaging)
@@ -1820,6 +1863,7 @@ mod tests {
                 },
             ],
             capabilities: Vec::new(),
+            flow_meta: None,
         };
         assert_eq!(
             select_app_flow(&info)
@@ -1855,6 +1899,7 @@ mod tests {
                 },
             ],
             capabilities: Vec::new(),
+            flow_meta: None,
         };
         let err = select_app_flow(&info)
             .expect_err("non-messaging `main` should not satisfy the fallback");
@@ -1883,6 +1928,7 @@ mod tests {
                 },
             ],
             capabilities: Vec::new(),
+            flow_meta: None,
         };
 
         let err = select_app_flow(&info).expect_err("ambiguous flow should fail");
@@ -2161,6 +2207,29 @@ mod tests {
 
         let info = load_app_pack_info(&pack_path).expect("load pack info");
         assert_eq!(info.pack_id, "greentic.test.fast2flow");
+        assert!(info.flow_meta.is_none(), "no sidecar means no audience");
+
+        // The same pack with a flow-meta sidecar, then with a broken one.
+        for (body, expect_audience) in [
+            (
+                r#"{"version":1,"audience":["sales"]}"#,
+                Some(vec!["sales".to_string()]),
+            ),
+            (r#"{"version":9}"#, None),
+        ] {
+            let path = dir.path().join("with-meta.gtpack");
+            let file = std::fs::File::create(&path).expect("create pack");
+            let mut zip = zip::ZipWriter::new(file);
+            zip.start_file("manifest.cbor", FileOptions::<()>::default())
+                .expect("start file");
+            zip.write_all(&cbor_bytes).expect("write manifest");
+            zip.start_file("assets/flow-meta.json", FileOptions::<()>::default())
+                .expect("start meta");
+            zip.write_all(body.as_bytes()).expect("write meta");
+            zip.finish().expect("finish pack");
+            let loaded = load_app_pack_info(&path).expect("load pack info");
+            assert_eq!(loaded.flow_meta.map(|m| m.audience), expect_audience);
+        }
         assert!(
             info.capabilities
                 .contains(&"greentic.cap.fast2flow.v1".to_string()),

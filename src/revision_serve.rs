@@ -6292,6 +6292,11 @@ async fn run_provider_inbound_pipeline(
         .attachments
         .get(deployment_id, revision_id);
     crate::artifacts::hook::prepare(unit.as_deref(), &mut envelopes, &origin).await;
+    let flow_meta = activation
+        .routing
+        .app_packs
+        .get_shared(bundle_id.as_str(), revision_id)
+        .and_then(|app| app.info.flow_meta.clone());
     for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
         // `flow_hint` metadata key (the provider echoing back the flow the
@@ -6319,6 +6324,16 @@ async fn run_provider_inbound_pipeline(
                 None
             }
         });
+        // Flow audience (docs/flow-audience.md): stamp `team_hint` from the
+        // provider-verified caller team and refuse a known team outside the
+        // flow's audience. An unknown team is never refused.
+        let audience_scope = format!("deployment {deployment_id} revision {revision_id}");
+        let (stamped, audience_denial) =
+            match crate::flow_audience::apply(flow_meta.as_ref(), ingress, &audience_scope) {
+                crate::flow_audience::Applied::Proceed(envelope) => (envelope, None),
+                crate::flow_audience::Applied::Denied(reply) => (ingress.clone(), Some(reply)),
+            };
+        let ingress = &stamped;
         // Fast2Flow (fast2flow_hook): an explicit target naming a non-default
         // flow wins; the default-flow target (named or not) may be re-routed,
         // and a miss may become the fixed reply without running a flow.
@@ -6381,11 +6396,18 @@ async fn run_provider_inbound_pipeline(
         // `keep_typing_while` has returned: no refresh can start after this point,
         // so a typing indicator never lands after the reply below. One reply
         // payload can fan out to several envelopes (e.g. `messages[]`).
-        let turn_result = match (&typing_sender, typing_input) {
-            (Some(sender), Some(input)) => {
-                crate::typing::keep_typing_while(Arc::clone(sender), input, planned_turn).await
+        let turn_result = if let Some(reply) = audience_denial {
+            // Refused by the flow audience: no flow runs, the plain reply goes
+            // out through the normal egress below.
+            drop(planned_turn);
+            Ok(vec![reply])
+        } else {
+            match (&typing_sender, typing_input) {
+                (Some(sender), Some(input)) => {
+                    crate::typing::keep_typing_while(Arc::clone(sender), input, planned_turn).await
+                }
+                _ => planned_turn.await,
             }
-            _ => planned_turn.await,
         };
         let reply_envelopes = match turn_result {
             Ok(envelopes) => envelopes,

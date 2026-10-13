@@ -35,6 +35,7 @@ fn pack_info() -> AppPackInfo {
             flow("on_event", "events"),
         ],
         capabilities: vec![crate::fast2flow::FAST2FLOW_CAPABILITY.to_string()],
+        flow_meta: None,
     }
 }
 

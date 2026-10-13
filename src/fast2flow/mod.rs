@@ -397,6 +397,7 @@ mod tests {
                 pack_id: "sales-crm".to_string(),
                 flows: alloc_messaging_default(),
                 capabilities: vec![FAST2FLOW_CAPABILITY.to_string()],
+                flow_meta: None,
             }
         }
 
@@ -504,6 +505,7 @@ mod tests {
                 pack_id: "no-fast2flow".to_string(),
                 flows: alloc_messaging_default(),
                 capabilities: Vec::new(),
+                flow_meta: None,
             };
             let result = try_for_request(
                 &cfg,

@@ -34,6 +34,7 @@ fn pack(opt_in: bool) -> AppPackInfo {
         pack_id: PACK.into(),
         flows: vec![flow("default"), flow("refund")],
         capabilities,
+        flow_meta: None,
     }
 }
 

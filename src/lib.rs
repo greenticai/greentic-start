@@ -54,6 +54,7 @@ mod sorla_state;
 pub mod event_router;
 mod extension_resolver;
 mod fast2flow;
+pub mod flow_audience;
 pub(crate) mod flow_log;
 mod gmap;
 mod http_helpers;

@@ -121,6 +121,7 @@ impl Fixture {
                 pack_id: PACK.to_string(),
                 flows: vec![flow("default"), flow("pipeline_flow")],
                 capabilities: caps.iter().map(|c| c.to_string()).collect(),
+                flow_meta: None,
             },
             revision_id: self.revision_id,
         })
@@ -766,6 +767,7 @@ async fn a_node_route_with_no_resolvable_default_flow_stamps_nothing() {
             pack_id: PACK.to_string(),
             flows: vec![flow("alpha"), flow("beta")],
             capabilities: vec![FAST2FLOW_CAPABILITY.to_string()],
+            flow_meta: None,
         },
         revision_id: fx.revision_id,
     });
