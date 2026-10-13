@@ -88,8 +88,10 @@ at parse time (error log), and an OAuth token whose `sub` starts with it is
 refused. An `Authorization` header that is present but unreadable (non-ASCII) is
 a presented, invalid credential (401), not an absent one.
 
-The daily cap is counted per process: scale-to-zero or a restart resets it
-(documented limitation until the runtime policy door reads the admin's count).
+The daily cap is counted per process. For a unit that stages `access.door`
+(below) the admin's count of today's anonymous turns raises the local counter
+on every fetch, so a scale-to-zero or restart no longer hands the budget back;
+for a unit without the door a cold start still resets it.
 
 Anonymous usage events carry no `credential_id` and `caller_kind: "anonymous"`;
 every other event is byte-identical to before. `caller_kind` is advisory for the
@@ -99,3 +101,74 @@ advertises no security scheme.
 Anonymous turns also share the unit's concurrent-turn gate without being able to
 fill it: they hold at most half of the permits (at least one), so a credentialed
 caller always has the other half.
+
+## The runtime access-policy door (phase 3)
+
+A unit whose `access` block carries `"door": true` asks the admin, while it
+runs, to NARROW the staged policy. Without the flag nothing is fetched and the
+unit is served exactly as before. The flag is read on its own, so an `access`
+block that is otherwise thrown away does not stop a unit from being narrowed.
+
+```json
+"access": { "...": "...", "door": true }
+```
+
+`GET <metering.endpoint with its last segment swapped for access-policy>` with
+the unit's metering token (the token needs the purpose `access`), `If-None-Match`
+when it holds an ETag. Answer:
+
+```json
+{ "generation": 7,
+  "policy": { "private_mechanisms": ["api_key","oauth"], "public_allowed": true,
+              "public_rate_per_min": 60, "public_burst": 20,
+              "public_daily_turn_cap": null },
+  "revoked_credential_ids": ["c_01J"], "revoked_client_ids": ["mcpc_01J"],
+  "public": { "daily_turns_used": 12 } }
+```
+
+Timing: an answer is served for 60 s, then revalidated; a failed attempt is not
+repeated for 30 s (the refresh floor); concurrent requests share one fetch; one
+attempt waits at most 3 s; no redirects; the body is capped at 1 MiB.
+
+**The door only tightens** (spec D17). The effective policy is the staged one
+with:
+
+| staged | door | effective |
+|---|---|---|
+| mechanisms | `private_mechanisms` | the intersection. Empty = every credential refused (error log), never a fallback |
+| public | `public_allowed: false` | private. A private unit is never made public |
+| rate / burst | `public_rate_per_min` / `public_burst` | the minimum |
+| daily cap | `public_daily_turn_cap` | the minimum; a cap can appear, never be lifted |
+| credentials | `revoked_credential_ids` | those credentials removed (a presented one is a `401`, also on a public unit) |
+| OAuth tokens | `revoked_client_ids` | a token whose subject is `svc:<client_id>@<tenant>` for a revoked client is refused **before the issuer is asked anything**, a token minted before the revocation included |
+
+The anonymous daily count becomes `max(local count, daily_turns_used)` each
+time a new answer arrives and grows by every turn served here after that, so
+the remaining budget is `min(staged, door) - daily_turns_used - turns served
+since the fetch`. (`max` rather than a plain assignment so a turn this process
+served that the admin has not yet been told about is never forgotten.)
+
+**A door that cannot answer opens nothing and denies nothing new.** A timeout,
+a 5xx, a 401/403/404 or a body this build cannot read keeps the last good
+answer; with none, the staged policy stands. Each distinct failure is logged
+once, never with the token or the body. A door answer is not trusted beyond
+what the table above says: a wider mechanism list, `public_allowed: true` on a
+private unit or a higher limit changes nothing.
+
+Not covered: the door cannot revoke a named bearer the designer never reported
+to the admin, and a revocation reaches a running unit within one 60 s window,
+not instantly.
+
+### Known limits of the door
+
+- **Revocation needs a first answer.** A revoked credential or service client is
+  refused only after the door has answered once. A process that cold-starts while
+  the admin is unreachable serves the staged policy, so a credential revoked since
+  the last deploy is still accepted until the first successful fetch. The next
+  deploy closes the gap for good, because it stages the document without that
+  credential's hash.
+- **The last good answer never expires.** While the admin stays unreachable, the
+  most recent answer keeps applying, revocations included. It is dropped only
+  when the process restarts.
+- **The door can only tighten.** An answer that would widen the staged policy is
+  intersected with it, so a compromised or misconfigured admin cannot open a unit.

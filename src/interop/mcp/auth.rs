@@ -88,6 +88,24 @@ pub(crate) async fn verify_oauth(
     let Some(token) = bearer_token(authorization) else {
         return McpAuth::Unauthorized;
     };
+    // A service client the admin revoked is refused here, BEFORE the issuer is
+    // asked anything: a token minted before the revocation is still validly
+    // signed and unexpired, so only its subject can say it is no longer
+    // welcome. The subject is read unverified, which is safe because the only
+    // thing done with it is to refuse; a forged one can cost its sender a
+    // `401` and nobody else anything.
+    if !config.revoked_client_ids.is_empty()
+        && unverified_sub(token)
+            .as_deref()
+            .and_then(service_client_id)
+            .is_some_and(|id| config.revoked_client_ids.contains(id))
+    {
+        crate::operator_log::info(
+            module_path!(),
+            "MCP: refusing a token of a service client the admin has revoked",
+        );
+        return McpAuth::Unauthorized;
+    }
     let Ok(header) = decode_header(token) else {
         return McpAuth::Unauthorized;
     };
@@ -139,6 +157,13 @@ pub(crate) async fn verify_oauth(
     // the token is signed — which is exactly why an issuer bug must refuse
     // rather than degrade. A service client's `svc:<id>@<tenant>` subject is
     // the one accepted exception, and it is MAPPED, not admitted as-is.
+    // The same check on the VERIFIED subject, for the day the cheap one above
+    // and this one could disagree about what a subject is.
+    if service_client_id(data.claims.sub.trim())
+        .is_some_and(|id| config.revoked_client_ids.contains(id))
+    {
+        return McpAuth::Unauthorized;
+    }
     let Some(caller_key) = caller_key_for_sub(&data.claims.sub, tenant_slug) else {
         crate::operator_log::warn(
             module_path!(),
@@ -188,6 +213,26 @@ pub(crate) fn caller_key_for_sub(sub: &str, tenant_slug: &str) -> Option<String>
         && crate::interop::valid_caller_key(slug)
         && slug == tenant_slug.trim())
     .then(|| format!("svc~{client_id}~{slug}"))
+}
+
+/// The client id of a service-client subject, `svc:<client_id>@<tenant>`.
+/// Shape only: whether the id and tenant are acceptable is
+/// [`caller_key_for_sub`]'s business.
+pub(crate) fn service_client_id(sub: &str) -> Option<&str> {
+    let (client_id, _slug) = sub.trim().strip_prefix("svc:")?.split_once('@')?;
+    (!client_id.is_empty()).then_some(client_id)
+}
+
+/// The `sub` claim of a JWT, WITHOUT verifying anything. Only ever used to
+/// refuse a request earlier, never to admit one.
+fn unverified_sub(token: &str) -> Option<String> {
+    use base64::Engine as _;
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    claims.get("sub")?.as_str().map(str::to_string)
 }
 
 /// The token of an `Authorization: Bearer <token>` header. The scheme is

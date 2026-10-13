@@ -129,6 +129,29 @@ impl AnonymousLimiter {
         Ok(())
     }
 
+    /// Raise the unit's anonymous count for today to `used`, the number of
+    /// anonymous turns the admin has recorded for it since UTC midnight.
+    ///
+    /// This is what stops a cold start from handing the daily budget back: the
+    /// process begins at zero, the admin remembers. It only ever RAISES the
+    /// count (a count already higher locally, from turns the admin has not
+    /// been told of yet, is kept), so the cap this feeds is never looser than
+    /// the admin's figure plus what this process has served since.
+    pub(crate) fn reconcile_daily(&self, deployment: &str, now_ms: u64, used: u64) {
+        let day = now_ms / 1000 / SECS_PER_DAY;
+        let used = u32::try_from(used).unwrap_or(u32::MAX);
+        let mut entry = self.daily.entry(deployment.to_string()).or_insert((day, 0));
+        if entry.0 != day {
+            *entry = (day, 0);
+        }
+        entry.1 = entry.1.max(used);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn daily_count(&self, deployment: &str) -> Option<u32> {
+        self.daily.get(deployment).map(|entry| entry.1)
+    }
+
     fn charge_client(
         &self,
         deployment: &str,

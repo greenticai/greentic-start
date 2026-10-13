@@ -352,7 +352,7 @@ fn etag_key(door: &SecretsDoor, tenant: &str, bundle_id: &str) -> String {
     format!("{}|{tenant}|{bundle_id}", door.read_all_url)
 }
 
-fn install_crypto_provider() {
+pub(crate) fn install_crypto_provider() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         // This binary carries both `ring` and `aws-lc-rs`, so rustls cannot

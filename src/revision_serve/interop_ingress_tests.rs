@@ -1654,6 +1654,9 @@ async fn two_mounted_units_serve_two_independent_surfaces() {
 #[path = "interop_ingress_metering_tests.rs"]
 mod metering;
 
+#[path = "interop_ingress_door_tests.rs"]
+mod interop_ingress_door_tests;
+
 // ---------------------------------------------------------------------------
 // Provider setup surface (`greentic.setup.web-component.v1`)
 // ---------------------------------------------------------------------------

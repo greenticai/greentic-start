@@ -180,6 +180,15 @@ pub(crate) struct InteropConfig {
     /// The audience an OAuth token must carry on `/a2a`. **Absent means
     /// `/a2a` accepts the staged bearer alone**, whatever `access` says.
     pub a2a_resource: Option<String>,
+    /// `access.door: true`: the runtime fetches the admin's access-policy door
+    /// and may only TIGHTEN what is staged here (see
+    /// [`super::policy_door`]). **Absent means no fetch at all**, which is
+    /// every document staged before the field existed.
+    pub access_door: bool,
+    /// Service-client ids (`svc:<client_id>@<tenant>` subjects) the door has
+    /// revoked. Never staged: filled only by the door overlay, and empty for a
+    /// unit that does not use the door.
+    pub revoked_client_ids: std::collections::BTreeSet<String>,
 }
 
 /// Wire form of one credential, before validation.
@@ -284,6 +293,15 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
     let metering = raw
         .metering
         .and_then(|value| super::metering::parse_metering(value, tenant_slug.as_deref(), unit));
+    // Read on its own, before `access` is interpreted: a door can only
+    // tighten, so a block this build otherwise throws away must not also stop
+    // the unit from asking the admin to narrow it.
+    let access_door = raw
+        .access
+        .as_ref()
+        .and_then(|value| value.get("door"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(InteropConfig {
         a2a: raw.a2a,
         mcp: raw.mcp,
@@ -301,6 +319,8 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
         a2a_resource: raw
             .a2a_resource
             .and_then(|value| valid_a2a_resource(&value, unit)),
+        access_door,
+        revoked_client_ids: Default::default(),
     })
 }
 
@@ -686,6 +706,32 @@ mod tests {
         );
         assert_eq!(c.access, AccessPolicy::default());
         assert_eq!(c.a2a_resource, None);
+    }
+
+    #[test]
+    fn the_door_flag_is_off_unless_the_block_says_true() {
+        assert!(!parse_doc(json!({})).access_door);
+        assert!(!parse_doc(json!({"access": {"visibility": "private"}})).access_door);
+        for bad in [json!("true"), json!(1), json!(null), json!("yes")] {
+            assert!(
+                !parse_doc(json!({"access": {"door": bad}})).access_door,
+                "only a JSON true switches the door on"
+            );
+        }
+        assert!(parse_doc(json!({"access": {"door": true}})).access_door);
+        // Staged policy is read exactly as before.
+        let c = parse_doc(json!({"access": {"door": true, "mechanisms": ["oauth"]}}));
+        assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth]);
+        assert!(c.revoked_client_ids.is_empty());
+    }
+
+    #[test]
+    fn a_block_that_is_thrown_away_still_carries_the_door_flag() {
+        // A door can only tighten, so an unreadable block must not stop the
+        // unit from asking the admin to narrow it.
+        let c = parse_doc(json!({"access": {"door": true, "mechanisms": []}}));
+        assert_eq!(c.access, AccessPolicy::default());
+        assert!(c.access_door);
     }
 
     #[test]
