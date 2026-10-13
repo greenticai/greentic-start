@@ -158,3 +158,17 @@ private unit or a higher limit changes nothing.
 Not covered: the door cannot revoke a named bearer the designer never reported
 to the admin, and a revocation reaches a running unit within one 60 s window,
 not instantly.
+
+### Known limits of the door
+
+- **Revocation needs a first answer.** A revoked credential or service client is
+  refused only after the door has answered once. A process that cold-starts while
+  the admin is unreachable serves the staged policy, so a credential revoked since
+  the last deploy is still accepted until the first successful fetch. The next
+  deploy closes the gap for good, because it stages the document without that
+  credential's hash.
+- **The last good answer never expires.** While the admin stays unreachable, the
+  most recent answer keeps applying, revocations included. It is dropped only
+  when the process restarts.
+- **The door can only tighten.** An answer that would widen the staged policy is
+  intersected with it, so a compromised or misconfigured admin cannot open a unit.
