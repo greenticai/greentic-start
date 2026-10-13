@@ -268,6 +268,7 @@ mod tests {
                 flow("on_event", "events"),
             ],
             capabilities: vec![],
+            flow_meta: None,
         }
     }
 

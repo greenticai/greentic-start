@@ -31,6 +31,7 @@ fn main_app(fx: &Fixture) -> Arc<RevisionAppPack> {
             pack_id: PACK.to_string(),
             flows: vec![flow("main"), flow("pipeline_flow")],
             capabilities: vec![FAST2FLOW_CAPABILITY.to_string()],
+            flow_meta: None,
         },
         revision_id: fx.revision_id,
     })
