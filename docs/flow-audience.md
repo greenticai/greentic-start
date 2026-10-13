@@ -14,18 +14,25 @@ The designer writes `assets/flow-meta.json` into an app pack:
 * **Reads** the sidecar when the app pack is loaded (`messaging_app::load_app_pack_info`,
   `AppPackInfo::flow_meta`). Absent, oversized, malformed or of an unknown
   `version` means "no audience" (fail open, one warning).
-* **Fills `team_hint`** in the inbound envelope's `metadata` from the caller's team.
-  The team comes from `extensions.caller.team`, the block only a messaging
-  provider may author on the revision-serve route (`client_caller`), and only
-  when `extensions.caller.user_verified` is `true`. The key is always
-  overwritten, or removed when the team is unknown: card submits flatten
-  user-controlled data into `metadata`, so an inbound `team_hint` is never trusted.
+* **Fills `team_hint`** in the inbound envelope's `metadata` from the caller's teams.
+  A user may belong to several teams. The teams come from
+  `extensions.caller.team` (one slug, backward compatible) and
+  `extensions.caller.teams` (array of slugs, at most 50 read), the block only a
+  messaging provider may author on the revision-serve route (`client_caller`),
+  and only when `extensions.caller.user_verified` is `true`. Each slug is
+  trimmed, lowercased and must be a DNS label of at most 50 characters
+  (`[a-z0-9-]`, no leading or trailing `-`); invalid entries are ignored and
+  duplicates removed. `team_hint` stays a single value: the first caller team
+  that is in the flow's audience (so the router uses the relevant team), else
+  the first caller team. The key is always overwritten, or removed when no team
+  is known: card submits flatten user-controlled data into `metadata`, so an
+  inbound `team_hint` is never trusted.
 * **Enforces** the audience (`flow_audience::decide`):
-  empty audience = everyone; known team in the audience = allowed;
-  known team outside it = refused with a plain reply
+  empty audience = everyone; ANY caller team in the audience = allowed;
+  known teams and none in the audience = refused with a plain reply
   ("Sorry, this assistant is not available to your team.") and no flow runs;
-  unknown team = NOT refused (fail open, logged at info), or every anonymous chat
-  would break.
+  no known team (absent, unverified, empty or all-invalid) = NOT refused (fail
+  open, logged at info), or every anonymous chat would break.
 
 ## Scope and limits
 
@@ -36,8 +43,8 @@ The designer writes `assets/flow-meta.json` into an app pack:
 * The check runs per inbound message, including card submits and parked
   conversations. It runs after inbound attachment handling, so a refused
   caller's files were already fetched and stored.
-* Nothing yet makes a provider put `team` in the caller block; until one does,
-  every caller has an unknown team and nothing is refused.
+* Until a provider puts `team` / `teams` in the caller block, every caller has
+  an unknown team and nothing is refused.
 
 ## Open questions
 

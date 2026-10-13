@@ -38,51 +38,149 @@ fn parse_refuses_unknown_version_and_garbage() {
     assert!(FlowMeta::parse(b"nope").is_err());
 }
 
+fn teams(slugs: &[&str]) -> Vec<String> {
+    slugs.iter().map(|s| s.to_string()).collect()
+}
+
+fn verified(caller: Value) -> ChannelMessageEnvelope {
+    let mut block = json!({"user_verified": true, "sub": "u"});
+    if let (Some(dst), Some(src)) = (block.as_object_mut(), caller.as_object()) {
+        dst.extend(src.clone());
+    }
+    envelope(json!({"caller": block}), json!({}))
+}
+
 #[test]
 fn empty_audience_never_restricts() {
     let m = meta(&[]);
-    assert_eq!(decide(Some(&m), Some("sales")), Decision::Allow);
-    assert_eq!(decide(Some(&m), None), Decision::Allow);
-    assert_eq!(decide(None, Some("sales")), Decision::Allow);
+    assert_eq!(decide(Some(&m), &teams(&["sales"])), Decision::Allow);
+    assert_eq!(decide(Some(&m), &[]), Decision::Allow);
+    assert_eq!(decide(None, &teams(&["sales"])), Decision::Allow);
 }
 
 #[test]
 fn listed_team_is_allowed_unlisted_is_denied() {
     let m = meta(&["sales"]);
-    assert_eq!(decide(Some(&m), Some("Sales ")), Decision::Allow);
+    assert_eq!(decide(Some(&m), &teams(&["Sales "])), Decision::Allow);
     assert_eq!(
-        decide(Some(&m), Some("hr")),
-        Decision::Deny { team: "hr".into() }
+        decide(Some(&m), &teams(&["hr"])),
+        Decision::Deny {
+            teams: teams(&["hr"])
+        }
+    );
+}
+
+#[test]
+fn one_match_among_many_allows() {
+    let m = meta(&["sales"]);
+    assert_eq!(
+        decide(Some(&m), &teams(&["hr", "ops", "sales"])),
+        Decision::Allow
+    );
+}
+
+#[test]
+fn no_match_among_many_is_denied() {
+    let m = meta(&["sales"]);
+    assert_eq!(
+        decide(Some(&m), &teams(&["hr", "ops"])),
+        Decision::Deny {
+            teams: teams(&["hr", "ops"])
+        }
     );
 }
 
 #[test]
 fn unknown_team_fails_open() {
     let m = meta(&["sales"]);
-    assert_eq!(decide(Some(&m), None), Decision::AllowUnknownTeam);
+    assert_eq!(decide(Some(&m), &[]), Decision::AllowUnknownTeam);
 }
 
 #[test]
-fn caller_team_requires_a_verified_block() {
-    let verified = envelope(
-        json!({"caller": {"user_verified": true, "sub": "u", "team": "Sales"}}),
+fn caller_teams_requires_a_verified_block() {
+    let v = verified(json!({"team": "Sales"}));
+    assert_eq!(caller_teams(&v), teams(&["sales"]));
+
+    let unverified = envelope(
+        json!({"caller": {"team": "sales", "teams": ["sales"]}}),
         json!({}),
     );
-    assert_eq!(caller_team(&verified).as_deref(), Some("sales"));
-
-    let unverified = envelope(json!({"caller": {"team": "sales"}}), json!({}));
-    assert_eq!(caller_team(&unverified), None);
-
-    let no_team = envelope(json!({"caller": {"user_verified": true}}), json!({}));
-    assert_eq!(caller_team(&no_team), None);
-
-    let blank = envelope(
-        json!({"caller": {"user_verified": true, "team": "  "}}),
-        json!({}),
+    assert!(caller_teams(&unverified).is_empty());
+    assert!(
+        caller_teams(&envelope(
+            json!({"caller": {"user_verified": true}}),
+            json!({})
+        ))
+        .is_empty()
     );
-    assert_eq!(caller_team(&blank), None);
+    assert!(caller_teams(&verified(json!({"team": "  "}))).is_empty());
+    assert!(caller_teams(&envelope(json!({}), json!({}))).is_empty());
+}
 
-    assert_eq!(caller_team(&envelope(json!({}), json!({}))), None);
+#[test]
+fn legacy_team_without_teams_still_works() {
+    let e = verified(json!({"team": "sales"}));
+    assert_eq!(caller_teams(&e), teams(&["sales"]));
+    let m = meta(&["sales"]);
+    assert!(matches!(apply(Some(&m), &e, "t"), Applied::Proceed(_)));
+}
+
+#[test]
+fn teams_are_merged_deduped_and_validated() {
+    let e = verified(json!({
+        "team": "Sales",
+        "teams": ["sales", "ops", "Bad Slug", "-x", "x-", "", 7, "UPPER", "a".repeat(51)]
+    }));
+    assert_eq!(caller_teams(&e), teams(&["sales", "ops", "upper"]));
+}
+
+#[test]
+fn only_the_first_fifty_teams_are_read() {
+    let many: Vec<String> = (0..60).map(|i| format!("t{i}")).collect();
+    let e = verified(json!({"teams": many}));
+    assert_eq!(caller_teams(&e).len(), MAX_CALLER_TEAMS);
+}
+
+#[test]
+fn all_invalid_or_empty_teams_fail_open() {
+    let m = meta(&["sales"]);
+    for caller in [
+        json!({"teams": []}),
+        json!({"teams": ["Bad Slug", "", "-"]}),
+        json!({"teams": "sales"}),
+    ] {
+        let e = verified(caller);
+        assert!(caller_teams(&e).is_empty());
+        assert!(matches!(apply(Some(&m), &e, "t"), Applied::Proceed(_)));
+    }
+}
+
+#[test]
+fn hint_prefers_a_team_in_the_audience_else_the_first() {
+    let m = meta(&["sales"]);
+    let t = teams(&["hr", "sales", "ops"]);
+    assert_eq!(hint_team(Some(&m), &t).as_deref(), Some("sales"));
+    assert_eq!(hint_team(Some(&meta(&["x"])), &t).as_deref(), Some("hr"));
+    assert_eq!(hint_team(None, &t).as_deref(), Some("hr"));
+    assert_eq!(hint_team(Some(&m), &[]), None);
+}
+
+#[test]
+fn apply_stamps_the_matching_team_and_overwrites_a_forged_hint() {
+    let m = meta(&["sales"]);
+    let e = envelope(
+        json!({"caller": {"user_verified": true, "team": "hr", "teams": ["hr", "sales"]}}),
+        json!({"team_hint": "ceo"}),
+    );
+    match apply(Some(&m), &e, "t") {
+        Applied::Proceed(e) => assert_eq!(
+            e.metadata.get(TEAM_HINT_KEY).map(String::as_str),
+            Some("sales")
+        ),
+        other => panic!("expected proceed, got {other:?}"),
+    }
+    let denied = verified(json!({"teams": ["hr", "ops"]}));
+    assert!(matches!(apply(Some(&m), &denied, "t"), Applied::Denied(_)));
 }
 
 #[test]

@@ -10,8 +10,9 @@
 //! runtime half, all of it pure so it can be tested without a runner host:
 //!
 //! * [`FlowMeta::parse`] — tolerant read of the sidecar;
-//! * [`caller_team`] — the caller's team, from the provider-authored
-//!   `extensions.caller` block, and only when the provider verified the user;
+//! * [`caller_teams`] — the caller's teams (`team` plus `teams`), from the
+//!   provider-authored `extensions.caller` block, and only when the provider
+//!   verified the user;
 //! * [`stamp_team_hint`] — the `team_hint` metadata key the flow and the
 //!   router read, always overwritten (never trusted from the inbound message);
 //! * [`decide`] — allow / deny.
@@ -19,10 +20,10 @@
 //! Policy (conservative, see `docs/flow-audience.md`):
 //!
 //! * empty audience → [`Decision::Allow`], no restriction;
-//! * caller team unknown (anonymous chat, unverified provider block, no team
-//!   claim) → [`Decision::AllowUnknownTeam`]: NOT refused, logged by the
-//!   caller. Refusing would break every anonymous channel;
-//! * caller team known and listed → allow; known and not listed →
+//! * caller teams unknown (anonymous chat, unverified provider block, no or
+//!   invalid team claim) → [`Decision::AllowUnknownTeam`]: NOT refused, logged
+//!   by the caller. Refusing would break every anonymous channel;
+//! * any caller team listed → allow; teams known and none listed →
 //!   [`Decision::Deny`] with a plain reply, never an error.
 
 use greentic_types::ChannelMessageEnvelope;
@@ -84,49 +85,101 @@ impl FlowMeta {
 /// Outcome of the audience check for one inbound message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
-    /// No restriction applies, or the caller's team is in the audience.
+    /// No restriction applies, or one of the caller's teams is in the audience.
     Allow,
-    /// The flow is restricted but the caller's team is unknown. Allowed
+    /// The flow is restricted but the caller's teams are unknown. Allowed
     /// (fail open); the caller logs it.
     AllowUnknownTeam,
-    /// The caller's team is known and outside the audience.
-    Deny { team: String },
+    /// The caller's teams are known and none is in the audience.
+    Deny { teams: Vec<String> },
 }
+
+/// Upper bound on teams read from one caller block.
+pub const MAX_CALLER_TEAMS: usize = 50;
+
+/// Longest DNS label.
+const MAX_SLUG_LEN: usize = 50;
 
 fn normalize(slug: &str) -> String {
     slug.trim().to_ascii_lowercase()
 }
 
-/// The caller's team, when the provider vouches for it.
+/// A team slug is a DNS label of at most 50 characters: lowercase ASCII
+/// letters, digits and `-`, not starting or ending with `-`.
+fn is_valid_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() <= MAX_SLUG_LEN
+        && !slug.starts_with('-')
+        && !slug.ends_with('-')
+        && slug
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// The caller's teams, when the provider vouches for them.
 ///
 /// Read from `extensions.caller` — the block only a messaging provider may
 /// author on this route (see `revision_serve::client_caller`) — and only when
 /// `user_verified` is `true`. An unverified block is a claim nobody checked.
-pub fn caller_team(envelope: &ChannelMessageEnvelope) -> Option<String> {
-    let block = envelope.extensions.get("caller")?;
+///
+/// The result is `team` (if valid) followed by the entries of `teams` (at most
+/// [`MAX_CALLER_TEAMS`] are read), normalised, invalid slugs dropped,
+/// duplicates removed, order kept. Empty means "unknown".
+pub fn caller_teams(envelope: &ChannelMessageEnvelope) -> Vec<String> {
+    let Some(block) = envelope.extensions.get("caller") else {
+        return Vec::new();
+    };
     if block.get("user_verified").and_then(Value::as_bool) != Some(true) {
-        return None;
+        return Vec::new();
     }
-    let team = normalize(block.get("team").and_then(Value::as_str)?);
-    (!team.is_empty()).then_some(team)
+    let single = block.get("team").and_then(Value::as_str);
+    let many = block
+        .get("teams")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(MAX_CALLER_TEAMS)
+        .filter_map(Value::as_str);
+    let mut teams: Vec<String> = Vec::new();
+    for slug in single.into_iter().chain(many) {
+        let slug = normalize(slug);
+        if is_valid_slug(&slug) && !teams.contains(&slug) {
+            teams.push(slug);
+        }
+    }
+    teams
 }
 
 /// Apply the audience policy.
-pub fn decide(meta: Option<&FlowMeta>, team: Option<&str>) -> Decision {
+pub fn decide(meta: Option<&FlowMeta>, teams: &[String]) -> Decision {
     let Some(meta) = meta.filter(|meta| meta.is_restricted()) else {
         return Decision::Allow;
     };
-    match team {
-        None => Decision::AllowUnknownTeam,
-        Some(team) => {
-            let team = normalize(team);
-            if meta.audience.contains(&team) {
-                Decision::Allow
-            } else {
-                Decision::Deny { team }
-            }
+    if teams.is_empty() {
+        return Decision::AllowUnknownTeam;
+    }
+    if teams
+        .iter()
+        .any(|team| meta.audience.contains(&normalize(team)))
+    {
+        Decision::Allow
+    } else {
+        Decision::Deny {
+            teams: teams.to_vec(),
         }
     }
+}
+
+/// The single value stamped as `team_hint`: the first caller team that is in
+/// the flow's audience (so the router uses the relevant team), else the first
+/// caller team, else none.
+pub fn hint_team(meta: Option<&FlowMeta>, teams: &[String]) -> Option<String> {
+    let in_audience = meta.and_then(|meta| {
+        teams
+            .iter()
+            .find(|team| meta.audience.contains(&normalize(team)))
+    });
+    in_audience.or_else(|| teams.first()).cloned()
 }
 
 /// A copy of `envelope` whose `team_hint` metadata is the verified caller
@@ -172,9 +225,10 @@ pub enum Applied {
 /// Stamp `team_hint`, then enforce the audience. `scope` is only for logs
 /// (never log message content).
 pub fn apply(meta: Option<&FlowMeta>, envelope: &ChannelMessageEnvelope, scope: &str) -> Applied {
-    let team = caller_team(envelope);
-    let stamped = stamp_team_hint(envelope, team.as_deref());
-    match decide(meta, team.as_deref()) {
+    let teams = caller_teams(envelope);
+    let hint = hint_team(meta, &teams);
+    let stamped = stamp_team_hint(envelope, hint.as_deref());
+    match decide(meta, &teams) {
         Decision::Allow => Applied::Proceed(stamped),
         Decision::AllowUnknownTeam => {
             crate::operator_log::info(
@@ -183,10 +237,12 @@ pub fn apply(meta: Option<&FlowMeta>, envelope: &ChannelMessageEnvelope, scope: 
             );
             Applied::Proceed(stamped)
         }
-        Decision::Deny { team } => {
+        Decision::Deny { teams } => {
             crate::operator_log::info(
                 module_path!(),
-                format!("[flow-audience] {scope}: team {team:?} is outside the audience, refused"),
+                format!(
+                    "[flow-audience] {scope}: teams {teams:?} are outside the audience, refused"
+                ),
             );
             Applied::Denied(denied_reply(envelope))
         }
