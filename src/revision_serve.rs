@@ -6297,17 +6297,7 @@ async fn run_provider_inbound_pipeline(
         .app_packs
         .get_shared(bundle_id.as_str(), revision_id)
         .and_then(|app| app.info.flow_meta.clone());
-    for inbound in &envelopes {
-        // Flow audience (docs/flow-audience.md): stamp `team_hint` from the
-        // provider-verified caller team and refuse a known team outside the
-        // flow's audience. An unknown team is never refused.
-        let audience_scope = format!("deployment {deployment_id} revision {revision_id}");
-        let (stamped, audience_denial) =
-            match crate::flow_audience::apply(flow_meta.as_ref(), inbound, &audience_scope) {
-                crate::flow_audience::Applied::Proceed(envelope) => (envelope, None),
-                crate::flow_audience::Applied::Denied(reply) => (inbound.clone(), Some(reply)),
-            };
-        let ingress = &stamped;
+    for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
         // `flow_hint` metadata key (the provider echoing back the flow the
         // conversation was opened against), validate it against the FlowIndex
@@ -6334,6 +6324,16 @@ async fn run_provider_inbound_pipeline(
                 None
             }
         });
+        // Flow audience (docs/flow-audience.md): stamp `team_hint` from the
+        // provider-verified caller team and refuse a known team outside the
+        // flow's audience. An unknown team is never refused.
+        let audience_scope = format!("deployment {deployment_id} revision {revision_id}");
+        let (stamped, audience_denial) =
+            match crate::flow_audience::apply(flow_meta.as_ref(), ingress, &audience_scope) {
+                crate::flow_audience::Applied::Proceed(envelope) => (envelope, None),
+                crate::flow_audience::Applied::Denied(reply) => (ingress.clone(), Some(reply)),
+            };
+        let ingress = &stamped;
         // Fast2Flow (fast2flow_hook): an explicit target naming a non-default
         // flow wins; the default-flow target (named or not) may be re-routed,
         // and a miss may become the fixed reply without running a flow.
