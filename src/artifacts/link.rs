@@ -219,14 +219,12 @@ pub(crate) fn ttl_from(raw: Option<&str>) -> u64 {
 
 /// Whether signed artifact links are minted and served at all, in CODE.
 ///
-/// OFF until the WebChat reconnect-token hardening (gap G2,
-/// docs/superpowers/plans/2026-10-08-webchat-reconnect-token-hardening.md in
-/// the designer repo) ships in the same release: a hijacked WebChat
-/// conversation would otherwise expose every file link it holds. No deploy
-/// lane can set an env var on a remote workload today, so the release that
-/// carries G2 flips this constant (and its pin test) rather than relying on
-/// operators to switch it on.
-pub(crate) const OUTBOUND_LINKS_ENABLED: bool = false;
+/// ON since the WebChat reconnect-token hardening (gap G2, #705 here and
+/// messaging-providers #453) shipped: a Direct Line conversation can no longer
+/// be reached by knowing its id, so a hijacked conversation no longer exposes
+/// the file links it holds. No deploy lane can set an env var on a remote
+/// workload, so this constant (and its pin test) is the switch.
+pub(crate) const OUTBOUND_LINKS_ENABLED: bool = true;
 /// Can only force links ON (`1`/`true`/`yes`/`on`, case-insensitive) for a
 /// host that has G2, e.g. local testing; there is no off-override, so a build
 /// whose constant is `true` cannot be switched off by a stray variable.
