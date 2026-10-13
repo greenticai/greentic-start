@@ -253,7 +253,7 @@ slot gets a `door_unavailable` note and inline bytes are cleared.
 | `GREENTIC_TEAMS_SERVICE_URL_HOSTS` | empty | Extra EXACT hosts a Teams activity's `serviceUrl` may name (comma-separated, https only; a wildcard is dropped). Section 5 |
 | `GREENTIC_PDF_WORKER_SLOTS` | `1` (1..4) | PDF workers at once; also the process-wide text-extraction slots |
 | `GREENTIC_PDF_WORKER_MEM_MB` | `320` (64..1024) | Memory limit of one PDF worker |
-| `GREENTIC_ARTIFACT_LINKS`, `GREENTIC_ARTIFACT_LINK_TTL_SECS`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR` | see `docs/outbound-artifacts.md` §6 | Outbound file links (off in code until the WebChat reconnect-token hardening ships) |
+| `GREENTIC_ARTIFACT_LINKS`, `GREENTIC_ARTIFACT_LINK_TTL_SECS`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT`, `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_HOUR`, `GREENTIC_ARTIFACT_LINK_EGRESS_MB_PER_LINK_PER_HOUR` | see `docs/outbound-artifacts.md` §6 | Outbound file links (on in code since the WebChat reconnect-token hardening shipped) |
 
 ## 7. Serving rule (binding for any route that serves artifact bytes)
 
@@ -277,8 +277,8 @@ see `docs/outbound-artifacts.md`. Any route added later MUST:
   abuse bound is the one-file scope plus the route's rate and egress limits.
   Holding a token for the conversation, bound or not, is never sufficient on
   its own, and an artifact id is never a credential (it is computable from the
-  bytes). Links are OFF in code until the WebChat reconnect-token hardening
-  (G2) ships.
+  bytes). Links are ON in code since the WebChat reconnect-token hardening
+  (G2) shipped.
 
 A Direct Line token, bound to the conversation or not, is never a read
 credential for an artifact. A WebChat download link is minted by the host per

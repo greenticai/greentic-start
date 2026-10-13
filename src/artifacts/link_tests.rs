@@ -234,13 +234,12 @@ fn key_normalisation_matches_hmac_for_short_and_long_tokens() {
     }
 }
 
-/// Pinned OFF until the WebChat reconnect-token hardening (gap G2) ships: a
-/// hijacked WebChat conversation would otherwise expose every link it holds.
-/// Flipping this is a release decision, not a refactor.
+/// Pinned ON now that the WebChat reconnect-token hardening (gap G2) has
+/// shipped. Flipping it either way is a release decision, not a refactor.
 #[test]
 #[allow(clippy::assertions_on_constants)] // the constant IS what is pinned
-fn outbound_links_are_off_in_code_until_g2_ships() {
-    assert!(!super::link::OUTBOUND_LINKS_ENABLED);
+fn outbound_links_are_on_in_code_since_g2_shipped() {
+    assert!(super::link::OUTBOUND_LINKS_ENABLED);
     assert_eq!(super::link::LINKS_ENV, "GREENTIC_ARTIFACT_LINKS");
 }
 

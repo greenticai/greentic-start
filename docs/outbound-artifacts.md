@@ -11,14 +11,13 @@ Contract: the attachments-and-artifacts master plan (C2 id, C3 door, C5 tool
 result, C6 fixtures) and the outbound-delivery plan (gap G1), both in the
 greentic-designer repository.
 
-**Links are OFF in this build.** `link::OUTBOUND_LINKS_ENABLED` is `false`
-until the release that carries the WebChat reconnect-token hardening (gap G2):
-a hijacked WebChat conversation would otherwise expose every file link it
-holds. While off, a reply that names a file says "A file was created but file
-delivery is turned off for this worker." and the route answers every request
-with its 404. `GREENTIC_ARTIFACT_LINKS=1` (`true`/`yes`/`on`) forces links on
-for a host that has G2 (local testing); there is no off-override. The G2
-release flips the constant and its pin test.
+**Links are ON in this build.** `link::OUTBOUND_LINKS_ENABLED` is `true` since
+the WebChat reconnect-token hardening (gap G2, #705 here and
+messaging-providers #453) shipped: knowing a conversation id no longer reaches
+the conversation, so a link it holds is not exposed by a hijack. There is no
+off-override, because no deploy lane can set an env var on a remote workload.
+A link remains a per-file credential bound to the deployment, valid 24 hours
+by default.
 
 ## 1. How it works
 
@@ -189,7 +188,7 @@ only WebChat gets a (relative) link. Never derived from a request's `Host`.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GREENTIC_ARTIFACT_LINKS` | off (code) | `1`/`true`/`yes`/`on` forces links on; no off value |
+| `GREENTIC_ARTIFACT_LINKS` | on (code) | has no effect while the code default is on; no off value |
 | `GREENTIC_ARTIFACT_LINK_TTL_SECS` | `86400` (300..604800) | Link lifetime; lowering it (with a restart) revokes longer links |
 | `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT` | `8` (2..32) | Door reads at once per process |
 | `GREENTIC_ARTIFACT_LINK_MAX_INFLIGHT_PER_UNIT` | `3` (1..8) | Door reads at once per unit, per process |
@@ -253,8 +252,7 @@ the PR:
    with `greentic.media` installed (built from its repository).
 3. Build a worker that binds `generate_image`; deploy it to a local
    `greentic-start` (`--store-root`) behind a cloudflared tunnel so the link
-   base is https, with `GREENTIC_ARTIFACT_LINKS=1` (links are off in code until
-   G2 ships).
+   base is https, (links are on in code since G2).
 4. WebChat GUI: ask for an image. Expect the image inline in the chat.
 5. Same worker on a Slack test workspace through the tunnel: the message text
    carries `generated.png: https://…/v1/artifacts/…`; opening it downloads the
