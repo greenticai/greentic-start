@@ -1,0 +1,1 @@
+{"cursor":8,"type":"input_required","items":[{"kind":"card","card":{"body":[{"text":"Pick one","type":"TextBlock"}],"type":"AdaptiveCard","version":"1.5"},"fallback":"Pick one"}],"ts":"2026-10-14T10:00:01Z"}

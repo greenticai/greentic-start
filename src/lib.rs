@@ -10,6 +10,7 @@ mod admin_server;
 mod agent_provenance;
 // `pub` (doc-hidden) so `tests/approval_rail_live_broker.rs` can drive the
 // bridge against a real NATS without a bundle or a Slack workspace.
+mod api_channel;
 #[doc(hidden)]
 pub mod approval_rail;
 mod artifacts;
