@@ -29,6 +29,7 @@
 use greentic_types::ChannelMessageEnvelope;
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 /// Pack path of the sidecar.
 pub const FLOW_META_ENTRY: &str = "assets/flow-meta.json";
@@ -52,6 +53,12 @@ pub struct FlowMeta {
     /// Phrases the designer feeds to the router index; unused by the gate.
     #[serde(default)]
     pub example_requests: Vec<String>,
+    /// Per-node audiences of a ROUTER pack: node id (`ask_<unit>`) to the team
+    /// slugs allowed to be routed to it. A node absent here, or mapped to an
+    /// empty list, is open. Enforced by the Fast2Flow hook, never by
+    /// [`decide`] on the pack as a whole.
+    #[serde(default)]
+    pub node_audience: BTreeMap<String, Vec<String>>,
 }
 
 impl FlowMeta {
@@ -73,7 +80,30 @@ impl FlowMeta {
             .map(|slug| normalize(slug))
             .filter(|slug| !slug.is_empty())
             .collect();
+        meta.node_audience = std::mem::take(&mut meta.node_audience)
+            .into_iter()
+            .filter_map(|(node, slugs)| {
+                let node = node.trim().to_string();
+                let slugs: Vec<String> = slugs
+                    .iter()
+                    .map(|slug| normalize(slug))
+                    .filter(|slug| !slug.is_empty())
+                    .collect();
+                // An entry that lists nobody means "open", so it is not kept:
+                // a restriction must name at least one team.
+                (!node.is_empty() && !slugs.is_empty()).then_some((node, slugs))
+            })
+            .collect();
         Ok(meta)
+    }
+
+    /// The audience of one routed node as a stand-alone [`FlowMeta`], or
+    /// `None` when the node is open.
+    pub fn node_meta(&self, node: &str) -> Option<FlowMeta> {
+        self.node_audience.get(node).map(|audience| FlowMeta {
+            audience: audience.clone(),
+            ..FlowMeta::default()
+        })
     }
 
     /// True when the flow restricts who may use it.
@@ -168,6 +198,13 @@ pub fn decide(meta: Option<&FlowMeta>, teams: &[String]) -> Decision {
             teams: teams.to_vec(),
         }
     }
+}
+
+/// Apply the audience policy to a routed node of a router pack. Same
+/// semantics as [`decide`]: an open node allows, unknown caller teams fail
+/// open, known teams none of which is listed are denied.
+pub fn decide_node(meta: Option<&FlowMeta>, node: &str, teams: &[String]) -> Decision {
+    decide(meta.and_then(|meta| meta.node_meta(node)).as_ref(), teams)
 }
 
 /// The single value stamped as `team_hint`: the first caller team that is in

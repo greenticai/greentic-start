@@ -303,6 +303,16 @@ pub(super) async fn plan_for_app(
         ),
     );
 
+    // Router audience: a client-named card navigation must not jump to a node
+    // the caller's team may not be routed to (`docs/flow-audience.md`).
+    for key in crate::fast2flow::turn::CARD_NAV_META_KEYS {
+        if let Some(node) = ingress.metadata.get(*key)
+            && let Some(refusal) = node_audience_refusal(&app, scope, ingress, node)
+        {
+            return refusal;
+        }
+    }
+
     let default_flow = default_flow_hint(&app, fallback.as_ref());
     match store {
         Some(store) => {
@@ -383,6 +393,13 @@ pub(super) async fn plan_for_app(
             fixed_reply: None,
         },
         TurnPlan::Routed(RouteDecision::Node { envelope, signal }) => {
+            if let Some(refusal) = signal
+                .node
+                .as_deref()
+                .and_then(|node| node_audience_refusal(&app, scope, ingress, node))
+            {
+                return refusal;
+            }
             match fallback.or_else(|| default_flow.clone()) {
                 Some(target) => {
                     let flow_id = target.flow_id.clone();
@@ -439,6 +456,56 @@ pub(super) async fn plan_for_app(
                 signal: None,
                 fixed_reply: Some(reply),
             }
+        }
+    }
+}
+
+/// The refusal turn when `node` of a router pack is restricted to teams the
+/// caller does not belong to (`FlowMeta::node_audience`, written by the
+/// designer from each target's own flow audience).
+///
+/// Same policy as the flow gate (`flow_audience::decide`): an open node allows,
+/// a caller without verified teams is not refused (logged), and known teams
+/// none of which is listed get the plain denied reply with no flow run and no
+/// call to the target. The teams are read from the provider-authored caller
+/// block of THIS message; nothing is trusted from another hop.
+pub(super) fn node_audience_refusal(
+    app: &RevisionAppPack,
+    scope: &TurnScope<'_>,
+    ingress: &ChannelMessageEnvelope,
+    node: &str,
+) -> Option<RevisionTurn> {
+    use crate::flow_audience::{Decision, caller_teams, decide_node, denied_reply};
+    let meta = app.info.flow_meta.as_ref()?;
+    meta.node_audience.get(node)?;
+    match decide_node(Some(meta), node, &caller_teams(ingress)) {
+        Decision::Allow => None,
+        Decision::AllowUnknownTeam => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[flow-audience] revision {} node {node}: caller team unknown, audience not enforced",
+                    scope.revision_id
+                ),
+            );
+            None
+        }
+        Decision::Deny { teams } => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[flow-audience] revision {} node {node}: teams {teams:?} are outside the audience, refused",
+                    scope.revision_id
+                ),
+            );
+            let mut reply = denied_reply(ingress);
+            reply.id = uuid::Uuid::new_v4().to_string();
+            Some(RevisionTurn {
+                target: None,
+                envelope: ingress.clone(),
+                signal: None,
+                fixed_reply: Some(reply),
+            })
         }
     }
 }
@@ -558,6 +625,13 @@ async fn reroute_parked(
         RouteDecision::Node { envelope, signal } => {
             if signal.node.as_deref().is_some_and(|n| parked.has_run(n)) {
                 return None;
+            }
+            if let Some(refusal) = signal
+                .node
+                .as_deref()
+                .and_then(|node| node_audience_refusal(app, scope, ingress, node))
+            {
+                return Some(refusal);
             }
             let target = target_flow.cloned()?;
             (target, envelope, signal)

@@ -18,6 +18,7 @@ fn meta(audience: &[&str]) -> FlowMeta {
     FlowMeta {
         audience: audience.iter().map(|s| s.to_string()).collect(),
         example_requests: Vec::new(),
+        node_audience: Default::default(),
     }
 }
 
@@ -231,4 +232,57 @@ fn apply_denies_proceeds_and_fails_open() {
         other => panic!("expected proceed, got {other:?}"),
     }
     assert!(matches!(apply(None, &hr, "t"), Applied::Proceed(_)));
+}
+
+fn router_meta() -> FlowMeta {
+    FlowMeta::parse(
+        br#"{"version":1,"audience":[],"node_audience":{"ask_hr":[" HR "],"ask_open":[],"ask_x":["a","b"]}}"#,
+    )
+    .expect("parse")
+}
+
+#[test]
+fn node_audience_is_normalised_and_an_empty_entry_is_open() {
+    let m = router_meta();
+    assert_eq!(m.node_audience.get("ask_hr"), Some(&vec!["hr".to_string()]));
+    assert!(!m.node_audience.contains_key("ask_open"));
+    assert!(
+        !m.is_restricted(),
+        "node audiences never restrict the pack itself"
+    );
+}
+
+#[test]
+fn a_routed_node_follows_the_same_policy_as_a_flow() {
+    let m = router_meta();
+    assert_eq!(
+        decide_node(Some(&m), "ask_hr", &teams(&["hr"])),
+        Decision::Allow
+    );
+    assert_eq!(
+        decide_node(Some(&m), "ask_hr", &teams(&["eng", "hr"])),
+        Decision::Allow
+    );
+    assert_eq!(
+        decide_node(Some(&m), "ask_hr", &teams(&["eng"])),
+        Decision::Deny {
+            teams: teams(&["eng"])
+        }
+    );
+    assert_eq!(
+        decide_node(Some(&m), "ask_hr", &[]),
+        Decision::AllowUnknownTeam
+    );
+    assert_eq!(
+        decide_node(Some(&m), "ask_open", &teams(&["eng"])),
+        Decision::Allow
+    );
+    assert_eq!(
+        decide_node(Some(&m), "welcome", &teams(&["eng"])),
+        Decision::Allow
+    );
+    assert_eq!(
+        decide_node(None, "ask_hr", &teams(&["eng"])),
+        Decision::Allow
+    );
 }

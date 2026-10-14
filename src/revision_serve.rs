@@ -16612,6 +16612,9 @@ mod fast2flow_hook;
 #[path = "revision_serve/client_caller.rs"]
 mod client_caller;
 
+#[cfg(all(test, unix))]
+#[path = "revision_serve/fast2flow_hook_audience_tests.rs"]
+mod fast2flow_hook_audience_tests;
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_tests.rs"]
 mod fast2flow_hook_tests;

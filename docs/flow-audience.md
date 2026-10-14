@@ -34,6 +34,30 @@ The designer writes `assets/flow-meta.json` into an app pack:
   no known team (absent, unverified, empty or all-invalid) = NOT refused (fail
   open, logged at info), or every anonymous chat would break.
 
+## Router packs (Fast2Flow): `node_audience`
+
+A channel served by a generated Fast2Flow router forwards the message to a
+target unit over agent-to-agent, so the target's own flow gate never sees the
+caller's teams. The router enforces the target's audience instead, on the
+message it received through the messaging path (verified caller block):
+
+* the designer writes `node_audience` into the router pack's
+  `assets/flow-meta.json`: `{"version":1,"audience":[],"node_audience":{"ask_hr":["hr"]}}`
+  (node id of the `a2a` node to the teams allowed to be routed to it; a node
+  absent or mapped to no team is open);
+* `fast2flow_hook` applies `flow_audience::decide_node`, the same policy as the
+  flow gate (open = allow; no verified team = allow, logged; any caller team
+  listed = allow; known teams none listed = the plain refusal reply, no target
+  is called), to (a) a node the router dispatches to, (b) a node dispatched
+  while re-routing a parked conversation, and (c) a card-navigation key
+  (`routeToCardId`, `toCardId`, `nextCardId`) in the inbound metadata, so a
+  client cannot name a restricted node itself;
+* nothing is trusted from another hop: teams are read from this message's
+  caller block, never from a forwarded header.
+
+Not covered: the router's assistant (the on-miss default flow), and a
+conversation already parked inside a target resumes without a new check.
+
 ## Scope and limits
 
 * Revision-serve messaging path only (start without `--bundle`). The legacy
