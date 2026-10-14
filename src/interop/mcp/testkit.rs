@@ -11,8 +11,12 @@
 //! key-generation quirk, and RSA keygen is slow enough to be felt in a suite
 //! this size.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use serde_json::json;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// The `kid` both the JWKS document and every minted token carry. A token
 /// whose `kid` is absent from the served key set must be refused, so the two
@@ -125,4 +129,50 @@ pub fn mint_token_with_kid(
         &EncodingKey::from_rsa_pem(TEST_PRIVATE_KEY_PEM.as_bytes()).expect("test RSA private key"),
     )
     .expect("minting a test token")
+}
+
+/// A stub authorization server that answers `/.well-known/jwks.json`.
+pub struct StubIssuer {
+    pub url: String,
+    pub fetches: Arc<AtomicUsize>,
+}
+
+impl StubIssuer {
+    /// Serve `connections` requests, then stop. The caller's issuer URL is
+    /// unique to this listener's port.
+    pub async fn start(connections: usize, body: String) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&fetches);
+        tokio::spawn(async move {
+            for _ in 0..connections {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                counted.fetch_add(1, Ordering::Relaxed);
+                let body = body.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let _ = stream.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.flush().await;
+                });
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}");
+        crate::interop::mcp::jwks::clear_issuer_for_tests(&url);
+        Self { url, fetches }
+    }
+
+    pub async fn serving_keys(connections: usize) -> Self {
+        Self::start(connections, jwks_document().to_string()).await
+    }
 }

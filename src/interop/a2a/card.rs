@@ -13,14 +13,17 @@ use sha2::{Digest, Sha256};
 
 use super::super::input_request::INPUT_REQUEST_MEDIA_TYPE;
 use super::types::{
-    AgentCapabilities, AgentCard, AgentInterface, AgentSkill, HttpAuthSecurityScheme,
-    ProtocolVersion, SecurityRequirement, SecurityScheme, StringList,
+    AgentCapabilities, AgentCard, AgentInterface, AgentSkill, ClientCredentialsFlow,
+    HttpAuthSecurityScheme, OAuth2SecurityScheme, OAuthFlows, ProtocolVersion, SecurityRequirement,
+    SecurityScheme, StringList,
 };
 use super::{A2aContext, A2aRequest, CARD_CACHE_CONTROL, HttpResponse, JSONRPC_PATH, plain};
+use crate::interop::config::{Mechanism, Visibility};
 
 /// Synthesize the card from the staged `agent` object, falling back to the
 /// bundle id and a generic `converse` skill.
 pub(crate) fn build_card(ctx: &A2aContext<'_>, base_url: &str) -> AgentCard {
+    let schemes = security_schemes(ctx);
     let agent = &ctx.config.agent;
     let name = agent
         .name
@@ -95,27 +98,79 @@ pub(crate) fn build_card(ctx: &A2aContext<'_>, base_url: &str) -> AgentCard {
         provider: None,
         documentation_url: None,
         icon_url: None,
-        security_schemes: BTreeMap::from([(
+        security_schemes: schemes.clone(),
+        security_requirements: requirements(&schemes),
+    }
+}
+
+/// The schemes the card advertises, from the unit's access policy.
+///
+/// - **Public**: none. A card with a bearer scheme and a requirement tells a
+///   client it must authenticate, and a public unit serves a caller who
+///   presents nothing. A credential is still honoured if sent.
+/// - **Private**: the bearer when `api_key` is allowed, plus the OAuth scheme
+///   when `oauth` is allowed and this unit can verify a token on `/a2a`.
+fn security_schemes(ctx: &A2aContext<'_>) -> BTreeMap<String, SecurityScheme> {
+    let config = ctx.config;
+    let mut schemes = BTreeMap::new();
+    if config.access.visibility == Visibility::Public {
+        return schemes;
+    }
+    let oauth_here = config.access.allows(Mechanism::Oauth)
+        && config.a2a_resource.is_some()
+        && config.tenant_slug.is_some();
+    let issuer = config
+        .issuer
+        .as_deref()
+        .map(|issuer| issuer.trim_end_matches('/'));
+    if config.access.allows(Mechanism::ApiKey) {
+        schemes.insert(
             BEARER_SCHEME_NAME.to_string(),
             SecurityScheme::HttpAuth(HttpAuthSecurityScheme {
                 description: Some("A worker interop token (gtw_…).".into()),
                 scheme: "bearer".into(),
                 bearer_format: Some("gtw".into()),
             }),
-        )]),
-        // Declaring the scheme is not the same as requiring it: a card with
-        // no requirement reads as "no authentication", and this endpoint
-        // refuses every anonymous call. No scopes, so an empty `list`.
-        security_requirements: vec![SecurityRequirement {
-            schemes: BTreeMap::from([(BEARER_SCHEME_NAME.to_string(), StringList::default())]),
-        }],
+        );
     }
+    if let (true, Some(issuer)) = (oauth_here, issuer) {
+        schemes.insert(
+            OAUTH_SCHEME_NAME.to_string(),
+            SecurityScheme::OAuth2(OAuth2SecurityScheme {
+                description: Some("An OAuth 2.0 access token for this agent's address.".into()),
+                flows: OAuthFlows {
+                    client_credentials: ClientCredentialsFlow {
+                        token_url: format!("{issuer}/oauth/token"),
+                        scopes: BTreeMap::new(),
+                    },
+                },
+            }),
+        );
+    }
+    schemes
+}
+
+/// One alternative per advertised scheme: a caller satisfies any of them.
+/// Declaring a scheme is not the same as requiring it, and a card with no
+/// requirement reads as "no authentication" — which is right only for a public
+/// unit, whose map is empty.
+fn requirements(schemes: &BTreeMap<String, SecurityScheme>) -> Vec<SecurityRequirement> {
+    schemes
+        .keys()
+        .map(|name| SecurityRequirement {
+            // No scopes, so an empty `list`.
+            schemes: BTreeMap::from([(name.clone(), StringList::default())]),
+        })
+        .collect()
 }
 
 /// The name both `securitySchemes` and `securityRequirements` refer the bearer
 /// scheme by. Spelled once: a requirement naming a scheme the card does not
 /// define is unsatisfiable, and nothing would report it.
 const BEARER_SCHEME_NAME: &str = "bearer";
+
+/// The same, for the OAuth scheme.
+const OAUTH_SCHEME_NAME: &str = "oauth";
 
 /// `GET /.well-known/agent-card.json`: unauthenticated, cacheable, with a
 /// strong ETag over the exact bytes served.

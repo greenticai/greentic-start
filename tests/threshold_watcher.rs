@@ -65,6 +65,7 @@ fn pack_with_metric_subscriber() -> AppPackInfo {
             },
         ],
         capabilities: vec![],
+        flow_meta: None,
     }
 }
 

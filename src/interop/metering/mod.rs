@@ -74,8 +74,9 @@ const QUEUE_CAPACITY: usize = 1024;
 ///
 /// A newtype with a redacting [`std::fmt::Debug`], so no `{:?}` anywhere —
 /// including one in a crate that has never heard of this module — can print
-/// it. The plaintext is reachable only through [`MeteringToken::expose`],
-/// whose one caller is the header the POST sends.
+/// it. The plaintext is reachable only through [`MeteringToken::expose`]:
+/// the header the POST sends, and the one-way derivation of the unit's
+/// artifact-link key (`artifacts::link_table`), which never stores or prints it.
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct MeteringToken(String);
 
@@ -319,11 +320,37 @@ impl TurnMetering {
         self
     }
 
+    /// Record one turn for `caller`: a staged credential is named, an OAuth
+    /// subject is not a credential and is omitted, and an anonymous caller is
+    /// marked `caller_kind: "anonymous"`.
+    pub(crate) fn record_for(
+        &self,
+        surface: Surface,
+        caller: &super::caller::Caller,
+        usage: TurnUsage,
+        duration: Duration,
+    ) {
+        let kind = caller.is_anonymous().then_some("anonymous");
+        self.record_inner(surface, caller.credential_id(), kind, usage, duration);
+    }
+
     /// Record one turn. Synchronous, never fallible, never blocking.
+    #[cfg(test)]
     pub(crate) fn record(
         &self,
         surface: Surface,
         credential_id: Option<&str>,
+        usage: TurnUsage,
+        duration: Duration,
+    ) {
+        self.record_inner(surface, credential_id, None, usage, duration);
+    }
+
+    fn record_inner(
+        &self,
+        surface: Surface,
+        credential_id: Option<&str>,
+        caller_kind: Option<&'static str>,
         usage: TurnUsage,
         duration: Duration,
     ) {
@@ -344,6 +371,7 @@ impl TurnMetering {
             bundle_id: self.unit.bundle_id.clone(),
             agent_id: self.unit.agent_id.clone(),
             credential_id: credential_id.map(str::to_string),
+            caller_kind,
             surface: surface.as_str(),
             tokens_in: usage.tokens_in,
             tokens_out: usage.tokens_out,

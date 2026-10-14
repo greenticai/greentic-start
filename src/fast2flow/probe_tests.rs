@@ -39,6 +39,7 @@ fn pack(capabilities: &[&str]) -> AppPackInfo {
         pack_id: PACK.to_string(),
         flows: vec![flow("default"), flow("pipeline_flow")],
         capabilities: capabilities.iter().map(|c| c.to_string()).collect(),
+        flow_meta: None,
     }
 }
 

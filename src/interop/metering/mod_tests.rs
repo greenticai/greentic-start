@@ -239,6 +239,7 @@ fn the_queue_drops_rather_than_growing_without_bound() {
                 bundle_id: "b".into(),
                 agent_id: "a".into(),
                 credential_id: None,
+                caller_kind: None,
                 surface: Surface::A2a.as_str(),
                 tokens_in: 0,
                 tokens_out: 0,

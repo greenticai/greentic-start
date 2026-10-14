@@ -27,7 +27,10 @@ pub(crate) mod turn;
 
 pub use config::Fast2FlowConfig;
 pub use contracts::{Fast2FlowHookInV1, MessageEnvelope};
-pub use gate::{FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY, Fast2FlowGate};
+pub use gate::{
+    FAST2FLOW_CAPABILITY, FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY,
+    FAST2FLOW_REROUTE_PARKED_CAPABILITY, Fast2FlowGate,
+};
 pub use host_process::invoke_routing_host_with_env;
 pub use llm_router::try_llm_route;
 pub use mapper::map_directive_to_control;
@@ -394,6 +397,7 @@ mod tests {
                 pack_id: "sales-crm".to_string(),
                 flows: alloc_messaging_default(),
                 capabilities: vec![FAST2FLOW_CAPABILITY.to_string()],
+                flow_meta: None,
             }
         }
 
@@ -501,6 +505,7 @@ mod tests {
                 pack_id: "no-fast2flow".to_string(),
                 flows: alloc_messaging_default(),
                 capabilities: Vec::new(),
+                flow_meta: None,
             };
             let result = try_for_request(
                 &cfg,

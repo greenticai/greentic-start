@@ -567,7 +567,8 @@ fn only_runner_scoped_categories_are_served_at_env_default() {
 
 #[tokio::test]
 async fn an_unreachable_door_fails_the_activation() {
-    let port = closed_port().await;
+    let closed = closed_port().await;
+    let port = closed.port;
     let store = MemStore::default();
     stage(
         &store,

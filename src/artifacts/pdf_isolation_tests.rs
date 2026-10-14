@@ -1,0 +1,383 @@
+use std::path::Path;
+use std::time::{Duration, Instant};
+
+use super::pdf_fixture::{flate_content_pdf, text_pdf, zlib_bomb};
+use super::pdf_isolation::*;
+
+// --- The worker's own extraction (runs in-process here; benign inputs only) --
+
+#[test]
+fn a_text_pdf_yields_its_text() {
+    let out = worker_extract(&text_pdf("Hello attachment", 1), 10, 1_000);
+    assert!(out.contains("Hello attachment"), "got {out:?}");
+}
+
+#[test]
+fn a_malformed_pdf_yields_empty_text_not_a_panic() {
+    for bytes in [
+        &b"%PDF-1.7\nnot really a pdf"[..],
+        b"%PDF-",
+        b"",
+        &[0xff; 64],
+    ] {
+        assert_eq!(worker_extract(bytes, 10, 1_000), "");
+    }
+    // Cut off after the catalog: no page tree, no cross-reference table.
+    let pdf = text_pdf("Hello", 1);
+    assert_eq!(worker_extract(&pdf[..60], 10, 1_000), "");
+}
+
+#[test]
+fn a_corrupt_flate_stream_yields_no_text() {
+    let out = worker_extract(&flate_content_pdf(b"\x78\x9cnot deflate"), 10, 1_000);
+    assert!(!out.contains("not deflate"));
+}
+
+#[test]
+fn the_bomb_fixture_is_a_valid_zlib_stream() {
+    // The real-binary test relies on this stream inflating as described; a
+    // broken fixture would make "the worker yielded nothing" prove nothing.
+    use std::io::Read as _;
+    let mut out = Vec::new();
+    flate2::read::ZlibDecoder::new(&zlib_bomb(b"BT ET", 1_000)[..])
+        .read_to_end(&mut out)
+        .expect("valid zlib, checksum included");
+    assert_eq!(out.len(), 5 + 1 + 258 * 1_000);
+    assert!(out.starts_with(b"BT ET "));
+    assert!(out[5..].iter().all(|&b| b == b' '));
+}
+
+#[test]
+fn a_small_bomb_is_just_a_document() {
+    let content = b"BT /F1 12 Tf 72 712 Td (Survived) Tj ET\n";
+    let out = worker_extract(&flate_content_pdf(&zlib_bomb(content, 4_000)), 10, 1_000);
+    assert!(out.contains("Survived"), "got {out:?}");
+}
+
+#[test]
+fn too_many_pages_yields_empty_text() {
+    let pdf = text_pdf("Hello", 4);
+    assert!(worker_extract(&pdf, 4, 1_000).contains("Hello"));
+    assert_eq!(worker_extract(&pdf, 3, 1_000), "");
+}
+
+#[test]
+fn the_worker_stops_at_the_character_cap() {
+    let pdf = text_pdf("abcdefghij", 20);
+    let out = worker_extract(&pdf, 50, 25);
+    assert_eq!(out.chars().count(), 25);
+}
+
+// --- The supervisor, driven with stand-in programs ---------------------------
+
+const SH: &str = "/bin/sh";
+
+fn fast() -> Limits {
+    Limits {
+        wall: Duration::from_secs(2),
+        max_chars: 1_000,
+        ..Limits::DEFAULT
+    }
+}
+
+/// Each call gets a gate of its own: a test that expects "" must get it from
+/// the worker, never from waiting on a slot another test holds.
+fn sh(script: &str, input: &[u8], limits: &Limits) -> String {
+    run_worker_in(&Gate::new(1), Path::new(SH), &["-c", script], input, limits)
+}
+
+#[test]
+fn a_framed_answer_is_the_text() {
+    let script = format!("printf '{}hello'", frame_for_shell());
+    assert_eq!(sh(&script, b"", &fast()), "hello");
+}
+
+#[test]
+fn the_input_reaches_the_worker_on_stdin() {
+    let script = format!("printf '{}'; /bin/cat", frame_for_shell());
+    assert_eq!(sh(&script, b"pdf bytes", &fast()), "pdf bytes");
+}
+
+#[test]
+fn an_unframed_answer_is_ignored() {
+    // Anything that is not the worker (a different binary, a crash banner)
+    // must never be read as extracted text.
+    assert_eq!(sh("printf 'hello'", b"", &fast()), "");
+}
+
+#[test]
+fn a_failed_worker_yields_empty_text() {
+    let script = format!("printf '{}hello'; exit 3", frame_for_shell());
+    assert_eq!(sh(&script, b"", &fast()), "");
+}
+
+#[test]
+fn a_worker_past_its_deadline_is_killed() {
+    let limits = Limits {
+        wall: Duration::from_millis(300),
+        ..fast()
+    };
+    let started = Instant::now();
+    assert_eq!(sh("/bin/sleep 30", b"", &limits), "");
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_flooding_worker_is_cut_off() {
+    // The host stops reading at the cap and closes the pipe, which ends the
+    // worker long before its deadline: the answer is never buffered whole.
+    // `yes` keeps constant memory, so nothing but the closed pipe stops it.
+    let script = format!("printf '{}'; exec /usr/bin/yes aaaaaaaa", frame_for_shell());
+    let limits = Limits {
+        wall: Duration::from_secs(4),
+        ..fast()
+    };
+    let started = Instant::now();
+    assert_eq!(sh(&script, b"", &limits), "");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn the_worker_runs_under_resource_limits() {
+    let script = format!(
+        "printf '{}'; printf '%s %s %s %s %s' \"$(ulimit -d)\" \"$(ulimit -t)\" \"$(ulimit -f)\" \"$(ulimit -c)\" \"$(ulimit -n)\"",
+        frame_for_shell()
+    );
+    let limits = Limits::DEFAULT;
+    let expected = format!("{} {} 0 0 16", limits.data_bytes / 1024, limits.cpu_secs);
+    assert_eq!(
+        sh(
+            &script,
+            b"",
+            &Limits {
+                wall: Duration::from_secs(2),
+                ..limits
+            }
+        ),
+        expected
+    );
+}
+
+#[test]
+fn the_worker_gets_no_environment() {
+    // The parent's environment carries credentials; a parser of untrusted
+    // input never sees them. `cargo test` always exports PATH and CARGO*.
+    let script = format!("printf '{}'; export -p", frame_for_shell());
+    let limits = Limits {
+        max_chars: 1_000_000,
+        ..fast()
+    };
+    let out = sh(&script, b"", &limits);
+    assert!(out.contains("export PWD="), "the shell answered: {out}");
+    assert!(!out.contains("PATH="), "{out}");
+    assert!(!out.contains("CARGO"), "{out}");
+}
+
+#[test]
+fn a_missing_program_yields_empty_text() {
+    let out = run_worker_in(
+        &Gate::new(1),
+        Path::new("/nonexistent/greentic-start"),
+        &[],
+        b"x",
+        &fast(),
+    );
+    assert_eq!(out, "");
+}
+
+#[test]
+fn concurrent_workers_are_bounded() {
+    let gate = Gate::new(2);
+    let a = gate.acquire(Duration::from_millis(10)).expect("first slot");
+    let _b = gate
+        .acquire(Duration::from_millis(10))
+        .expect("second slot");
+    assert!(gate.acquire(Duration::from_millis(50)).is_none());
+    drop(a);
+    assert!(gate.acquire(Duration::from_millis(50)).is_some());
+}
+
+/// The frame as a `printf` format string (its newline written as `\n`).
+fn frame_for_shell() -> String {
+    String::from_utf8(FRAME.to_vec())
+        .unwrap()
+        .replace('\n', "\\n")
+}
+
+// --- The bounded read of the worker's answer ---------------------------------
+
+/// An endless stream of `x` that fails the test if anyone asks it for more
+/// than `limit` bytes in total: the read cap must stop asking, not just stop
+/// keeping.
+struct Endless {
+    served: u64,
+    limit: u64,
+}
+
+impl std::io::Read for Endless {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        assert!(
+            self.served + buf.len() as u64 <= self.limit,
+            "asked for {} bytes after {} served",
+            buf.len(),
+            self.served
+        );
+        buf.fill(b'x');
+        self.served += buf.len() as u64;
+        Ok(buf.len())
+    }
+}
+
+#[test]
+fn reading_the_answer_stops_at_the_cap() {
+    let cap = 100_000;
+    let out = read_capped(
+        Endless {
+            served: 0,
+            limit: cap + 8192,
+        },
+        cap,
+    )
+    .unwrap();
+    assert_eq!(out.len() as u64, cap);
+}
+
+#[test]
+fn a_short_answer_is_read_whole() {
+    assert_eq!(read_capped(&b"hello"[..], 100).unwrap(), b"hello");
+}
+
+#[test]
+fn the_worker_runs_in_the_root_directory() {
+    let script = format!("printf '{}'; pwd", frame_for_shell());
+    assert_eq!(sh(&script, b"", &fast()), "/\n");
+}
+
+#[test]
+fn a_dropped_child_guard_kills_and_reaps_the_worker() {
+    let child = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let started = Instant::now();
+    drop(ChildGuard::new(child));
+    assert!(started.elapsed() < Duration::from_secs(5));
+    // Reaped, not a zombie: the pid no longer exists.
+    assert!(!Path::new(&format!("/proc/{pid}")).exists());
+}
+
+// --- Production limits and their environment overrides -----------------------
+
+#[test]
+fn defaults_fit_a_small_container() {
+    // Deployed containers may have 512 MiB-1 GiB; one worker at 320 MiB.
+    assert_eq!(Limits::DEFAULT.data_bytes, 320 * 1024 * 1024);
+    assert_eq!(DEFAULT_WORKER_SLOTS, 1);
+}
+
+#[test]
+fn the_memory_override_is_clamped_and_falls_back_on_garbage() {
+    assert_eq!(worker_mem_mb(None), 320);
+    assert_eq!(worker_mem_mb(Some("512")), 512);
+    assert_eq!(worker_mem_mb(Some(" 128 ")), 128);
+    assert_eq!(worker_mem_mb(Some("8")), 64);
+    assert_eq!(worker_mem_mb(Some("99999")), 1024);
+    for garbage in ["", "lots", "-5", "1.5", "320MB"] {
+        assert_eq!(worker_mem_mb(Some(garbage)), 320, "{garbage:?}");
+    }
+}
+
+#[test]
+fn the_slot_override_is_clamped_and_falls_back_on_garbage() {
+    assert_eq!(worker_slots(None), 1);
+    assert_eq!(worker_slots(Some("3")), 3);
+    assert_eq!(worker_slots(Some("0")), 1);
+    assert_eq!(worker_slots(Some("64")), 4);
+    for garbage in ["", "two", "-1"] {
+        assert_eq!(worker_slots(Some(garbage)), 1, "{garbage:?}");
+    }
+}
+
+#[test]
+fn limits_with_a_memory_override_change_only_the_memory() {
+    let limits = Limits::with_mem_mb(512);
+    assert_eq!(limits.data_bytes, 512 * 1024 * 1024);
+    assert_eq!(
+        Limits {
+            data_bytes: Limits::DEFAULT.data_bytes,
+            ..limits
+        },
+        Limits::DEFAULT
+    );
+}
+
+// --- Which executable the worker is ------------------------------------------
+
+#[test]
+fn the_worker_is_the_running_image_not_its_path() {
+    // `/proc/self/exe` is the image this process runs even after the runtime
+    // updater has replaced or deleted the file at its path.
+    let current = Some(std::path::PathBuf::from("/opt/greentic/bin/greentic-start"));
+    assert_eq!(
+        worker_program(true, current.clone()).as_deref(),
+        Some(Path::new("/proc/self/exe"))
+    );
+    assert_eq!(worker_program(false, current.clone()), current);
+    assert_eq!(worker_program(false, None), None);
+}
+
+#[test]
+fn a_worker_runs_only_with_a_slot_of_the_gate_it_is_given() {
+    let script = format!("printf '{}ok'", frame_for_shell());
+    let limits = Limits {
+        wall: Duration::from_millis(200),
+        ..fast()
+    };
+    let busy = Gate::new(1);
+    let _held = busy.acquire(Duration::from_millis(10)).unwrap();
+    let started = Instant::now();
+    assert_eq!(
+        run_worker_in(&busy, Path::new(SH), &["-c", &script], b"", &limits),
+        ""
+    );
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let free = Gate::new(1);
+    assert_eq!(
+        run_worker_in(&free, Path::new(SH), &["-c", &script], b"", &limits),
+        "ok"
+    );
+}
+
+#[test]
+fn a_running_worker_holds_a_slot_of_the_gate_it_is_given() {
+    // Deterministic whatever else runs: the given gate is busy exactly while
+    // the worker runs.
+    let gate = std::sync::Arc::new(Gate::new(1));
+    let script = format!("/bin/sleep 0.4; printf '{}ok'", frame_for_shell());
+    let worker = {
+        let gate = std::sync::Arc::clone(&gate);
+        std::thread::spawn(move || {
+            run_worker_in(&gate, Path::new(SH), &["-c", &script], b"", &fast())
+        })
+    };
+    let mut saw_busy = false;
+    for _ in 0..30 {
+        if gate.in_use() == 1 {
+            saw_busy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(worker.join().unwrap(), "ok");
+    assert!(saw_busy, "the worker never took a slot of its gate");
+    assert_eq!(gate.in_use(), 0);
+}

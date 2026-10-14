@@ -15,7 +15,7 @@
 //!   naming the default flow is a fallback like no target at all, and only a
 //!   fallback is replaced by Fast2Flow (see [`is_default_target`]);
 //! * ownership — a conversation parked in a flow resumes that flow and is
-//!   never re-routed (see [`parked_flow`]);
+//!   never re-routed (see [`parked_run`]);
 //! * no LLM fallback: revision mode has no `bundle.yaml` `llm:` block and no
 //!   env-based source exists, so `llm` is `None` (host-only routing).
 //!
@@ -33,11 +33,11 @@ use greentic_runner_host::{Activity, WelcomeFlowHint};
 use greentic_types::ChannelMessageEnvelope;
 
 use super::Activation;
-use crate::fast2flow::Fast2FlowConfig;
 use crate::fast2flow::dispatch::RouteDecision;
 use crate::fast2flow::probe::{OnRouterFailure, ProbeInputs, TurnPlan, plan_turn};
 use crate::fast2flow::revision_packs::{RevisionAppPack, revision_index_scope};
 use crate::fast2flow::turn::{RouteSignal, card_nav_target, stamp_route};
+use crate::fast2flow::{FAST2FLOW_REROUTE_PARKED_CAPABILITY, Fast2FlowConfig};
 use crate::messaging_app::select_app_flow;
 use crate::operator_log;
 use crate::runner_host::OperatorContext;
@@ -303,35 +303,60 @@ pub(super) async fn plan_for_app(
         ),
     );
 
+    // Router audience: a client-named card navigation must not jump to a node
+    // the caller's team may not be routed to (`docs/flow-audience.md`).
+    for key in crate::fast2flow::turn::CARD_NAV_META_KEYS {
+        if let Some(node) = ingress.metadata.get(*key)
+            && let Some(refusal) = node_audience_refusal(&app, scope, ingress, node)
+        {
+            return refusal;
+        }
+    }
+
     let default_flow = default_flow_hint(&app, fallback.as_ref());
     match store {
-        Some(store) => match parked_flow(&store, scope, &app, ingress, default_flow.as_ref()).await
-        {
-            Ok(Some(flow_id)) => {
-                operator_log::info(
-                    module_path!(),
-                    format!(
-                        "[fast2flow] conversation parked in flow={flow_id} pack={} — resuming it, routing skipped",
-                        app.pack_id
-                    ),
-                );
-                let target = WelcomeFlowHint {
-                    pack_id: app.pack_id.clone(),
-                    flow_id,
-                };
-                return RevisionTurn::passthrough(Some(target), ingress);
+        Some(store) => {
+            match parked_run(&store, scope, &app, ingress, default_flow.as_ref()).await {
+                Ok(Some(parked)) => {
+                    if let Some(turn) = reroute_parked(
+                        cfg.clone(),
+                        ctx.clone(),
+                        &app,
+                        &store,
+                        scope,
+                        ingress,
+                        &parked,
+                        fallback.as_ref().or(default_flow.as_ref()),
+                    )
+                    .await
+                    {
+                        return turn;
+                    }
+                    operator_log::info(
+                        module_path!(),
+                        format!(
+                            "[fast2flow] conversation parked in flow={} pack={} — resuming it, routing skipped",
+                            parked.flow_id, app.pack_id
+                        ),
+                    );
+                    let target = WelcomeFlowHint {
+                        pack_id: app.pack_id.clone(),
+                        flow_id: parked.flow_id,
+                    };
+                    return RevisionTurn::passthrough(Some(target), ingress);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    // Not knowing whether a flow is parked must not re-route the
+                    // turn away from it: keep today's behaviour.
+                    operator_log::warn(
+                        module_path!(),
+                        format!("[fast2flow] parked-flow lookup failed; routing skipped: {err:#}"),
+                    );
+                    return RevisionTurn::passthrough(fallback, ingress);
+                }
             }
-            Ok(None) => {}
-            Err(err) => {
-                // Not knowing whether a flow is parked must not re-route the
-                // turn away from it: keep today's behaviour.
-                operator_log::warn(
-                    module_path!(),
-                    format!("[fast2flow] parked-flow lookup failed; routing skipped: {err:#}"),
-                );
-                return RevisionTurn::passthrough(fallback, ingress);
-            }
-        },
+        }
         None => operator_log::debug(
             module_path!(),
             "[fast2flow] revision runtime not loaded; parked-flow check skipped",
@@ -350,42 +375,8 @@ pub(super) async fn plan_for_app(
         return RevisionTurn::passthrough(fallback, ingress);
     }
 
-    let index_scope = revision_index_scope(
-        scope.tenant,
-        scope.team,
-        scope.bundle_id.as_str(),
-        scope.revision_id,
-    );
-    let provider = scope.provider.to_string();
-    let probe_app = Arc::clone(&app);
-    let probe_envelope = ingress.clone();
-    let planned = tokio::task::spawn_blocking(move || {
-        let inputs = ProbeInputs {
-            cfg: &cfg,
-            ctx: &ctx,
-            pack: &probe_app.info,
-            pack_path: &probe_app.pack_path,
-            index_scope: Some(&index_scope),
-            provider: &provider,
-            llm: None,
-        };
-        plan_turn(
-            &inputs,
-            &probe_envelope,
-            false,
-            OnRouterFailure::DefaultFlow,
-        )
-    })
-    .await;
-    let plan = match planned {
-        Ok(plan) => plan,
-        Err(err) => {
-            operator_log::warn(
-                module_path!(),
-                format!("[fast2flow] routing probe task failed; default target kept: {err}"),
-            );
-            return RevisionTurn::passthrough(fallback, ingress);
-        }
+    let Some(plan) = probe_plan(cfg, ctx, &app, scope, ingress).await else {
+        return RevisionTurn::passthrough(fallback, ingress);
     };
     match plan {
         TurnPlan::Routed(RouteDecision::Flow {
@@ -402,6 +393,13 @@ pub(super) async fn plan_for_app(
             fixed_reply: None,
         },
         TurnPlan::Routed(RouteDecision::Node { envelope, signal }) => {
+            if let Some(refusal) = signal
+                .node
+                .as_deref()
+                .and_then(|node| node_audience_refusal(&app, scope, ingress, node))
+            {
+                return refusal;
+            }
             match fallback.or_else(|| default_flow.clone()) {
                 Some(target) => {
                     let flow_id = target.flow_id.clone();
@@ -462,6 +460,223 @@ pub(super) async fn plan_for_app(
     }
 }
 
+/// The refusal turn when `node` of a router pack is restricted to teams the
+/// caller does not belong to (`FlowMeta::node_audience`, written by the
+/// designer from each target's own flow audience).
+///
+/// Same policy as the flow gate (`flow_audience::decide`): an open node allows,
+/// a caller without verified teams is not refused (logged), and known teams
+/// none of which is listed get the plain denied reply with no flow run and no
+/// call to the target. The teams are read from the provider-authored caller
+/// block of THIS message; nothing is trusted from another hop.
+pub(super) fn node_audience_refusal(
+    app: &RevisionAppPack,
+    scope: &TurnScope<'_>,
+    ingress: &ChannelMessageEnvelope,
+    node: &str,
+) -> Option<RevisionTurn> {
+    use crate::flow_audience::{Decision, caller_teams, decide_node, denied_reply};
+    let meta = app.info.flow_meta.as_ref()?;
+    meta.node_audience.get(node)?;
+    match decide_node(Some(meta), node, &caller_teams(ingress)) {
+        Decision::Allow => None,
+        Decision::AllowUnknownTeam => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[flow-audience] revision {} node {node}: caller team unknown, audience not enforced",
+                    scope.revision_id
+                ),
+            );
+            None
+        }
+        Decision::Deny { teams } => {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[flow-audience] revision {} node {node}: teams {teams:?} are outside the audience, refused",
+                    scope.revision_id
+                ),
+            );
+            let mut reply = denied_reply(ingress);
+            reply.id = uuid::Uuid::new_v4().to_string();
+            Some(RevisionTurn {
+                target: None,
+                envelope: ingress.clone(),
+                signal: None,
+                fixed_reply: Some(reply),
+            })
+        }
+    }
+}
+
+/// Run the routing probe for `ingress` under `spawn_blocking`. `None` when the
+/// probe task itself failed: the caller keeps its default target.
+async fn probe_plan(
+    cfg: Fast2FlowConfig,
+    ctx: OperatorContext,
+    app: &Arc<RevisionAppPack>,
+    scope: &TurnScope<'_>,
+    ingress: &ChannelMessageEnvelope,
+) -> Option<TurnPlan<RouteDecision>> {
+    let index_scope = revision_index_scope(
+        scope.tenant,
+        scope.team,
+        scope.bundle_id.as_str(),
+        scope.revision_id,
+    );
+    let provider = scope.provider.to_string();
+    let probe_app = Arc::clone(app);
+    let probe_envelope = ingress.clone();
+    let planned = tokio::task::spawn_blocking(move || {
+        let inputs = ProbeInputs {
+            cfg: &cfg,
+            ctx: &ctx,
+            pack: &probe_app.info,
+            pack_path: &probe_app.pack_path,
+            index_scope: Some(&index_scope),
+            provider: &provider,
+            llm: None,
+        };
+        plan_turn(
+            &inputs,
+            &probe_envelope,
+            false,
+            OnRouterFailure::DefaultFlow,
+        )
+    })
+    .await;
+    match planned {
+        Ok(plan) => Some(plan),
+        Err(err) => {
+            operator_log::warn(
+                module_path!(),
+                format!("[fast2flow] routing probe task failed; default target kept: {err}"),
+            );
+            None
+        }
+    }
+}
+
+/// A conversation parked in a flow: where, the key it is stored under, and the
+/// snapshot as JSON (the runner's snapshot type is not nameable from here, and
+/// only its executed-node set is read).
+pub(super) struct ParkedRun {
+    pub(super) flow_id: String,
+    lookup: IngressEnvelope,
+    snapshot: serde_json::Value,
+}
+
+impl ParkedRun {
+    /// Whether the parked run has already executed `node`: a dispatch to it is
+    /// the conversation the user is in, not a new topic.
+    fn has_run(&self, node: &str) -> bool {
+        snapshot_ran(&self.snapshot, node)
+    }
+}
+
+/// Whether a serialized flow snapshot holds an output for `node`.
+pub(super) fn snapshot_ran(snapshot: &serde_json::Value, node: &str) -> bool {
+    snapshot
+        .pointer("/state/nodes")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|nodes| nodes.contains_key(node))
+}
+
+/// A turn that is plain text: not a card navigation, not a card submit.
+pub(super) fn is_free_text(ingress: &ChannelMessageEnvelope) -> bool {
+    ingress
+        .text
+        .as_deref()
+        .is_some_and(|t| !t.trim().is_empty())
+        && card_nav_target(ingress).is_none()
+        && !ingress.metadata.contains_key("action")
+}
+
+/// A free-text turn over a conversation parked in a pack that opted in
+/// ([`FAST2FLOW_REROUTE_PARKED_CAPABILITY`]): route it, and when the router
+/// dispatches somewhere the parked run has not been, drop the parked run and
+/// start there. `None` resumes the parked run unchanged, which is also the
+/// answer for every failure on this path — it can only ever add a route.
+#[allow(clippy::too_many_arguments)]
+async fn reroute_parked(
+    cfg: Fast2FlowConfig,
+    ctx: OperatorContext,
+    app: &Arc<RevisionAppPack>,
+    store: &DynSessionStore,
+    scope: &TurnScope<'_>,
+    ingress: &ChannelMessageEnvelope,
+    parked: &ParkedRun,
+    target_flow: Option<&WelcomeFlowHint>,
+) -> Option<RevisionTurn> {
+    if !app
+        .info
+        .capabilities
+        .iter()
+        .any(|c| c == FAST2FLOW_REROUTE_PARKED_CAPABILITY)
+        || !is_free_text(ingress)
+    {
+        return None;
+    }
+    let TurnPlan::Routed(decision) = probe_plan(cfg, ctx, app, scope, ingress).await? else {
+        return None;
+    };
+    let (target, envelope, signal) = match decision {
+        RouteDecision::Node { envelope, signal } => {
+            if signal.node.as_deref().is_some_and(|n| parked.has_run(n)) {
+                return None;
+            }
+            if let Some(refusal) = signal
+                .node
+                .as_deref()
+                .and_then(|node| node_audience_refusal(app, scope, ingress, node))
+            {
+                return Some(refusal);
+            }
+            let target = target_flow.cloned()?;
+            (target, envelope, signal)
+        }
+        RouteDecision::Flow {
+            flow_id,
+            envelope,
+            signal,
+        } => {
+            if flow_id == parked.flow_id {
+                return None;
+            }
+            let target = WelcomeFlowHint {
+                pack_id: app.pack_id.clone(),
+                flow_id,
+            };
+            (target, envelope, signal)
+        }
+    };
+    if let Err(err) = FlowResumeStore::new(Arc::clone(store))
+        .clear(&parked.lookup)
+        .await
+    {
+        operator_log::warn(
+            module_path!(),
+            format!("[fast2flow] could not drop the parked run; resuming it: {err}"),
+        );
+        return None;
+    }
+    operator_log::info(
+        module_path!(),
+        format!(
+            "[fast2flow] parked conversation in flow={} re-routed to {:?} (new topic) pack={}",
+            parked.flow_id, signal.node, app.pack_id
+        ),
+    );
+    let flow_id = target.flow_id.clone();
+    Some(RevisionTurn {
+        target: Some(target),
+        envelope,
+        signal: Some((signal, flow_id)),
+        fixed_reply: None,
+    })
+}
+
 /// The app pack's default flow: the request fallback when it names this pack,
 /// else the pack's own default (`select_app_flow`).
 fn default_flow_hint(
@@ -489,13 +704,13 @@ fn default_flow_hint(
 /// park). So every messaging flow of the app pack is checked, the default
 /// first, through the runner's own `FlowResumeStore` over the revision's
 /// session store.
-pub(super) async fn parked_flow(
+pub(super) async fn parked_run(
     store: &DynSessionStore,
     scope: &TurnScope<'_>,
     app: &RevisionAppPack,
     ingress: &ChannelMessageEnvelope,
     default_flow: Option<&WelcomeFlowHint>,
-) -> Result<Option<String>> {
+) -> Result<Option<ParkedRun>> {
     let resume = FlowResumeStore::new(Arc::clone(store));
     let mut flows: Vec<&str> = Vec::new();
     if let Some(default) = default_flow {
@@ -509,14 +724,17 @@ pub(super) async fn parked_flow(
     let activity =
         super::envelope_to_activity(ingress, scope.tenant, scope.endpoint_id, None, None);
     for flow_id in flows {
-        let envelope = resume_lookup_envelope(&activity, scope.tenant, &app.pack_id, flow_id);
-        if resume
-            .fetch(&envelope)
+        let lookup = resume_lookup_envelope(&activity, scope.tenant, &app.pack_id, flow_id);
+        if let Some(snapshot) = resume
+            .fetch(&lookup)
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?
-            .is_some()
         {
-            return Ok(Some(flow_id.to_string()));
+            return Ok(Some(ParkedRun {
+                flow_id: flow_id.to_string(),
+                lookup,
+                snapshot: serde_json::to_value(&snapshot).unwrap_or(serde_json::Value::Null),
+            }));
         }
     }
     Ok(None)
@@ -612,3 +830,7 @@ pub(super) fn stamped_reply_envelopes(
     }
     envelopes
 }
+
+#[cfg(all(test, unix))]
+#[path = "fast2flow_hook_reroute_tests.rs"]
+mod reroute_tests;

@@ -27,10 +27,11 @@
 //! loopback peers, so a remote caller cannot impersonate a user/session or pin a
 //! chosen revision (see `caller_identity`).
 //!
-//! Inbound provider webhooks are authenticated by two gates before the body is
-//! trusted: [`crate::provider_auth`] for a shared secret echoed in a header
-//! (Telegram), and [`crate::provider_webhook_verify`] for a signed request
-//! (Slack). Note this path does NOT run the pack's
+//! Inbound provider webhooks are authenticated by three gates before the body
+//! is trusted: [`crate::provider_auth`] for a shared secret echoed in a header
+//! (Telegram), [`crate::provider_webhook_verify`] for a signed request
+//! (Slack), and [`crate::inbound_verify`] for WhatsApp, Webex and Microsoft
+//! Teams. Note this path does NOT run the pack's
 //! `messaging.provider_ingress.v1` component the way the legacy ingress does —
 //! it calls the provider op directly — so nothing a provider component would
 //! have checked on the legacy path is checked here implicitly.
@@ -92,6 +93,7 @@ use crate::ingress_types::IngressHttpResponse;
 use crate::messaging_dto::HttpInV1;
 use crate::operator_log;
 use crate::provider_auth;
+use crate::provider_auth_marker;
 use crate::provider_webhook_verify;
 use crate::revision_dispatcher::{
     DispatchRequest, RevisionDispatcher, RevisionKey, SetCookieDirective, cookie_name,
@@ -240,6 +242,10 @@ pub(crate) struct RevisionServeConfig {
     /// via [`PublicUrlCapture::offer`], waking the deferred registration task.
     /// `None` = not on Cloud Run, or a URL was already known at boot.
     pub public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// The tunnel's public URL (cloudflared/ngrok), set once the tunnel is
+    /// up. Read ONLY by signed artifact links (`artifact_link_base`), never by
+    /// `interop_base_url`.
+    pub tunnel_public_url: Arc<std::sync::OnceLock<String>>,
 }
 
 /// Per-connection shared state. Holds the live activation behind an
@@ -299,6 +305,8 @@ struct ServeState {
     /// via [`PublicUrlCapture::offer`], waking the deferred registration
     /// task in `lib.rs`. `None` = not armed.
     public_url_capture: Option<Arc<PublicUrlCapture>>,
+    /// See [`RevisionServeConfig::tunnel_public_url`].
+    tunnel_public_url: Arc<std::sync::OnceLock<String>>,
     /// Worker-interop state: the Phase 0b escape hatch, and (in tests) the
     /// turn override. Shared by every connection of this listener.
     interop: crate::interop::InteropState,
@@ -603,6 +611,7 @@ impl RevisionServer {
             session_manager,
             notifier,
             public_url_capture: config.public_url_capture,
+            tunnel_public_url: config.tunnel_public_url,
             interop: crate::interop::InteropState::from_env(config.public_base_url),
             #[cfg(test)]
             activity_source_override: None,
@@ -1079,7 +1088,9 @@ fn spawn_revision_connection(
             let connection_state = Arc::clone(state);
             let peer_is_loopback = peer_is_loopback_trusted(trust_loopback_peers, peer.ip());
             tokio::spawn(async move {
-                let service = service_fn(move |req| {
+                let service = service_fn(move |mut req: Request<Incoming>| {
+                    req.extensions_mut()
+                        .insert(crate::http_ingress::limits::PeerIp(peer.ip()));
                     handle_connection(req, connection_state.clone(), peer_is_loopback)
                 });
                 let io = TokioIo::new(stream);
@@ -1234,6 +1245,7 @@ fn interop_request_path<'a>(activation: &Activation, host: Option<&str>, path: &
 /// string.
 fn path_allows_cors(path: &str, interop_path: &str) -> bool {
     path != "/workers/invoke"
+        && !crate::artifacts::serve_link::is_link_path(path)
         && !crate::interop::a2a::is_cors_excluded(interop_path)
         && !crate::interop::mcp::is_cors_excluded(interop_path)
 }
@@ -1357,6 +1369,15 @@ async fn serve(
         }
     }
 
+    // Signed artifact links (docs/outbound-artifacts.md). Reserved before
+    // deployment resolution so a `/` binding cannot capture it; the handler
+    // reads the live activation's link table and answers every refusal about
+    // which file or which unit with one 404.
+    if crate::artifacts::serve_link::is_link_path(&path) {
+        let links = state.current().routing.artifact_links.clone();
+        return Ok(crate::artifacts::serve_link::handle(&req, &links).await);
+    }
+
     // Snapshot the activation ONCE per request so dispatch and execute see a
     // coherent (host, routing) pair. A concurrent [`RevisionServer::reload`]
     // swap is observed by the *next* request; this one keeps running against
@@ -1373,6 +1394,10 @@ async fn serve(
     // Phase 0b: read before the body consumes `req`. Only the generic-JSON
     // branch reads it; provider routes carry their own verification.
     let authorization_header = header_str(req.headers(), header::AUTHORIZATION.as_str());
+    // Present but not text (non-ASCII): the interop gate counts that as a
+    // credential presented and invalid, not as none.
+    let authorization_unreadable =
+        authorization_header.is_none() && req.headers().contains_key(header::AUTHORIZATION);
     let if_none_match = header_str(req.headers(), header::IF_NONE_MATCH.as_str());
     let a2a_version_header = header_str(req.headers(), crate::interop::a2a::VERSION_HEADER);
     let mcp_method_header = header_str(req.headers(), crate::interop::mcp::MCP_METHOD_HEADER);
@@ -1406,6 +1431,22 @@ async fn serve(
         .deployment_routes
         .resolve_mount(host_header.as_deref(), &path);
     let interop_path = interop_mount.map_or(path.as_str(), |mount| mount.remainder(&path));
+    // Only an interop request needs the client behind it, and only a public
+    // unit uses it; computed here because `req` is consumed below.
+    let interop_client = if interop_mount.is_some()
+        && (crate::interop::a2a::route_for(interop_path).is_some()
+            || crate::interop::mcp::route_for(interop_path).is_some())
+    {
+        crate::interop::anonymous::client_label(
+            req.extensions()
+                .get::<crate::http_ingress::limits::PeerIp>()
+                .map(|peer| peer.0),
+            req.headers(),
+            state.interop.trusted_proxy_hops,
+        )
+    } else {
+        None
+    };
 
     // Worker-interop surfaces (A2A). Checked BEFORE webchat classification and
     // provider routing, and only for a unit whose staged config enables the
@@ -1430,6 +1471,9 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: if_none_match.as_deref(),
                         mcp_method: None,
+                        authorization_unreadable,
+                        client: interop_client.as_deref(),
+                        host: host_header.as_deref(),
                     },
                 )
                 .await;
@@ -1459,6 +1503,9 @@ async fn serve(
                         query: query_string.as_deref(),
                         if_none_match: None,
                         mcp_method: mcp_method_header.as_deref(),
+                        authorization_unreadable,
+                        client: interop_client.as_deref(),
+                        host: host_header.as_deref(),
                     },
                 )
                 .await;
@@ -1574,12 +1621,13 @@ async fn serve(
         .await);
     }
 
-    let body_bytes = read_body_limited(req).await.map_err(|_| {
-        error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "request body exceeds the size limit",
-        )
-    })?;
+    // Per-route caps and the upload limiter (`crate::http_ingress::limits`);
+    // an upload slot is held until this request is answered.
+    let crate::http_ingress::limits::IngressBody {
+        bytes: body_bytes,
+        _slot: _upload_slot,
+        ..
+    } = crate::http_ingress::limits::read_ingress_body(req, &effective_path).await?;
 
     // Phase D.3: the body is read as raw bytes; the strict JSON parse is
     // deferred until we know this is the generic-JSON branch (provider
@@ -1897,6 +1945,40 @@ async fn load_unit_config_cached(
     activation: &Activation,
     tenant: &str,
     bundle_id: &str,
+    deployment: Option<DeploymentId>,
+) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
+    let staged = load_staged_unit_config(state, activation, tenant, bundle_id).await?;
+    // The staged document is cached for a short TTL; what the admin's access
+    // door says on top of it is decided here, per request. A unit that did not
+    // stage `access.door` comes back untouched and nothing is fetched.
+    let Some(staged) = staged else {
+        return Ok(None);
+    };
+    let deployment = deployment.map(|id| id.to_string());
+    let unit = crate::interop::policy_door::UnitRef {
+        tenant,
+        bundle_id,
+        deployment: deployment.as_deref(),
+    };
+    Ok(Some(
+        state
+            .interop
+            .policy_door
+            .effective(
+                staged,
+                &unit,
+                &state.interop.limiter,
+                crate::ingress_auth::now_ms(),
+            )
+            .await,
+    ))
+}
+
+async fn load_staged_unit_config(
+    state: &ServeState,
+    activation: &Activation,
+    tenant: &str,
+    bundle_id: &str,
 ) -> Result<Option<crate::interop::config::InteropConfig>, crate::ingress_auth::ConfigUnavailable> {
     if let Some(cached) = state.interop.configs.get(tenant, bundle_id) {
         return Ok(cached);
@@ -1970,27 +2052,60 @@ async fn resolve_interop_unit(
     let deployment_id = mount.deployment_id;
     let bundle_id = mount.bundle_id.as_str().to_string();
     let tenant = mount.tenant.to_string();
-    let config = load_unit_config_cached(state, activation, &tenant, &bundle_id)
-        .await
-        .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
-            operator_log::warn(
-                module_path!(),
-                format!("interop config for unit `{bundle_id}` could not be read: {message}"),
-            );
-            error_response(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "the ingress credential store is unavailable",
-            )
-        })?;
-    Ok(config
-        .filter(|config| feature.enabled_in(config))
-        .map(|config| InteropUnit {
-            deployment_id,
-            tenant,
-            bundle_id,
-            mount: mount.prefix.to_string(),
-            config,
-        }))
+    let config =
+        load_unit_config_cached(state, activation, &tenant, &bundle_id, Some(deployment_id))
+            .await
+            .map_err(|crate::ingress_auth::ConfigUnavailable(message)| {
+                operator_log::warn(
+                    module_path!(),
+                    format!("interop config for unit `{bundle_id}` could not be read: {message}"),
+                );
+                error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "the ingress credential store is unavailable",
+                )
+            })?;
+    let config = config.filter(|config| feature.enabled_in(config));
+    if let Some(config) = config.as_ref() {
+        warn_public_unit_without_proxy_hops(state, &bundle_id, config);
+    }
+    Ok(config.map(|config| InteropUnit {
+        deployment_id,
+        tenant,
+        bundle_id,
+        mount: mount.prefix.to_string(),
+        config,
+    }))
+}
+
+/// Say once per unit, the first time its config is read, that a PUBLIC unit is
+/// served with no trusted proxy hop: behind a load balancer every anonymous
+/// caller then looks like one client, so none gets a per-client bucket and none
+/// can continue a conversation. Set `GREENTIC_TRUSTED_PROXY_HOPS` to the number
+/// of proxies that append to `X-Forwarded-For`.
+fn warn_public_unit_without_proxy_hops(
+    state: &ServeState,
+    bundle_id: &str,
+    config: &crate::interop::config::InteropConfig,
+) {
+    static SAID: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::LazyLock::new(Default::default);
+    if !config.access.is_public() || state.interop.trusted_proxy_hops > 0 {
+        return;
+    }
+    let first = SAID
+        .lock()
+        .is_ok_and(|mut said| said.len() < 1024 && said.insert(bundle_id.to_string()));
+    if first {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "unit `{bundle_id}` is public but GREENTIC_TRUSTED_PROXY_HOPS is 0: callers behind a \
+                 proxy cannot be told apart, so anonymous callers get no per-client limit and no \
+                 resumable conversations (set the variable to the number of proxies in front)"
+            ),
+        );
+    }
 }
 
 /// The public base URL the interop surfaces advertise themselves at: the
@@ -2027,6 +2142,20 @@ fn interop_base_url(state: &ServeState) -> Option<String> {
         })
         .map(|url| url.trim_end_matches('/').to_string())
         .filter(|url| !url.is_empty())
+}
+
+/// The origin signed artifact links are built on: [`interop_base_url`]'s
+/// sources plus the tunnel, validated (docs/outbound-artifacts.md).
+fn artifact_link_base(state: &ServeState) -> crate::artifacts::link_base::LinkBase {
+    crate::artifacts::link_base::link_base(
+        state.interop.public_base_url.as_deref(),
+        state
+            .public_url_capture
+            .as_ref()
+            .and_then(|capture| capture.get())
+            .map(String::as_str),
+        state.tunnel_public_url.get().map(String::as_str),
+    )
 }
 
 /// [`interop_base_url`] with the unit's own mount joined onto it — the address
@@ -2133,7 +2262,15 @@ async fn serve_interop_inner(
     headers: InteropRequestHeaders<'_>,
     trace: &crate::interop::telemetry::RequestTrace,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
-    let base_url = interop_unit_base_url(state, unit);
+    let mut base_url = interop_unit_base_url(state, unit);
+    if base_url.is_none() && route == crate::interop::a2a::A2aRoute::Card {
+        // No public address is known (a ClusterIP worker). Fall back to the
+        // in-cluster Service name the caller used, only for the card and only
+        // when it is shaped like one (see `interop::cluster_host`).
+        base_url = headers
+            .host
+            .and_then(|host| crate::interop::cluster_host::unit_base(host, &unit.mount));
+    }
     let ctx = crate::interop::a2a::A2aContext {
         config: &unit.config,
         base_url: base_url.as_deref(),
@@ -2196,8 +2333,14 @@ async fn serve_interop_inner(
     // `Authorization` header, so an unauthenticated peer must not be able to
     // make this process read (and buffer) a megabyte per request. `/mcp`
     // already had this order; this path did not.
-    let credential_id = crate::interop::a2a::rpc::authenticate(&ctx, headers.authorization)
-        .map_err(|response| *response)?;
+    let caller = crate::interop::a2a::rpc::authenticate(
+        &ctx,
+        headers.authorization,
+        headers.authorization_unreadable,
+        headers.client,
+    )
+    .await
+    .map_err(|response| *response)?;
     let body_bytes = read_body_limited(req).await.map_err(|_| {
         trace.outcome(crate::interop::telemetry::Outcome::Rejected);
         error_response(
@@ -2219,11 +2362,9 @@ async fn serve_interop_inner(
     };
     Ok(match route {
         crate::interop::a2a::A2aRoute::JsonRpc => {
-            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, credential_id, &runner).await
+            crate::interop::a2a::rpc::handle_jsonrpc(&ctx, &request, &caller, &runner).await
         }
-        _ => {
-            crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, credential_id, &runner).await
-        }
+        _ => crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, &caller, &runner).await,
     })
 }
 
@@ -2292,11 +2433,13 @@ async fn serve_mcp(
     let metadata_url = resource.as_deref().map(|resource| {
         crate::interop::mcp::metadata::resource_metadata_url(base_url.as_deref(), resource)
     });
-    let caller = match crate::interop::mcp::auth::authenticate(
+    let caller = match crate::interop::auth::authenticate(
         &unit.config,
         resource.as_deref(),
         authorization,
+        headers.authorization_unreadable,
         crate::ingress_auth::now_ms(),
+        headers.client,
     )
     .await
     {
@@ -2317,7 +2460,13 @@ async fn serve_mcp(
     // so it is a pre-filter and never the final price: the `ask` tool settles
     // the remainder of a turn's cost against this same bucket.
     let cost = crate::interop::mcp::request_cost(mcp_method);
-    if let Err(retry_after) = state.interop.limiter.check(caller.key(), cost) {
+    if let Err(retry_after) = state.interop.limiter.admit(
+        &caller,
+        &unit.config.access,
+        &unit.deployment_id.to_string(),
+        crate::interop::limits::Charge::priced(cost),
+        crate::ingress_auth::now_ms(),
+    ) {
         let mut response = error_response(
             StatusCode::TOO_MANY_REQUESTS,
             "too many requests from this connection; wait and retry",
@@ -2341,14 +2490,8 @@ async fn serve_mcp(
         deployment_id: unit.deployment_id,
         tenant: unit.tenant.clone(),
         bundle_id: unit.bundle_id.clone(),
-        caller_key: caller.key().to_string(),
-        // Only a STAGED credential may be named as one; an OAuth `sub` is
-        // minted by the authorization server and is not a credential the
-        // designer issued.
-        credential_id: match &caller {
-            crate::interop::mcp::auth::McpCaller::Bearer(id) => Some(id.clone()),
-            crate::interop::mcp::auth::McpCaller::Oauth(_) => None,
-        },
+        caller: caller.clone(),
+        access: unit.config.access.clone(),
         metering: crate::interop::metering::TurnMetering::for_unit(
             &state.interop.meter,
             &unit.config,
@@ -2471,6 +2614,8 @@ impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
 /// consumed.
 struct InteropRequestHeaders<'a> {
     authorization: Option<&'a str>,
+    /// An `Authorization` header was sent that could not be read as text.
+    authorization_unreadable: bool,
     /// `A2A-Version`.
     version: Option<&'a str>,
     query: Option<&'a str>,
@@ -2478,6 +2623,12 @@ struct InteropRequestHeaders<'a> {
     /// `Mcp-Method` (SEP-2243), which the MCP limiter meters on so it never
     /// has to parse a body.
     mcp_method: Option<&'a str>,
+    /// The client behind the request, for an anonymous caller of a public
+    /// unit ([`crate::interop::anonymous::client_label`]).
+    client: Option<&'a str>,
+    /// The `Host` header, read only for the agent-card fallback
+    /// ([`crate::interop::cluster_host`]).
+    host: Option<&'a str>,
 }
 
 /// Phase 0b (worker-interop contract D7): refuse a non-loopback caller of the
@@ -2501,7 +2652,7 @@ async fn gate_generic_ingress(
     if peer_is_loopback || !gate_enabled {
         return Ok(());
     }
-    let config = load_unit_config_cached(state, activation, tenant, bundle_id).await;
+    let config = load_unit_config_cached(state, activation, tenant, bundle_id, None).await;
     let gate = crate::ingress_auth::decide_generic(
         peer_is_loopback,
         gate_enabled,
@@ -4783,7 +4934,11 @@ fn build_activity(
     // Every caller of this function hands it JSON a client wrote, so a caller
     // block in it is a claim, never a verification. Only the provider route
     // (`envelope_to_activity`) may carry one — see `client_caller`.
-    let payload = &client_caller::without_client_caller(payload);
+    let mut payload = client_caller::without_client_caller(payload);
+    // Likewise a stored-attachment reference or a host note: only the host's
+    // inbound pipeline (provider route) writes those.
+    crate::artifacts::provenance::strip_reserved_json(&mut payload);
+    let payload = &payload;
     let mut activity = match payload.get("text").and_then(Value::as_str) {
         // `Activity::text` keeps ONLY the text. That is right for a plain
         // message and silently lossy for `{"text": …, "metadata": …}` — the
@@ -5420,6 +5575,11 @@ async fn dispatch_provider_route(
     webchat_target: Option<&crate::webchat_routing::WebchatTarget>,
     flow_header: Option<&str>,
 ) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    // The provider reads `x-greentic-auth-verified` as "the host authenticated
+    // this webhook". Only the host may set it, so a client-supplied occurrence
+    // is dropped here, before any gate or forwarding step can see it — on every
+    // route and whatever the gate below decides. See `provider_auth_marker`.
+    let request_headers = &provider_auth_marker::strip_reserved(request_headers);
     let Some(route_match) = activation
         .routing
         .http_routes
@@ -5510,15 +5670,19 @@ async fn dispatch_provider_route(
             && (norm_path == "/v3/directline/conversations"
                 || norm_path.ends_with("/conversations"))
         {
-            crate::conv_dedup::extract_user_id(body).map(|user_id| crate::conv_dedup::DedupKey {
+            // Keyed on the CALLER's bearer (`request_headers`, not `dl_headers`
+            // after the rewrite above): the cached response carries a token
+            // bound to the new conversation.
+            crate::conv_dedup::create_key(
                 deployment_id,
-                tenant: route_tenant.clone(),
-                team: route_team.clone(),
-                user_id,
-                flow_hint: webchat_target
+                &route_tenant,
+                &route_team,
+                webchat_target
                     .and_then(|t| t.flow_id.clone())
                     .or_else(|| flow_header.map(str::to_string)),
-            })
+                body,
+                request_headers,
+            )
         } else {
             None
         };
@@ -5554,7 +5718,7 @@ async fn dispatch_provider_route(
     // endpoints provisioned before PR #246 have no `webhook_secret_ref` and
     // continue to identify-route by `provider_id`.
     let secrets = activation.host.secrets_manager();
-    let header_endpoint_id_authenticated = match provider_auth::authenticate_provider_webhook(
+    let auth_outcome = match provider_auth::authenticate_provider_webhook(
         activation.routing.endpoint_admit.as_ref(),
         &secrets,
         scope,
@@ -5563,10 +5727,24 @@ async fn dispatch_provider_route(
     )
     .await
     {
-        Ok(provider_auth::AuthOutcome::Authenticated(eid)) => Some(eid),
-        Ok(provider_auth::AuthOutcome::Skipped) => None,
+        Ok(outcome) => outcome,
         Err(response) => return Err(response),
     };
+    let header_endpoint_id_authenticated = match &auth_outcome {
+        provider_auth::AuthOutcome::Authenticated(eid) => Some(eid.clone()),
+        provider_auth::AuthOutcome::Skipped => None,
+    };
+    // Tell the provider the gate above passed (never for `Skipped`), so it may
+    // stamp a verified caller. `dl_headers` was copied from the stripped
+    // `request_headers`, so this is the only way the marker gets in.
+    provider_auth_marker::stamp_if_authenticated(&mut dl_headers, &auth_outcome);
+    // Whether THIS host verified the request (a matched webhook secret above,
+    // or a checked signature below). Inbound attachments resolve a remote
+    // fetch reference only from a verified request.
+    let mut transport_verified = header_endpoint_id_authenticated.is_some();
+    // A configured gate that could not run (key set or secret store outage):
+    // the agent's note then says verification is unavailable, not unset.
+    let mut verification_unavailable = false;
 
     // Transport-layer signature gate. `provider_auth` above covers providers
     // that authenticate with a shared secret in a header (Telegram); this
@@ -5604,7 +5782,10 @@ async fn dispatch_provider_route(
         })
         .await;
         match verdict {
-            Ok(Ok(_)) => {}
+            Ok(Ok(verification)) => {
+                transport_verified |=
+                    verification == provider_webhook_verify::WebhookVerification::Verified;
+            }
             Ok(Err(boxed)) => return Err(*boxed),
             Err(err) => {
                 // The verification task panicked or was cancelled. There is no
@@ -5625,18 +5806,51 @@ async fn dispatch_provider_route(
         }
     }
 
+    // WhatsApp, Webex and Microsoft Teams: verified by this host
+    // (`crate::inbound_verify`), before the pin and the provider op.
+    match crate::inbound_verify::verify_inbound(
+        crate::inbound_verify::Inbound {
+            provider_type: &provider_type,
+            method,
+            headers: request_headers,
+            body,
+            pack_id: &descriptor_pack_id,
+            unit_id: bundle_id.as_str(),
+            tenant,
+            pack_non_secret: descriptor_pack_non_secret.as_deref(),
+            deployment_id,
+        },
+        &secrets,
+        crate::inbound_verify::secrets_env(),
+    )
+    .await
+    {
+        Ok(verdict) => {
+            transport_verified |= verdict == crate::inbound_verify::Verdict::Verified;
+            verification_unavailable |= verdict == crate::inbound_verify::Verdict::Unavailable;
+        }
+        Err(response) => return Err(response),
+    }
+    let request_verification = crate::artifacts::origin::RequestVerification::from_gates(
+        transport_verified,
+        verification_unavailable,
+    );
+
     // Second half of the `defer_pin` two-phase write (A1 follow-up): commit the
     // body-derived chat-stickiness pin now that the host gates above have
     // admitted the request (a rejected request returns `Err` above and never
     // pins).
     //
-    // Trust boundary: two gates run before this point, and between them they
-    // cover the shipped signed providers — `provider_auth` for a Telegram
-    // endpoint carrying a `webhook_secret_ref`, and `provider_webhook_verify`
-    // for a provider class that signs its requests (Slack). What still pins
-    // without any verification is a provider class in neither set: a legacy
-    // Telegram endpoint provisioned with no `webhook_secret_ref`, or a class
-    // that carries no transport authentication at all. Those still pin here —
+    // Trust boundary: three gates run before this point, and between them
+    // they cover the shipped signed providers — `provider_auth` for a Telegram
+    // endpoint carrying a `webhook_secret_ref`, `provider_webhook_verify` for a
+    // provider class that signs its requests (Slack), and `inbound_verify` for
+    // WhatsApp, Webex and Teams once their input is configured. What still pins
+    // without any verification is a provider class none of them proved: a
+    // legacy Telegram endpoint provisioned with no `webhook_secret_ref`, an
+    // unconfigured WhatsApp/Webex/Teams channel (or one whose proof was
+    // unavailable), or a class that carries no transport authentication at
+    // all. Those still pin here —
     // unchanged from A1, which pinned them inline during dispatch. Impact stays
     // low: same-bundle version routing only, `try_pin` cannot overwrite an
     // existing pin, and the store caps + TTL bound cardinality.
@@ -5763,6 +5977,11 @@ async fn dispatch_provider_route(
             "provider config could not be resolved",
         )
     })?;
+    let configured_number =
+        crate::artifacts::instance_check::configured_number(provider_config.as_ref());
+    // The Graph version a WhatsApp media lookup uses (docs/inbound-attachments.md §5).
+    let whatsapp_api_version =
+        crate::artifacts::fetch::configured_whatsapp_api_version(provider_config.as_ref());
 
     let http_in = build_provider_http_in(
         &provider_type,
@@ -5846,6 +6065,13 @@ async fn dispatch_provider_route(
             &mut result.messaging_envelopes,
         );
     }
+    // Host checklist 14: a WhatsApp envelope for another business number than
+    // this instance's is dropped before it can reach any turn or fetch.
+    crate::artifacts::instance_check::drop_foreign_numbers(
+        &provider_type,
+        configured_number.as_deref(),
+        &mut result.messaging_envelopes,
+    );
 
     // `result.events` are EventEnvelopeV1 (event-fabric) emissions. The
     // legacy `dispatch_http_ingress` routes these only for `Domain::Events`
@@ -5881,6 +6107,8 @@ async fn dispatch_provider_route(
         let pipeline_bundle = bundle_id.clone();
         let pipeline_team = route_team.clone();
         let pipeline_notifier = Arc::clone(&state.notifier);
+        // Signed links for files the agent creates (docs/outbound-artifacts.md).
+        let link_base = artifact_link_base(&state);
         // Created here, inside the request-instrumented future, so it parents
         // to the `http.request` span and the turn shares the request's trace.
         // Ids only — never message content.
@@ -5909,6 +6137,9 @@ async fn dispatch_provider_route(
                     welcome_hint,
                     pipeline_notifier,
                     supports_typing,
+                    request_verification,
+                    whatsapp_api_version,
+                    link_base,
                 )
                 .await;
             }
@@ -6030,7 +6261,16 @@ async fn run_provider_inbound_pipeline(
     welcome_hint: Option<WelcomeFlowHint>,
     notifier: Arc<dyn crate::notifier::ActivityNotifier>,
     supports_typing: bool,
+    request_verification: crate::artifacts::origin::RequestVerification,
+    whatsapp_api_version: Option<String>,
+    link_base: crate::artifacts::link_base::LinkBase,
 ) {
+    // Files an agent created leave as signed links, chosen out of band
+    // (docs/outbound-artifacts.md).
+    let outbound_ctx = crate::artifacts::outbound::OutboundCtx::new(
+        activation.routing.artifact_links.get(&deployment_id),
+        link_base,
+    );
     // Channel "is typing" signal (docs/typing-signal.md). Built once per batch and
     // only when the provider declares `send_typing` and the kill switch is on. The
     // config is the same per-pack override value `run_reply_egress` hands
@@ -6053,6 +6293,23 @@ async fn run_provider_inbound_pipeline(
             &pack_id,
         )
     });
+    // Inbound attachments (`crate::artifacts::hook`): runs here, after the
+    // HTTP ack and the approval intercept, before any turn.
+    let mut envelopes = envelopes;
+    let origin =
+        crate::artifacts::origin::Origin::new(&provider_type, &pack_id, &tenant, Some(&team))
+            .verified_by_host(request_verification)
+            .with_whatsapp_api_version(whatsapp_api_version);
+    let unit = activation
+        .routing
+        .attachments
+        .get(deployment_id, revision_id);
+    crate::artifacts::hook::prepare(unit.as_deref(), &mut envelopes, &origin).await;
+    let flow_meta = activation
+        .routing
+        .app_packs
+        .get_shared(bundle_id.as_str(), revision_id)
+        .and_then(|app| app.info.flow_meta.clone());
     for ingress in &envelopes {
         // Per-envelope flow targeting: if the envelope carries a
         // `flow_hint` metadata key (the provider echoing back the flow the
@@ -6080,6 +6337,16 @@ async fn run_provider_inbound_pipeline(
                 None
             }
         });
+        // Flow audience (docs/flow-audience.md): stamp `team_hint` from the
+        // provider-verified caller team and refuse a known team outside the
+        // flow's audience. An unknown team is never refused.
+        let audience_scope = format!("deployment {deployment_id} revision {revision_id}");
+        let (stamped, audience_denial) =
+            match crate::flow_audience::apply(flow_meta.as_ref(), ingress, &audience_scope) {
+                crate::flow_audience::Applied::Proceed(envelope) => (envelope, None),
+                crate::flow_audience::Applied::Denied(reply) => (ingress.clone(), Some(reply)),
+            };
+        let ingress = &stamped;
         // Fast2Flow (fast2flow_hook): an explicit target naming a non-default
         // flow wins; the default-flow target (named or not) may be re-routed,
         // and a miss may become the fixed reply without running a flow.
@@ -6112,6 +6379,7 @@ async fn run_provider_inbound_pipeline(
         // The whole turn — the Fast2Flow probe included, as on the legacy
         // path — runs inside the typing indicator, so a slow routing host
         // shows "typing" instead of a silent pause before the flow starts.
+        let outbound_side = crate::artifacts::outbound::OutboundSide::default();
         let planned_turn = async {
             let planned = fast2flow_hook::plan_revision_turn(
                 &activation,
@@ -6122,7 +6390,11 @@ async fn run_provider_inbound_pipeline(
             )
             .await;
             fast2flow_hook::run_planned_turn(planned, run_turn, |reply| {
-                build_reply_envelopes(ingress, reply, &pack_id, &tenant)
+                let envelopes = build_reply_envelopes(ingress, reply, &pack_id, &tenant);
+                let files =
+                    crate::artifacts::outbound::collect(unwrap_pending_response(reply.payload()));
+                outbound_side.record(&envelopes, files);
+                envelopes
             })
             .await
         };
@@ -6137,11 +6409,18 @@ async fn run_provider_inbound_pipeline(
         // `keep_typing_while` has returned: no refresh can start after this point,
         // so a typing indicator never lands after the reply below. One reply
         // payload can fan out to several envelopes (e.g. `messages[]`).
-        let turn_result = match (&typing_sender, typing_input) {
-            (Some(sender), Some(input)) => {
-                crate::typing::keep_typing_while(Arc::clone(sender), input, planned_turn).await
+        let turn_result = if let Some(reply) = audience_denial {
+            // Refused by the flow audience: no flow runs, the plain reply goes
+            // out through the normal egress below.
+            drop(planned_turn);
+            Ok(vec![reply])
+        } else {
+            match (&typing_sender, typing_input) {
+                (Some(sender), Some(input)) => {
+                    crate::typing::keep_typing_while(Arc::clone(sender), input, planned_turn).await
+                }
+                _ => planned_turn.await,
             }
-            _ => planned_turn.await,
         };
         let reply_envelopes = match turn_result {
             Ok(envelopes) => envelopes,
@@ -6157,6 +6436,14 @@ async fn run_provider_inbound_pipeline(
             }
         };
 
+        let reply_envelopes = crate::artifacts::outbound::prepare_replies(
+            reply_envelopes,
+            &outbound_side,
+            ingress,
+            &provider_type,
+            &outbound_ctx,
+            crate::artifacts::serve_link::unix_now(),
+        );
         for reply_envelope in reply_envelopes {
             match run_reply_egress(
                 &activation,
@@ -6374,9 +6661,11 @@ pub(crate) fn build_reply_envelopes(
     // passed through, repairing only the route fields from the ingress.
     // `parse_envelopes` does not reconstruct a bare envelope, so keep this ahead
     // of the shared shaper.
-    if let Ok(mut envelope) =
-        serde_json::from_value::<ChannelMessageEnvelope>(reply.payload().clone())
-    {
+    // The runner's created-files list is delivery metadata (collected apart,
+    // see `artifacts::outbound`), never message content.
+    let mut payload = reply.payload().clone();
+    crate::artifacts::outbound::strip_created_list(&mut payload);
+    if let Ok(mut envelope) = serde_json::from_value::<ChannelMessageEnvelope>(payload) {
         if envelope.session_id.trim().is_empty() {
             envelope.session_id = ingress.session_id.clone();
         }
@@ -6397,6 +6686,7 @@ pub(crate) fn build_reply_envelopes(
     // resolve pack-scoped creds — the legacy messaging path does both before
     // shaping.
     let mut value = unwrap_pending_response(reply.payload()).clone();
+    crate::artifacts::outbound::strip_created_list(&mut value);
     let team = ingress
         .metadata
         .get("team")
@@ -6778,6 +7068,13 @@ fn extract_directline_provider_path(path: &str) -> String {
 /// `/token` → `POST /v3/directline/tokens/generate`
 /// `/directline/...` → `/v3/directline/...`
 fn normalize_directline_dispatch(method: &str, path: &str) -> (String, String) {
+    // Canonical case first: the session preflight, the dedup key, the
+    // revision pin, the streamUrl rewrite and the method forwarded to the
+    // provider all compare against `GET`/`POST`. A lower-case `get` used to
+    // skip the preflight and still reach the provider's (case-insensitive)
+    // router (G2 review).
+    let method = method.to_ascii_uppercase();
+    let method = method.as_str();
     if path == "/token" {
         return (
             "POST".to_string(),
@@ -8003,6 +8300,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start split server");
 
@@ -8054,6 +8352,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start must succeed even when main bumps into admin range");
 
@@ -8355,6 +8654,8 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         });
         let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
@@ -9205,6 +9506,73 @@ mod tests {
     }
 
     #[test]
+    fn a_media_create_result_reaches_the_collector_as_a_final_flow_reply() {
+        // greentic-runner#850: the `media.create` node (no `output:` key, ends
+        // the flow) answers a C5 value that is the flow's final reply payload.
+        let id = format!("artifact://{}", "c".repeat(64));
+        let result = json!({
+            "ok": true,
+            "artifact": {"id": id, "mime_type": "application/pdf", "name": "Summary.pdf"},
+            "artifacts": [{"id": id, "mime_type": "application/pdf", "name": "Summary.pdf"}],
+            "warnings": [],
+        });
+        let reply = Activity::custom("response", result.clone());
+        let files = crate::artifacts::outbound::collect(unwrap_pending_response(reply.payload()));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, id);
+        // A parked turn wraps the same value one level down.
+        let parked = Activity::custom("response", json!({"status": "pending", "response": result}));
+        let files = crate::artifacts::outbound::collect(unwrap_pending_response(parked.payload()));
+        assert_eq!(files.len(), 1);
+    }
+
+    #[test]
+    fn a_runner_created_files_list_is_collected_and_never_shaped_into_the_message() {
+        // greentic-runner `media.create` anywhere in a turn: the final reply
+        // carries `created_artifacts`. The ids are delivery metadata.
+        let id = format!("artifact://{}", "d".repeat(64));
+        let ingress: ChannelMessageEnvelope = serde_json::from_value(json!({
+            "id": "msg-in-created",
+            "tenant": { "env": "dev", "tenant": "acme", "tenant_id": "acme", "attempt": 0 },
+            "channel": "webchat-gui",
+            "session_id": "conv-c",
+            "to": [{ "id": "room-1", "kind": "room" }],
+            "text": "make me a pdf",
+        }))
+        .expect("ingress envelope");
+        let list = json!([{"id": id, "mime_type": "application/pdf", "name": "S.pdf"}]);
+
+        let with_text = Activity::custom(
+            "response",
+            json!({"text": "Here is your summary", "created_artifacts": list.clone()}),
+        );
+        let files =
+            crate::artifacts::outbound::collect(unwrap_pending_response(with_text.payload()));
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, id);
+        let envs = build_reply_envelopes(&ingress, &with_text, "pack", "acme");
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].text.as_deref(), Some("Here is your summary"));
+        let wire = serde_json::to_string(&envs).expect("json");
+        assert!(
+            !wire.contains(&"d".repeat(64)),
+            "id leaked into message: {wire}"
+        );
+
+        // A file-only turn shapes no message; the egress loop builds one.
+        let file_only = Activity::custom("response", json!({"created_artifacts": list}));
+        let files =
+            crate::artifacts::outbound::collect(unwrap_pending_response(file_only.payload()));
+        assert_eq!(files.len(), 1);
+        let envs = build_reply_envelopes(&ingress, &file_only, "pack", "acme");
+        let wire = serde_json::to_string(&envs).expect("json");
+        assert!(
+            !wire.contains(&"d".repeat(64)),
+            "id leaked into message: {wire}"
+        );
+    }
+
+    #[test]
     fn synthesize_provider_response_defaults_to_200_and_preserves_body() {
         let response = IngressHttpResponse {
             status: 0, // Not a real HTTP status — synth must fall back to 200.
@@ -9469,6 +9837,8 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -9510,9 +9880,34 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         }
+    }
+
+    /// Links use the tunnel only when nothing configured or captured exists,
+    /// and the interop base (agent cards) never reads the tunnel at all.
+    #[test]
+    fn artifact_links_fall_back_to_the_tunnel_and_interop_ignores_it() {
+        use crate::artifacts::link_base::LinkBase;
+        let bound: SocketAddr = "127.0.0.1:0".parse().unwrap();
+        let mut state = empty_state("env-1", bound);
+        assert_eq!(artifact_link_base(&state), LinkBase::RelativeOnly);
+        state
+            .tunnel_public_url
+            .set("https://t.trycloudflare.com/".into())
+            .unwrap();
+        assert_eq!(
+            artifact_link_base(&state),
+            LinkBase::Absolute("https://t.trycloudflare.com".into())
+        );
+        assert_eq!(interop_base_url(&state), None);
+        state.interop.public_base_url = Some("https://configured.example".into());
+        assert_eq!(
+            artifact_link_base(&state),
+            LinkBase::Absolute("https://configured.example".into())
+        );
     }
 
     fn body_string(resp: Response<Full<Bytes>>) -> String {
@@ -9764,6 +10159,8 @@ mod tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -9921,6 +10318,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start server");
 
@@ -9977,6 +10375,7 @@ mod tests {
             exe_path: None,
             public_base_url: None,
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
         })
         .expect("start server");
         let port = server.actual_port();
@@ -10193,6 +10592,23 @@ mod tests {
     }
 
     // Category 2: normalize_directline_dispatch
+
+    #[test]
+    fn normalize_directline_dispatch_upper_cases_the_method() {
+        // Everything after it (the preflight, dedup, the revision pin, the
+        // streamUrl rewrite, the method forwarded to the provider) compares
+        // against the canonical spelling.
+        for raw in ["get", "Get", "gEt"] {
+            let (method, path) =
+                normalize_directline_dispatch(raw, "/v3/directline/conversations/c1");
+            assert_eq!(method, "GET", "{raw}");
+            assert_eq!(path, "/v3/directline/conversations/c1");
+            assert!(returns_stream_url(&method, &path), "{raw}");
+        }
+        let (method, path) = normalize_directline_dispatch("post", "/directline/conversations");
+        assert_eq!(method, "POST");
+        assert!(is_conversation_create(&method, &path));
+    }
 
     #[test]
     fn normalize_directline_dispatch_maps_token_to_canonical() {
@@ -10778,6 +11194,12 @@ mod tests {
         );
     }
 
+    #[test]
+    fn cors_blocks_signed_artifact_links() {
+        let link = "/v1/artifacts/01J0000000000000000000000A/x/1/y";
+        assert!(!path_allows_cors(link, link));
+    }
+
     // Category 8: session hint extraction for webchat
 
     #[test]
@@ -11134,6 +11556,8 @@ mod tests {
             app_packs: live.routing.app_packs.clone(),
             triggers: live.routing.triggers.clone(),
             runtime_metered: live.routing.runtime_metered.clone(),
+            attachments: live.routing.attachments.clone(),
+            artifact_links: live.routing.artifact_links.clone(),
             // …and rebuilds the env-derived half.
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
@@ -11189,6 +11613,8 @@ mod tests {
             app_packs: live.routing.app_packs.clone(),
             triggers: live.routing.triggers.clone(),
             runtime_metered: live.routing.runtime_metered.clone(),
+            attachments: live.routing.attachments.clone(),
+            artifact_links: live.routing.artifact_links.clone(),
             deployment_routes: crate::deployment_routes::DeploymentRouteTable::default(),
             endpoint_admit: std::sync::Arc::new(crate::endpoint_admit::EndpointAdmit::default()),
             deployment_config_overrides: std::sync::Arc::default(),
@@ -11353,6 +11779,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11461,6 +11888,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11563,6 +11991,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11638,6 +12067,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -11764,6 +12194,8 @@ mod tests {
             app_packs: Default::default(),
             triggers: Default::default(),
             runtime_metered: Default::default(),
+            attachments: Default::default(),
+            artifact_links: Default::default(),
         });
         let activation = Activation {
             host: base.host,
@@ -11920,6 +12352,7 @@ mod tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         })
@@ -12791,6 +13224,8 @@ mod binary_update_tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -12962,6 +13397,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13002,6 +13438,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13037,6 +13474,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13068,6 +13506,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13288,6 +13727,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13337,6 +13777,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         };
@@ -13396,6 +13837,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -13434,6 +13876,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: None,
         });
@@ -15583,6 +16026,8 @@ mod binary_update_tests {
                 app_packs: Default::default(),
                 triggers: Default::default(),
                 runtime_metered: Default::default(),
+                attachments: Default::default(),
+                artifact_links: Default::default(),
             }),
         }
     }
@@ -15650,6 +16095,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::clone(&notifier),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source.clone() as Arc<dyn crate::websocket::pump::ActivitySource>
@@ -15780,6 +16226,7 @@ mod binary_update_tests {
             )),
             notifier: Arc::new(crate::notifier::InMemoryNotifier::new(64)),
             public_url_capture: None,
+            tunnel_public_url: Default::default(),
             interop: crate::interop::InteropState::default(),
             activity_source_override: Some(
                 test_source as Arc<dyn crate::websocket::pump::ActivitySource>,
@@ -16165,6 +16612,9 @@ mod fast2flow_hook;
 #[path = "revision_serve/client_caller.rs"]
 mod client_caller;
 
+#[cfg(all(test, unix))]
+#[path = "revision_serve/fast2flow_hook_audience_tests.rs"]
+mod fast2flow_hook_audience_tests;
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_tests.rs"]
 mod fast2flow_hook_tests;
@@ -16172,3 +16622,7 @@ mod fast2flow_hook_tests;
 #[cfg(test)]
 #[path = "revision_serve/fast2flow_hook_default_hint_tests.rs"]
 mod fast2flow_hook_default_hint_tests;
+
+#[cfg(test)]
+#[path = "revision_serve/upload_http_in_tests.rs"]
+mod upload_http_in_tests;

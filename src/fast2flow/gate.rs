@@ -19,6 +19,18 @@ pub const FAST2FLOW_CAPABILITY: &str = "greentic.cap.fast2flow.v1";
 pub const FAST2FLOW_ON_MISS_DEFAULT_FLOW_CAPABILITY: &str =
     "greentic.cap.fast2flow.on_miss.default_flow.v1";
 
+/// Opt-in companion to [`FAST2FLOW_CAPABILITY`] for a pack whose flow parks on
+/// a card the user can walk away from (a router that renders a target's form).
+///
+/// By default a conversation parked in a flow resumes that flow and is never
+/// routed, so a message typed over such a card goes to whatever owns it. With
+/// this capability a FREE-TEXT turn over a parked conversation is routed first:
+/// when the router dispatches to a node the parked run has not yet executed,
+/// the parked run is dropped and the turn starts there; otherwise (no match,
+/// or the node the conversation is already in) it resumes as before. Card
+/// submits and navigations are never routed.
+pub const FAST2FLOW_REROUTE_PARKED_CAPABILITY: &str = "greentic.cap.fast2flow.reroute_parked.v1";
+
 /// Cheap, side-effect-free per-request check. Called on the inbound hot path.
 pub trait Fast2FlowGate: Send + Sync + std::fmt::Debug {
     fn is_enabled(&self, ctx: &OperatorContext, pack: &AppPackInfo) -> bool;
@@ -95,6 +107,7 @@ mod tests {
                 node_ids: vec![],
             }],
             capabilities: caps.iter().map(|s| s.to_string()).collect(),
+            flow_meta: None,
         }
     }
 

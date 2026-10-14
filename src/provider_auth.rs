@@ -110,6 +110,7 @@ pub(crate) async fn authenticate_provider_webhook(
         .collect();
 
     if candidates.is_empty() {
+        warn_unsigned_telegram(scope.bundle_id.as_str());
         return Ok(AuthOutcome::Skipped);
     }
 
@@ -147,6 +148,52 @@ pub(crate) async fn authenticate_provider_webhook(
     ))
 }
 
+/// How often the unsigned-endpoint warning repeats per bundle.
+const UNSIGNED_WARN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+/// Whether a warning for `key` is due now, recording it when so. Pure over the
+/// supplied clock and table so the rate limit is testable.
+fn unsigned_warning_due(
+    seen: &mut std::collections::HashMap<String, std::time::Instant>,
+    key: &str,
+    now: std::time::Instant,
+) -> bool {
+    match seen.get(key) {
+        Some(last) if now.duration_since(*last) < UNSIGNED_WARN_INTERVAL => false,
+        _ => {
+            seen.insert(key.to_string(), now);
+            true
+        }
+    }
+}
+
+/// A Telegram webhook reached a bundle none of whose Telegram endpoints carry a
+/// `webhook_secret_ref`: it is admitted unchecked (legacy posture) and the
+/// provider will not stamp a verified caller for it. Log at most hourly per
+/// bundle, naming the remedy.
+fn warn_unsigned_telegram(bundle_id: &str) {
+    static SEEN: std::sync::Mutex<Option<std::collections::HashMap<String, std::time::Instant>>> =
+        std::sync::Mutex::new(None);
+    let due = match SEEN.lock() {
+        Ok(mut guard) => unsigned_warning_due(
+            guard.get_or_insert_with(Default::default),
+            bundle_id,
+            std::time::Instant::now(),
+        ),
+        // A poisoned lock only costs the rate limit; still warn.
+        Err(_) => true,
+    };
+    if due {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "telegram webhook for bundle {bundle_id} was admitted without authentication:                  no Telegram endpoint linked to it has a webhook_secret_ref, so no verified                  caller is established for its chats. Run `greentic-deployer op messaging \
+                 endpoint rotate-webhook-secret` on the endpoint to provision one."
+            ),
+        );
+    }
+}
+
 fn find_header_value<'a>(headers: &'a [(String, String)], target: &str) -> Option<&'a str> {
     headers
         .iter()
@@ -178,6 +225,29 @@ mod tests {
 
     fn seed_secret(secrets: &mut HashMap<String, Vec<u8>>, ref_: &SecretRef, value: &[u8]) {
         secrets.insert(secret_ref_to_store_uri(ref_), value.to_vec());
+    }
+
+    #[test]
+    fn unsigned_warning_is_rate_limited_per_bundle() {
+        use std::time::{Duration, Instant};
+        let mut seen = HashMap::new();
+        let t0 = Instant::now();
+        assert!(unsigned_warning_due(&mut seen, "a", t0));
+        assert!(!unsigned_warning_due(
+            &mut seen,
+            "a",
+            t0 + Duration::from_secs(60)
+        ));
+        assert!(unsigned_warning_due(
+            &mut seen,
+            "b",
+            t0 + Duration::from_secs(60)
+        ));
+        assert!(unsigned_warning_due(
+            &mut seen,
+            "a",
+            t0 + UNSIGNED_WARN_INTERVAL
+        ));
     }
 
     #[tokio::test]

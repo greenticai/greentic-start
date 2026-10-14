@@ -81,6 +81,80 @@ pub(crate) struct AgentMeta {
     pub skills: Vec<AgentSkillMeta>,
 }
 
+/// Who may call the unit's interop surfaces (access-policy spec §4).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Visibility {
+    /// Every caller must present a credential. The default, and what any
+    /// unreadable `access` block degrades to.
+    #[default]
+    Private,
+    /// A caller with no credential is served as anonymous, within the limits.
+    Public,
+}
+
+/// A credential mechanism the admin allows on a private unit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mechanism {
+    /// The staged `gtw_` bearer.
+    ApiKey,
+    /// An RS256 access token from the unit's authorization server.
+    Oauth,
+}
+
+/// Limits on anonymous callers of a public unit (spec §6.2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PublicLimits {
+    /// Sustained turns per minute, per unit.
+    pub rate_per_min: u32,
+    /// Turns that may arrive at once.
+    pub burst: u32,
+    /// Anonymous turns per UTC day, per unit. `None` = no daily cap.
+    pub daily_turn_cap: Option<u32>,
+}
+
+impl Default for PublicLimits {
+    fn default() -> Self {
+        Self {
+            rate_per_min: 60,
+            burst: 20,
+            daily_turn_cap: None,
+        }
+    }
+}
+
+/// The staged access policy. **Every failure mode of reading it is
+/// [`AccessPolicy::default`]**: private, both mechanisms. Never public.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AccessPolicy {
+    pub visibility: Visibility,
+    /// Never empty: an empty or absent list reads as both.
+    pub mechanisms: Vec<Mechanism>,
+    /// Meaningful only when `visibility` is `Public`.
+    pub public: PublicLimits,
+    pub generation: u64,
+}
+
+impl Default for AccessPolicy {
+    fn default() -> Self {
+        Self {
+            visibility: Visibility::Private,
+            mechanisms: vec![Mechanism::ApiKey, Mechanism::Oauth],
+            public: PublicLimits::default(),
+            generation: 0,
+        }
+    }
+}
+
+impl AccessPolicy {
+    pub(crate) fn is_public(&self) -> bool {
+        self.visibility == Visibility::Public
+    }
+
+    pub(crate) fn allows(&self, mechanism: Mechanism) -> bool {
+        self.mechanisms.contains(&mechanism)
+    }
+}
+
 /// A parsed, validated interop config.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InteropConfig {
@@ -100,6 +174,21 @@ pub(crate) struct InteropConfig {
     /// staged before the field existed; a build that predates the field
     /// ignores it (unknown fields are not rejected).
     pub secrets_door: bool,
+    /// Private (default) or public, and which mechanisms protect a private
+    /// unit. See [`AccessPolicy`].
+    pub access: AccessPolicy,
+    /// The audience an OAuth token must carry on `/a2a`. **Absent means
+    /// `/a2a` accepts the staged bearer alone**, whatever `access` says.
+    pub a2a_resource: Option<String>,
+    /// `access.door: true`: the runtime fetches the admin's access-policy door
+    /// and may only TIGHTEN what is staged here (see
+    /// [`super::policy_door`]). **Absent means no fetch at all**, which is
+    /// every document staged before the field existed.
+    pub access_door: bool,
+    /// Service-client ids (`svc:<client_id>@<tenant>` subjects) the door has
+    /// revoked. Never staged: filled only by the door overlay, and empty for a
+    /// unit that does not use the door.
+    pub revoked_client_ids: std::collections::BTreeSet<String>,
 }
 
 /// Wire form of one credential, before validation.
@@ -134,6 +223,10 @@ struct RawConfig {
     metering: Option<Value>,
     #[serde(default)]
     secrets_door: bool,
+    #[serde(default)]
+    access: Option<Value>,
+    #[serde(default)]
+    a2a_resource: Option<String>,
 }
 
 /// Parse the staged bytes. `None` means "treat as absent": the document is not
@@ -200,6 +293,15 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
     let metering = raw
         .metering
         .and_then(|value| super::metering::parse_metering(value, tenant_slug.as_deref(), unit));
+    // Read on its own, before `access` is interpreted: a door can only
+    // tighten, so a block this build otherwise throws away must not also stop
+    // the unit from asking the admin to narrow it.
+    let access_door = raw
+        .access
+        .as_ref()
+        .and_then(|value| value.get("door"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
     Some(InteropConfig {
         a2a: raw.a2a,
         mcp: raw.mcp,
@@ -210,7 +312,179 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
         agent,
         metering,
         secrets_door: raw.secrets_door,
+        access: raw
+            .access
+            .map(|value| parse_access(value, unit))
+            .unwrap_or_default(),
+        a2a_resource: raw
+            .a2a_resource
+            .and_then(|value| valid_a2a_resource(&value, unit)),
+        access_door,
+        revoked_client_ids: Default::default(),
     })
+}
+
+/// Read the `access` block alone, like `metering`. **Any problem forces the
+/// unit private**, never a partly-read public policy: a block this build cannot
+/// fully understand must not open a unit to the internet.
+///
+/// The mechanisms list is read FIRST and on its own, because it is the one
+/// field that narrows access and must never be silently widened:
+///
+/// - a readable list keeps its known entries (an unknown name is dropped alone
+///   and logged);
+/// - an unreadable one, an empty one, or one with no known entry makes the
+///   whole block invalid: private with the DEFAULT mechanisms, logged at
+///   error level naming the offending value;
+/// - a problem anywhere ELSE (visibility, public limits, shape) forces private
+///   but keeps the readable mechanisms, so a narrowed list stays narrowed.
+fn parse_access(value: Value, unit: &str) -> AccessPolicy {
+    let Some(object) = value.as_object() else {
+        invalid(unit, "`access` is not an object");
+        return AccessPolicy::default();
+    };
+    let mechanisms = match object.get("mechanisms") {
+        None => AccessPolicy::default().mechanisms,
+        Some(Value::Array(names)) => {
+            let mut parsed = Vec::new();
+            for name in names {
+                let mechanism = match name.as_str() {
+                    Some("api_key") => Mechanism::ApiKey,
+                    Some("oauth") => Mechanism::Oauth,
+                    _ => {
+                        warn(
+                            unit,
+                            &format!("ignoring unknown `access.mechanisms` entry {name}"),
+                        );
+                        continue;
+                    }
+                };
+                if !parsed.contains(&mechanism) {
+                    parsed.push(mechanism);
+                }
+            }
+            if parsed.is_empty() {
+                invalid(
+                    unit,
+                    &format!(
+                        "`access.mechanisms` {} names no known mechanism",
+                        Value::Array(names.clone())
+                    ),
+                );
+                return AccessPolicy::default();
+            }
+            parsed
+        }
+        Some(other) => {
+            invalid(unit, &format!("`access.mechanisms` {other} is not a list"));
+            return AccessPolicy::default();
+        }
+    };
+    let generation = object
+        .get("generation")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let private = |reason: &str| {
+        warn(unit, &format!("{reason}; treating the unit as private"));
+        AccessPolicy {
+            visibility: Visibility::Private,
+            mechanisms: mechanisms.clone(),
+            public: PublicLimits::default(),
+            generation,
+        }
+    };
+    let visibility = match object.get("visibility") {
+        None => Visibility::Private,
+        Some(Value::String(v)) if v == "private" => Visibility::Private,
+        Some(Value::String(v)) if v == "public" => Visibility::Public,
+        Some(other) => {
+            return private(&format!("`access.visibility` {other} is not understood"));
+        }
+    };
+    // Limits are read only for a public unit, and a public unit with limits
+    // that cannot work is not public at all.
+    let public = if visibility == Visibility::Public {
+        match object.get("public") {
+            None => PublicLimits::default(),
+            Some(value) => match read_limits(value) {
+                Some(limits) => limits,
+                None => {
+                    operator_log::error(
+                        module_path!(),
+                        format!(
+                            "interop config for unit `{unit}`: `access.public` {value} has a \
+                             malformed or non-positive limit (rate_per_min, burst or \
+                             daily_turn_cap); forcing the unit private"
+                        ),
+                    );
+                    return private("`access.public` limits are unusable");
+                }
+            },
+        }
+    } else {
+        PublicLimits::default()
+    };
+    AccessPolicy {
+        visibility,
+        mechanisms,
+        public,
+        generation,
+    }
+}
+
+fn read_limits(value: &Value) -> Option<PublicLimits> {
+    let object = value.as_object()?;
+    let positive = |key: &str| {
+        object
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+            .filter(|n| *n > 0)
+    };
+    let daily_turn_cap = match object.get("daily_turn_cap") {
+        None | Some(Value::Null) => None,
+        // Zero is not "no cap": a cap of zero turns would refuse every
+        // anonymous turn, which is as unusable as a zero rate, so it is
+        // rejected like one rather than read as unlimited.
+        Some(cap) => Some(
+            cap.as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .filter(|n| *n > 0)?,
+        ),
+    };
+    Some(PublicLimits {
+        rate_per_min: positive("rate_per_min")?,
+        burst: positive("burst")?,
+        daily_turn_cap,
+    })
+}
+
+/// `https://…`, or `http://` to a loopback host (local development). Anything
+/// else is dropped: the value is the audience a token is checked against, and
+/// an audience that is not an address this unit can serve is not one.
+fn valid_a2a_resource(value: &str, unit: &str) -> Option<String> {
+    let value = value.trim();
+    let loopback = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|prefix| {
+            value
+                .strip_prefix(prefix)
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with([':', '/']))
+        });
+    let https = value
+        .strip_prefix("https://")
+        .is_some_and(|rest| !rest.is_empty() && !rest.starts_with('/'));
+    if https || loopback {
+        Some(value.to_string())
+    } else {
+        if !value.is_empty() {
+            warn(
+                unit,
+                "ignoring `a2a_resource`: not an https:// (or loopback) URL",
+            );
+        }
+        None
+    }
 }
 
 fn parse_credential(entry: Value, unit: &str) -> Option<Credential> {
@@ -221,6 +495,21 @@ fn parse_credential(entry: Value, unit: &str) -> Option<Credential> {
             return None;
         }
     };
+    // `anon_` is the namespace of anonymous callers. A credential in it would
+    // authenticate into an anonymous caller's session namespace, so it is
+    // dropped like any malformed one: that can only refuse a caller.
+    if raw.id.starts_with(crate::interop::caller::ANONYMOUS_PREFIX) {
+        operator_log::error(
+            module_path!(),
+            format!(
+                "interop config for unit `{unit}`: dropping credential `{}`: the `{}` id prefix \
+                 is reserved for anonymous callers",
+                raw.id,
+                crate::interop::caller::ANONYMOUS_PREFIX
+            ),
+        );
+        return None;
+    }
     if !valid_credential_id(&raw.id) {
         warn(
             unit,
@@ -279,6 +568,17 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+/// An `access` block that had to be thrown away. Error level: an operator
+/// who narrowed access and got the default back needs to see it.
+fn invalid(unit: &str, message: &str) {
+    operator_log::error(
+        module_path!(),
+        format!(
+            "interop config for unit `{unit}`: {message}; treating the unit as private with the default mechanisms"
+        ),
+    );
 }
 
 fn warn(unit: &str, message: &str) {
@@ -366,10 +666,253 @@ mod tests {
     }
 
     #[test]
+    fn a_credential_in_the_reserved_anonymous_namespace_is_dropped_alone() {
+        let doc = json!({
+            "v": 1,
+            "credentials": [
+                {"id": "anon_evil", "sha256": HASH},
+                {"id": "anon_", "sha256": HASH},
+                {"id": "c_01J", "sha256": HASH},
+                {"id": "anonymous", "sha256": HASH}
+            ]
+        });
+        let config = parse(doc.to_string().as_bytes(), "unit").expect("parses");
+        let ids: Vec<_> = config.credentials.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, vec!["c_01J", "anonymous"]);
+    }
+
+    #[test]
     fn a_malformed_agent_falls_back_to_defaults() {
         let doc = json!({"v": 1, "a2a": true, "agent": "nope"});
         let config = parse(doc.to_string().as_bytes(), "unit").expect("parses");
         assert_eq!(config.agent, AgentMeta::default());
+    }
+
+    fn parse_doc(extra: Value) -> InteropConfig {
+        let mut doc = json!({"v": 1, "a2a": true, "credentials": []});
+        if let (Value::Object(base), Value::Object(more)) = (&mut doc, extra) {
+            base.extend(more);
+        }
+        parse(doc.to_string().as_bytes(), "unit").expect("parses")
+    }
+
+    #[test]
+    fn absent_access_block_is_private_with_both_mechanisms() {
+        let c = parse_doc(json!({}));
+        assert_eq!(c.access.visibility, Visibility::Private);
+        assert_eq!(
+            c.access.mechanisms,
+            vec![Mechanism::ApiKey, Mechanism::Oauth]
+        );
+        assert_eq!(c.access, AccessPolicy::default());
+        assert_eq!(c.a2a_resource, None);
+    }
+
+    #[test]
+    fn the_door_flag_is_off_unless_the_block_says_true() {
+        assert!(!parse_doc(json!({})).access_door);
+        assert!(!parse_doc(json!({"access": {"visibility": "private"}})).access_door);
+        for bad in [json!("true"), json!(1), json!(null), json!("yes")] {
+            assert!(
+                !parse_doc(json!({"access": {"door": bad}})).access_door,
+                "only a JSON true switches the door on"
+            );
+        }
+        assert!(parse_doc(json!({"access": {"door": true}})).access_door);
+        // Staged policy is read exactly as before.
+        let c = parse_doc(json!({"access": {"door": true, "mechanisms": ["oauth"]}}));
+        assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth]);
+        assert!(c.revoked_client_ids.is_empty());
+    }
+
+    #[test]
+    fn a_block_that_is_thrown_away_still_carries_the_door_flag() {
+        // A door can only tighten, so an unreadable block must not stop the
+        // unit from asking the admin to narrow it.
+        let c = parse_doc(json!({"access": {"door": true, "mechanisms": []}}));
+        assert_eq!(c.access, AccessPolicy::default());
+        assert!(c.access_door);
+    }
+
+    #[test]
+    fn a_full_access_block_parses() {
+        let c = parse_doc(json!({
+            "access": {
+                "visibility": "public",
+                "mechanisms": ["oauth"],
+                "public": {"rate_per_min": 30, "burst": 5, "daily_turn_cap": 100},
+                "generation": 7
+            },
+            "a2a_resource": "https://w.example/a2a"
+        }));
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth]);
+        assert_eq!(
+            c.access.public,
+            PublicLimits {
+                rate_per_min: 30,
+                burst: 5,
+                daily_turn_cap: Some(100)
+            }
+        );
+        assert_eq!(c.access.generation, 7);
+        assert_eq!(c.a2a_resource.as_deref(), Some("https://w.example/a2a"));
+    }
+
+    #[test]
+    fn unparseable_access_degrades_to_private_never_public() {
+        for access in [
+            json!({"visibility": "public", "mechanisms": "nope"}),
+            json!({"visibility": "public", "public": "nope"}),
+            json!({"visibility": "public", "public": {"rate_per_min": 0, "burst": 5}}),
+            json!({"visibility": "public", "public": {"rate_per_min": 5, "burst": 0}}),
+            json!({"visibility": "public", "public": {"rate_per_min": -1, "burst": 5}}),
+            json!({"visibility": true}),
+            json!("public"),
+            json!(["public"]),
+        ] {
+            let c = parse_doc(json!({"access": access.clone()}));
+            assert_eq!(c.access.visibility, Visibility::Private, "{access}");
+            assert_ne!(c.access.visibility, Visibility::Public, "{access}");
+        }
+    }
+
+    #[test]
+    fn unknown_visibility_value_is_private() {
+        for value in ["world", "PUBLIC", "", "anyone"] {
+            let c = parse_doc(json!({"access": {"visibility": value}}));
+            assert_eq!(c.access.visibility, Visibility::Private, "{value}");
+        }
+    }
+
+    #[test]
+    fn empty_or_unknown_mechanisms_read_as_both() {
+        for mechanisms in [json!([]), json!(["saml"])] {
+            let c = parse_doc(json!({"access": {"mechanisms": mechanisms}}));
+            assert_eq!(
+                c.access.mechanisms,
+                vec![Mechanism::ApiKey, Mechanism::Oauth]
+            );
+        }
+        let c = parse_doc(json!({"access": {"mechanisms": ["saml", "api_key", "api_key"]}}));
+        assert_eq!(c.access.mechanisms, vec![Mechanism::ApiKey]);
+    }
+
+    /// A problem elsewhere in the block forces private but must not widen a
+    /// narrowed list back to both mechanisms.
+    #[test]
+    fn a_malformed_block_keeps_a_readable_narrowed_mechanism_list() {
+        for access in [
+            json!({"visibility": "public", "mechanisms": ["oauth"], "public": {"rate_per_min": 0, "burst": 5}}),
+            json!({"visibility": "public", "mechanisms": ["oauth"], "public": "junk"}),
+            json!({"visibility": "world", "mechanisms": ["oauth"]}),
+            json!({"visibility": true, "mechanisms": ["oauth"]}),
+            json!({"visibility": "public", "mechanisms": ["oauth"], "public": {"rate_per_min": 5, "burst": 5, "daily_turn_cap": "x"}}),
+        ] {
+            let c = parse_doc(json!({"access": access.clone()}));
+            assert_eq!(c.access.visibility, Visibility::Private, "{access}");
+            assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth], "{access}");
+        }
+    }
+
+    /// An unreadable, empty or all-unknown list invalidates the whole block.
+    #[test]
+    fn an_unusable_mechanism_list_invalidates_the_whole_block() {
+        for mechanisms in [
+            json!([]),
+            json!(["saml"]),
+            json!([1, null]),
+            json!("oauth"),
+            json!({"a": 1}),
+        ] {
+            let c = parse_doc(
+                json!({"access": {"visibility": "public", "mechanisms": mechanisms.clone()}}),
+            );
+            assert_eq!(c.access.visibility, Visibility::Private, "{mechanisms}");
+            assert_eq!(
+                c.access.mechanisms,
+                AccessPolicy::default().mechanisms,
+                "{mechanisms}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_limits_are_read_only_when_public() {
+        let c = parse_doc(json!({"access": {
+            "visibility": "private",
+            "public": {"rate_per_min": 1, "burst": 1, "daily_turn_cap": 1}
+        }}));
+        assert_eq!(c.access.public, PublicLimits::default());
+        // Even malformed limits on a private unit change nothing.
+        let c = parse_doc(json!({"access": {"visibility": "private", "public": "junk"}}));
+        assert_eq!(c.access.visibility, Visibility::Private);
+    }
+
+    fn public_with_cap(cap: Value) -> InteropConfig {
+        parse_doc(json!({"access": {
+            "visibility": "public",
+            "mechanisms": ["oauth"],
+            "public": {"rate_per_min": 30, "burst": 5, "daily_turn_cap": cap}
+        }}))
+    }
+
+    #[test]
+    fn a_daily_cap_of_zero_forces_private_and_keeps_the_mechanisms() {
+        let c = public_with_cap(json!(0));
+        assert_eq!(c.access.visibility, Visibility::Private);
+        assert_eq!(c.access.mechanisms, vec![Mechanism::Oauth]);
+        assert_eq!(c.access.public, PublicLimits::default());
+    }
+
+    #[test]
+    fn an_absent_or_null_daily_cap_means_no_cap() {
+        let c = public_with_cap(Value::Null);
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.public.daily_turn_cap, None);
+        let c = parse_doc(json!({"access": {
+            "visibility": "public",
+            "public": {"rate_per_min": 30, "burst": 5}
+        }}));
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.public.daily_turn_cap, None);
+    }
+
+    #[test]
+    fn a_positive_daily_cap_is_kept() {
+        let c = public_with_cap(json!(5));
+        assert_eq!(c.access.visibility, Visibility::Public);
+        assert_eq!(c.access.public.daily_turn_cap, Some(5));
+    }
+
+    #[test]
+    fn public_without_limits_gets_the_defaults() {
+        let c = parse_doc(json!({"access": {"visibility": "public"}}));
+        assert_eq!(
+            c.access.public,
+            PublicLimits {
+                rate_per_min: 60,
+                burst: 20,
+                daily_turn_cap: None
+            }
+        );
+    }
+
+    #[test]
+    fn a2a_resource_must_be_https_or_loopback_http() {
+        for (value, kept) in [
+            ("https://w.example/a2a", true),
+            ("http://127.0.0.1:8080/a2a", true),
+            ("http://localhost/a2a", true),
+            ("http://w.example/a2a", false),
+            ("http://127.0.0.1.evil.example/a2a", false),
+            ("ftp://w.example", false),
+            ("https://", false),
+            ("", false),
+        ] {
+            let c = parse_doc(json!({"a2a_resource": value}));
+            assert_eq!(c.a2a_resource.is_some(), kept, "{value}");
+        }
     }
 
     #[test]
