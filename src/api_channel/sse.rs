@@ -55,7 +55,7 @@ impl Default for SseConfig {
 /// Shared by every stream of one process.
 pub(crate) struct ApiChannelState {
     pub notifier: Arc<dyn ActivityNotifier>,
-    pub limits: StreamLimits,
+    pub limits: Arc<StreamLimits>,
     pub config: SseConfig,
 }
 

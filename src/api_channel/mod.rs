@@ -5,12 +5,7 @@
 //! log as Server-Sent Events by running `websocket::Pump` against an
 //! `ActivitySource` that calls the op. See
 //! `docs/superpowers/specs/2026-10-14-api-channel-design.md` in
-//! greentic-designer for the contract and `docs/api-channel.md`-style notes in
-//! the module docs of each file.
-
-// The route wiring is added separately; until it lands these are only
-// exercised by the tests.
-#![allow(dead_code)]
+//! greentic-designer for the contract.
 
 pub(crate) mod event;
 pub(crate) mod limits;

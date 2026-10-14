@@ -76,3 +76,10 @@ impl Default for StreamLimits {
         Self::new(DEFAULT_MAX_STREAMS_PER_CREDENTIAL)
     }
 }
+
+/// The process-wide limiter: every connection of every listener shares one
+/// accounting pool, as `interop` does.
+pub(crate) fn shared() -> Arc<StreamLimits> {
+    static SHARED: std::sync::OnceLock<Arc<StreamLimits>> = std::sync::OnceLock::new();
+    Arc::clone(SHARED.get_or_init(|| Arc::new(StreamLimits::default())))
+}

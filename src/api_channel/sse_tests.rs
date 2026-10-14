@@ -87,7 +87,7 @@ fn state(config: SseConfig, max_streams: usize) -> (ApiChannelState, Arc<InMemor
     (
         ApiChannelState {
             notifier: notifier.clone(),
-            limits: StreamLimits::new(max_streams),
+            limits: Arc::new(StreamLimits::new(max_streams)),
             config,
         },
         notifier,

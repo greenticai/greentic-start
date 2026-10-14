@@ -1091,7 +1091,7 @@ fn spawn_revision_connection(
                 let service = service_fn(move |mut req: Request<Incoming>| {
                     req.extensions_mut()
                         .insert(crate::http_ingress::limits::PeerIp(peer.ip()));
-                    handle_connection(req, connection_state.clone(), peer_is_loopback)
+                    serve_request(req, connection_state.clone(), peer_is_loopback)
                 });
                 let io = TokioIo::new(stream);
                 // `with_upgrades` is required so the WebSocket handshake
@@ -1115,6 +1115,23 @@ fn spawn_revision_connection(
             format!("revision ingress accept error: {err}"),
         ),
     }
+}
+
+/// Route one request. The API channel's SSE stream is the only response with a
+/// streaming body, so it is intercepted here and every other response is boxed
+/// unchanged; `handle_connection` keeps its `Full<Bytes>` contract.
+async fn serve_request(
+    req: Request<Incoming>,
+    state: Arc<ServeState>,
+    peer_is_loopback: bool,
+) -> Result<Response<crate::api_channel::sse::SseBody>, Infallible> {
+    let path = req.uri().path().to_string();
+    if api_stream::is_api_stream_request(req.method(), &path) {
+        return Ok(api_stream::handle_api_stream(req, &path, state).await);
+    }
+    handle_connection(req, state, peer_is_loopback)
+        .await
+        .map(|response| response.map(|body| body.boxed()))
 }
 
 /// `service_fn` adapter: collapse the `Ok`/`Err` response halves into the single
@@ -16605,6 +16622,9 @@ mod public_url_capture_tests {
 #[cfg(test)]
 #[path = "revision_serve/interop_ingress_tests.rs"]
 mod interop_ingress_tests;
+
+#[path = "revision_serve/api_stream.rs"]
+mod api_stream;
 
 #[path = "revision_serve/fast2flow_hook.rs"]
 mod fast2flow_hook;
