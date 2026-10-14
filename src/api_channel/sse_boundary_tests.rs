@@ -250,8 +250,8 @@ async fn an_explicit_cursor_expired_from_the_provider_is_410_with_the_oldest_cur
         .expect("body")
         .to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(json["error"], "cursor_expired");
-    assert_eq!(json["oldest_cursor"], 4);
+    assert_eq!(json["error"]["code"], "cursor_expired");
+    assert_eq!(json["error"]["oldest_cursor"], 4);
 }
 
 #[test]

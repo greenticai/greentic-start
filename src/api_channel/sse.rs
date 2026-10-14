@@ -88,9 +88,9 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<SseBod
 fn gone(oldest_cursor: u64) -> Response<SseBody> {
     json_response(
         StatusCode::GONE,
+        // The same body the provider's REST poll answers with.
         serde_json::json!({
-            "error": "cursor_expired",
-            "oldest_cursor": oldest_cursor,
+            "error": {"code": "cursor_expired", "oldest_cursor": oldest_cursor},
         }),
     )
 }

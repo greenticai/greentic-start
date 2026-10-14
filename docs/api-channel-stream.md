@@ -14,7 +14,7 @@ provider (`src/api_channel/`, wired in `src/revision_serve/api_stream.rs`).
   `next_cursor` is the last returned cursor + 1 (or `since` when nothing is
   returned). `Last-Event-ID: N` resumes at `since = N + 1`.
 - A `cursor_expired` answer from `poll_events` (`{"error":{"code":"cursor_expired","oldest_cursor":N}}`)
-  is `410` with `{"error":"cursor_expired","oldest_cursor":N}`. A resume whose
+  is `410` with `{"error":{"code":"cursor_expired","oldest_cursor":N}}` (the same body as the provider's REST poll). A resume whose
   first returned event is later than `since` is the same `410` (fallback).
   `conversation_not_found` is `404`.
 - A `: keep-alive` comment every 15 s; the stream closes after 5 minutes and the

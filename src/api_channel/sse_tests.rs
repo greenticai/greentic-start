@@ -242,7 +242,7 @@ async fn a_cursor_older_than_the_retained_log_is_gone_with_the_oldest_cursor() {
         .expect("body")
         .to_bytes();
     let json: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
-    assert_eq!(json["oldest_cursor"], 3);
+    assert_eq!(json["error"]["oldest_cursor"], 3);
 }
 
 #[tokio::test]
