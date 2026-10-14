@@ -25,6 +25,30 @@ pub(crate) enum BackendError {
     NotFound,
     #[error("the provider could not be asked")]
     Unavailable,
+    /// The provider answered `cursor_expired`: the log was trimmed past the
+    /// requested cursor.
+    #[error("the cursor is older than the retained log")]
+    CursorExpired { oldest_cursor: u64 },
+}
+
+/// Decode the output of the `poll_events` op.
+///
+/// The op reports failure inside a successful invocation, as
+/// `{"error":{"code":..}}` (`cursor_expired` also carries `oldest_cursor`).
+/// Provider text never reaches the caller: only the code is read.
+pub(crate) fn parse_poll_output(output: Value) -> Result<PollEventsResponse, BackendError> {
+    if let Some(error) = output.get("error") {
+        let code = error.get("code").and_then(Value::as_str);
+        return Err(match code {
+            Some("cursor_expired") => match error.get("oldest_cursor").and_then(Value::as_u64) {
+                Some(oldest_cursor) => BackendError::CursorExpired { oldest_cursor },
+                None => BackendError::Unavailable,
+            },
+            Some("conversation_not_found") => BackendError::NotFound,
+            _ => BackendError::Unavailable,
+        });
+    }
+    serde_json::from_value(output).map_err(|_| BackendError::Unavailable)
 }
 
 /// What the SSE route needs from the deployed provider. One value is built per

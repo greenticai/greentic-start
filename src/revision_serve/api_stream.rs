@@ -114,7 +114,7 @@ impl ApiChannelBackend for RevisionApiBackend {
         };
         let input = serde_json::to_vec(&request).map_err(|_| BackendError::Unavailable)?;
         let output = self.invoke(POLL_EVENTS_OP, input).await?;
-        serde_json::from_value(output).map_err(|_| BackendError::Unavailable)
+        crate::api_channel::source::parse_poll_output(output)
     }
 }
 

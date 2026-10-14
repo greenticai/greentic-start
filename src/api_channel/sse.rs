@@ -85,6 +85,16 @@ fn json_response(status: StatusCode, body: serde_json::Value) -> Response<SseBod
         .unwrap_or_else(|_| plain(status))
 }
 
+fn gone(oldest_cursor: u64) -> Response<SseBody> {
+    json_response(
+        StatusCode::GONE,
+        serde_json::json!({
+            "error": "cursor_expired",
+            "oldest_cursor": oldest_cursor,
+        }),
+    )
+}
+
 /// `since` for a `Last-Event-ID`: the next cursor after the one seen.
 fn resume_point(last_event_id: Option<&str>) -> Result<Option<u64>, ()> {
     match last_event_id.map(str::trim).filter(|v| !v.is_empty()) {
@@ -113,7 +123,10 @@ pub(crate) async fn handle_stream(
         Ok(()) => {}
         Err(BackendError::Unauthorized) => return plain(StatusCode::UNAUTHORIZED),
         Err(BackendError::NotFound) => return plain(StatusCode::NOT_FOUND),
-        Err(BackendError::Unavailable) => return plain(StatusCode::BAD_GATEWAY),
+        // `authorize` never asks about a cursor.
+        Err(BackendError::Unavailable | BackendError::CursorExpired { .. }) => {
+            return plain(StatusCode::BAD_GATEWAY);
+        }
     }
 
     let permit = match state.limits.admit(&credential_key(bearer)) {
@@ -139,30 +152,25 @@ pub(crate) async fn handle_stream(
     };
     let since = resume.unwrap_or(0);
 
-    // A resume must continue exactly where the client stopped. If the first
-    // retained event is later than the one asked for, the log was trimmed past
-    // the client's cursor and an honest stream is impossible: say so, with the
-    // oldest cursor still available. A fresh client (no `Last-Event-ID`) just
-    // starts at the oldest event.
-    if resume.is_some() {
-        match backend.poll_events(&request.conversation_id, since).await {
-            Ok(response) => {
-                if let Some(first) = response.events.first()
-                    && first.cursor > since
-                {
-                    return json_response(
-                        StatusCode::GONE,
-                        serde_json::json!({
-                            "error": "cursor_expired",
-                            "oldest_cursor": first.cursor,
-                        }),
-                    );
-                }
+    // Ask the provider once before streaming: a missing conversation or an
+    // expired cursor must be an honest status, not a stream that errors. The
+    // provider reports an expired cursor explicitly (`cursor_expired`); as a
+    // fallback, a resume whose first returned event is later than the one
+    // asked for also means the log was trimmed. A fresh client (no
+    // `Last-Event-ID`) just starts at the oldest event.
+    match backend.poll_events(&request.conversation_id, since).await {
+        Ok(response) => {
+            if resume.is_some()
+                && let Some(first) = response.events.first()
+                && first.cursor > since
+            {
+                return gone(first.cursor);
             }
-            Err(BackendError::NotFound) => return plain(StatusCode::NOT_FOUND),
-            Err(BackendError::Unauthorized) => return plain(StatusCode::UNAUTHORIZED),
-            Err(BackendError::Unavailable) => return plain(StatusCode::BAD_GATEWAY),
         }
+        Err(BackendError::CursorExpired { oldest_cursor }) => return gone(oldest_cursor),
+        Err(BackendError::NotFound) => return plain(StatusCode::NOT_FOUND),
+        Err(BackendError::Unauthorized) => return plain(StatusCode::UNAUTHORIZED),
+        Err(BackendError::Unavailable) => return plain(StatusCode::BAD_GATEWAY),
     }
 
     let source: Arc<dyn ActivitySource> = Arc::new(PollEventsSource { backend });

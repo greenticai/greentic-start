@@ -33,4 +33,6 @@ pub(crate) fn stream_conversation_id(path: &str) -> Option<String> {
 #[cfg(test)]
 mod event_tests;
 #[cfg(test)]
+mod sse_boundary_tests;
+#[cfg(test)]
 mod sse_tests;
