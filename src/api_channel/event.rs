@@ -50,11 +50,12 @@ pub(crate) struct ApiEvent {
     pub cursor: u64,
     #[serde(rename = "type")]
     pub kind: EventType,
-    pub items: Vec<Item>,
-    pub ts: String,
-    /// Present on `error` events only; never provider text.
+    /// Present on `error` events only; never provider text. Declared before
+    /// `items` so the serialized key order matches the shared fixtures.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
+    pub items: Vec<Item>,
+    pub ts: String,
 }
 
 /// Input of the `poll_events` provider op.

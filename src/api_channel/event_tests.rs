@@ -1,5 +1,5 @@
 //! The shared fixtures are asserted byte for byte: parse, re-serialize, and the
-//! bytes must equal the file (minus its trailing newline).
+//! bytes must equal the file (with no trailing newline either).
 
 use super::event::*;
 use serde::Serialize;
@@ -15,7 +15,11 @@ fn fixture(name: &str) -> String {
 
 fn assert_round_trips<T: Serialize + DeserializeOwned>(name: &str) -> T {
     let raw = fixture(name);
-    let expected = raw.strip_suffix('\n').unwrap_or(&raw);
+    let expected = raw.as_str();
+    assert!(
+        !expected.ends_with('\n'),
+        "{name} must have no trailing newline"
+    );
     let parsed: T = serde_json::from_str(expected).expect("fixture parses");
     let out = serde_json::to_string(&parsed).expect("serializes");
     assert_eq!(out, expected, "{name} drifted from the typed schema");
