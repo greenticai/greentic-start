@@ -145,6 +145,8 @@ pub(crate) enum RouteSource {
     Bm25,
     /// The embedded LLM fallback.
     Llm,
+    /// The Jev tier (`fast2flow::jev`).
+    Jev,
 }
 
 impl RouteSource {
@@ -153,6 +155,7 @@ impl RouteSource {
         match self {
             Self::Bm25 => "fast2flow",
             Self::Llm => "fast2flow:llm",
+            Self::Jev => "fast2flow:jev",
         }
     }
 
@@ -160,6 +163,7 @@ impl RouteSource {
         match self {
             Self::Bm25 => "bm25",
             Self::Llm => "llm",
+            Self::Jev => "jev",
         }
     }
 }
@@ -185,7 +189,7 @@ impl RouteSignal {
     /// `flow` names the default flow even though no flow ran. `confidence` is
     /// the router's value as its shortest decimal (`0.92`, not the f32 noise
     /// `0.9200000166893005`), and `null` when none was reported or it is
-    /// non-finite or outside `[0, 1]`. `source` is `"bm25"` or `"llm"`.
+    /// non-finite or outside `[0, 1]`. `source` is `"bm25"`, `"llm"` or `"jev"`.
     pub(crate) fn to_json(&self, flow_id: &str) -> JsonValue {
         let confidence = self
             .confidence

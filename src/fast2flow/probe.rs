@@ -34,6 +34,9 @@ pub(crate) struct ProbeInputs<'a> {
     pub(crate) provider: &'a str,
     /// The `llm:` instance for the LLM fallback; `None` disables it.
     pub(crate) llm: Option<&'a BundleLlmConfig>,
+    /// The Jev tier's inputs; `None` = the tier cannot run (no key reader).
+    /// Even when set, the tier runs only if a `jev` block is configured.
+    pub(crate) jev: Option<super::jev::JevInputs<'a>>,
 }
 
 /// What a turn does, decided before any flow runs.
@@ -79,7 +82,10 @@ pub(crate) fn probe(
         i.pack,
         envelope,
     );
-    turn::probe_turn(host, || llm_fallback(i, envelope))
+    // Tier order after the host router: Jev, then the embedded LLM.
+    turn::probe_turn(host, || {
+        super::jev::route(i, envelope).or_else(|| llm_fallback(i, envelope))
+    })
 }
 
 /// What an unrouted turn does when the router could not be asked or failed

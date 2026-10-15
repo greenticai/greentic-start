@@ -219,6 +219,11 @@ struct ExtendedBundleYaml {
     telemetry: Option<BundleTelemetryConfig>,
     #[serde(default)]
     llm: Option<BundleLlmConfig>,
+    /// Kept raw: a malformed `jev:` block must switch only the Jev tier off,
+    /// never make this whole document (and the `llm:` / telemetry peeks that
+    /// read it) unparseable. See [`peek_bundle_jev`].
+    #[serde(default)]
+    jev: Option<serde_yaml_bw::Value>,
 }
 
 /// Result of loading extended bundle.yaml
@@ -242,6 +247,17 @@ pub(crate) fn peek_bundle_llm(bundle_path: &Path) -> Option<BundleLlmConfig> {
     let raw = std::fs::read_to_string(bundle_path).ok()?;
     let parsed: ExtendedBundleYaml = serde_yaml_bw::from_str(&raw).ok()?;
     parsed.llm
+}
+
+/// Read just the top-level `jev:` block (the Fast2Flow Jev routing tier) from a
+/// normalized bundle.yaml. Absent or unusable (reported) is `None`: the tier
+/// stays off.
+pub(crate) fn peek_bundle_jev(
+    bundle_path: &Path,
+) -> Option<crate::fast2flow::jev::config::JevBlock> {
+    let raw = std::fs::read_to_string(bundle_path).ok()?;
+    let parsed: ExtendedBundleYaml = serde_yaml_bw::from_str(&raw).ok()?;
+    crate::fast2flow::jev::config::parse_operator_block(parsed.jev?)
 }
 
 /// Read the optional sidecar telemetry artifact persisted by `gtc setup` at
@@ -548,6 +564,33 @@ mod tests {
         assert_eq!(llm.fast2flow_llm_min_confidence, Some(0.55));
         // fast2flow consumer is opt-out: enabled unless explicitly disabled.
         assert!(llm.fast2flow);
+    }
+
+    #[test]
+    fn peek_bundle_jev_parses_the_block_and_a_bad_one_only_switches_jev_off() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let bundle = temp.path().join("bundle.yaml");
+        std::fs::write(
+            &bundle,
+            "bundle_id: demo\nllm:\n  provider: openai\njev:\n  api_key_secret: jev/api_key\n  timeout_ms: 1500\n",
+        )
+        .expect("write");
+        let jev = peek_bundle_jev(&bundle).expect("jev block present");
+        assert_eq!(jev.api_key_secret.as_deref(), Some("jev/api_key"));
+        assert_eq!(jev.timeout_ms, Some(1500));
+
+        // A literal key is refused: the tier is off, and `llm:` still reads.
+        std::fs::write(
+            &bundle,
+            "bundle_id: demo\nllm:\n  provider: openai\njev:\n  api_key: sk-live\n",
+        )
+        .expect("write");
+        assert!(peek_bundle_jev(&bundle).is_none());
+        assert_eq!(peek_bundle_llm(&bundle).expect("llm").provider, "openai");
+
+        // No block at all.
+        std::fs::write(&bundle, "bundle_id: demo\n").expect("write");
+        assert!(peek_bundle_jev(&bundle).is_none());
     }
 
     #[test]

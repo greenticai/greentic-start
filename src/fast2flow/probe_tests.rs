@@ -108,6 +108,7 @@ fn plan(
         index_scope,
         provider: "webchat",
         llm: None,
+        jev: None,
     };
     plan_turn(
         &inputs,
@@ -292,6 +293,7 @@ fn the_llm_fallback_gates_run_in_order_before_the_index_is_read() {
             index_scope: Some(scope),
             provider: "webchat",
             llm: llm_cfg.as_ref(),
+            jev: None,
         };
         let plan = plan_turn(&inputs, &envelope(text), false, OnRouterFailure::MissPolicy);
         let materialized = indexes.path().join(scope).join("index.json").is_file();
@@ -331,6 +333,7 @@ fn a_failed_router_is_a_miss_unless_the_caller_fails_open() {
         index_scope: None,
         provider: "webchat",
         llm: None,
+        jev: None,
     };
     let env = envelope("hello?");
     assert!(matches!(

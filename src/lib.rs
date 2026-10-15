@@ -1591,6 +1591,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
     let llm_cfg = bundle_config::peek_bundle_llm(&config_dir.join("bundle.yaml"))
         .or_else(|| bundle_config::peek_bundle_llm(&config_path));
     llm::set_config(llm_cfg);
+    // The bundle's `jev:` block (Fast2Flow Jev routing tier). Absent = off.
+    fast2flow::jev::config::set_operator(
+        bundle_config::peek_bundle_jev(&config_dir.join("bundle.yaml"))
+            .or_else(|| bundle_config::peek_bundle_jev(&config_path)),
+    );
     // Resolve the LLM credential once (a `secrets://` dev-store ref or an env-var
     // name) so keyed providers (OpenAI/Anthropic/…) work; Ollama needs none.
     if let Some(cfg) = llm::config() {

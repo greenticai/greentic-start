@@ -32,12 +32,12 @@ const MAX_CANDIDATES: usize = 40;
 
 /// A routable destination derived from one index entry.
 #[derive(Debug, Clone, PartialEq)]
-struct Candidate {
+pub(crate) struct Candidate {
     /// `pack/flow/node` (or fewer segments) — what the model must echo back.
-    target: String,
-    title: String,
+    pub(crate) target: String,
+    pub(crate) title: String,
     /// Example utterances / tags shown to the model as matching hints.
-    hints: Vec<String>,
+    pub(crate) hints: Vec<String>,
 }
 
 /// The model's structured choice.
@@ -240,7 +240,7 @@ The target MUST be copied verbatim from one of the options. If nothing is a good
 }
 
 /// Parse the index JSON and build the routable candidate list.
-fn candidates_from_index(bytes: &[u8]) -> Vec<Candidate> {
+pub(crate) fn candidates_from_index(bytes: &[u8]) -> Vec<Candidate> {
     let manifest: IndexManifest = match serde_json::from_slice(bytes) {
         Ok(m) => m,
         Err(_) => return Vec::new(),
