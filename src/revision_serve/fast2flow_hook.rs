@@ -16,6 +16,9 @@
 //!   fallback is replaced by Fast2Flow (see [`is_default_target`]);
 //! * ownership — a conversation parked in a flow resumes that flow and is
 //!   never re-routed (see [`parked_run`]);
+//! * the Jev tier (`fast2flow::jev`) reads its key from the revision host's
+//!   secrets store and is configured by the pack's `assets/fast2flow.json`
+//!   (plus `bundle.yaml` where one exists); absent config = off;
 //! * no LLM fallback: revision mode has no `bundle.yaml` `llm:` block and no
 //!   env-based source exists, so `llm` is `None` (host-only routing).
 //!
@@ -77,6 +80,9 @@ pub(super) struct TurnScope<'a> {
     pub(super) revision_id: RevisionId,
     pub(super) provider: &'a str,
     pub(super) endpoint_id: Option<&'a str>,
+    /// The secrets store the Jev routing tier reads its key NAME from at call
+    /// time. `None` leaves that tier unable to run.
+    pub(super) secrets: Option<crate::secrets_gate::DynSecretsManager>,
 }
 
 /// Split a turn's target into the EXPLICIT one (the envelope's validated
@@ -528,6 +534,17 @@ async fn probe_plan(
     let provider = scope.provider.to_string();
     let probe_app = Arc::clone(app);
     let probe_envelope = ingress.clone();
+    // The Jev tier reads its key in the scopes this pack's channel secrets use.
+    let jev_keys = scope
+        .secrets
+        .clone()
+        .map(|secrets| crate::fast2flow::jev::ManagerKeys {
+            secrets,
+            env: crate::inbound_verify::secrets_env().to_string(),
+            tenant: scope.tenant.to_string(),
+            pack_id: app.pack_id.clone(),
+            unit_id: scope.bundle_id.as_str().to_string(),
+        });
     let planned = tokio::task::spawn_blocking(move || {
         let inputs = ProbeInputs {
             cfg: &cfg,
@@ -537,6 +554,12 @@ async fn probe_plan(
             index_scope: Some(&index_scope),
             provider: &provider,
             llm: None,
+            jev: jev_keys
+                .as_ref()
+                .map(|keys| crate::fast2flow::jev::JevInputs {
+                    operator: crate::fast2flow::jev::config::operator(),
+                    keys,
+                }),
         };
         plan_turn(
             &inputs,

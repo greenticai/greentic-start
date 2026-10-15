@@ -33,7 +33,7 @@ mod bf_keys;
 mod bot_framework;
 mod hmac_channels;
 mod notices;
-mod secrets;
+pub(crate) mod secrets;
 mod service_url;
 
 use std::collections::BTreeMap;

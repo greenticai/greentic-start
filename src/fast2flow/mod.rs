@@ -16,6 +16,7 @@ pub(crate) mod dispatch;
 pub mod gate;
 pub mod host_process;
 pub(crate) mod index_refresh;
+pub(crate) mod jev;
 pub mod llm_router;
 pub mod mapper;
 pub(crate) mod pack_config;

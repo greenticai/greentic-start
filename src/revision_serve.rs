@@ -6380,6 +6380,7 @@ async fn run_provider_inbound_pipeline(
             revision_id,
             provider: &provider_type,
             endpoint_id: endpoint_id.as_deref(),
+            secrets: Some(activation.host.secrets_manager()),
         };
         let run_turn = |envelope: ChannelMessageEnvelope, target: Option<WelcomeFlowHint>| {
             let hint = target.clone().or_else(|| welcome_hint.clone());

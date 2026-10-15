@@ -56,6 +56,14 @@ pub(super) fn route_messaging_envelopes(
         )
     });
 
+    // Jev tier key reader (only used when a `jev` block is configured).
+    let jev_keys = crate::fast2flow::jev::ManagerKeys {
+        secrets: runner_host.secrets_manager(),
+        env: crate::inbound_verify::secrets_env().to_string(),
+        tenant: ctx.tenant.clone(),
+        pack_id: pack_info.pack_id.clone(),
+        unit_id: String::new(),
+    };
     let probe_inputs = ProbeInputs {
         cfg: crate::fast2flow::Fast2FlowConfig::global(),
         ctx,
@@ -64,6 +72,10 @@ pub(super) fn route_messaging_envelopes(
         index_scope: None,
         provider,
         llm: crate::llm::config(),
+        jev: Some(crate::fast2flow::jev::JevInputs {
+            operator: crate::fast2flow::jev::config::operator(),
+            keys: &jev_keys,
+        }),
     };
 
     for original in &envelopes {

@@ -110,6 +110,7 @@ impl Fixture {
             revision_id: self.revision_id,
             provider: "messaging.webchat.gui",
             endpoint_id: None,
+            secrets: None,
         }
     }
 
