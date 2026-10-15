@@ -15,8 +15,9 @@ use greentic_types::ChannelMessageEnvelope;
 
 use super::dispatch::{self, RouteDecision};
 use super::turn::{self, MissAction, Unrouted};
-use super::{FAST2FLOW_CAPABILITY, Fast2FlowConfig};
+use super::{FAST2FLOW_CAPABILITY, Fast2FlowConfig, RoutingOutcome};
 use crate::bundle_config::BundleLlmConfig;
+use crate::ingress::control_directive::ControlDirective;
 use crate::messaging_app::AppPackInfo;
 use crate::runner_host::OperatorContext;
 
@@ -69,19 +70,25 @@ pub(crate) fn probe(
     i: &ProbeInputs<'_>,
     envelope: &ChannelMessageEnvelope,
 ) -> Result<RouteDecision, Unrouted> {
-    let host = dispatch::host_route(
-        super::route_request_in_scope(
-            i.cfg,
-            i.ctx,
-            i.pack,
-            i.pack_path,
-            envelope,
-            i.provider,
-            i.index_scope,
-        ),
+    let mut outcome = super::route_request_in_scope(
+        i.cfg,
+        i.ctx,
         i.pack,
+        i.pack_path,
         envelope,
+        i.provider,
+        i.index_scope,
     );
+    // `jev.position: only`: the host's ROUTE decision is dropped before it is
+    // applied. Deny/Respond and failures are untouched.
+    if matches!(
+        outcome,
+        RoutingOutcome::Directive(ControlDirective::Dispatch { .. })
+    ) && super::jev::replaces_host_route(i)
+    {
+        outcome = RoutingOutcome::NoMatch;
+    }
+    let host = dispatch::host_route(outcome, i.pack, envelope);
     // Tier order after the host router: Jev, then the embedded LLM.
     turn::probe_turn(host, || {
         super::jev::route(i, envelope).or_else(|| llm_fallback(i, envelope))

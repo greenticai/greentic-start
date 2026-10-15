@@ -92,6 +92,29 @@ fn report(seen: &WarnOnce<&'static str>, class: &'static str, line: String) {
     }
 }
 
+/// `true` when this turn runs Jev INSTEAD of the host router's route decision
+/// (`position: only`, tier on, pack declares Fast2Flow). Anything that keeps
+/// the tier from running (no block, veto, bad config) is `false`, so the host
+/// router behaves exactly as it did before this option existed.
+pub(crate) fn replaces_host_route(i: &ProbeInputs<'_>) -> bool {
+    replaces_host_route_reporting(i, &REPORTED)
+}
+
+fn replaces_host_route_reporting(i: &ProbeInputs<'_>, seen: &WarnOnce<&'static str>) -> bool {
+    let Some(jev) = i.jev.as_ref() else {
+        return false;
+    };
+    if !i
+        .pack
+        .capabilities
+        .iter()
+        .any(|c| c == FAST2FLOW_CAPABILITY)
+    {
+        return false;
+    }
+    settings_for(i, jev, seen).is_some_and(|s| s.position == config::Position::Only)
+}
+
 /// Route `original` with Jev, or `None` to fall through.
 pub(crate) fn route(
     i: &ProbeInputs<'_>,

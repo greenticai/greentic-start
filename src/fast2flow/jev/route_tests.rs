@@ -442,3 +442,6 @@ fn the_key_never_appears_in_what_the_tier_can_print() {
     assert!(!format!("{settings:?}").contains(KEY));
     let _ = Path::new("");
 }
+
+#[path = "only_tests.rs"]
+mod only;

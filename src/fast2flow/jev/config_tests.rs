@@ -129,3 +129,15 @@ fn the_pack_block_is_read_from_the_shared_config_entry() {
     assert!(parse_pack_block(br#"{"jev":{"api_key":"x"}}"#).is_err());
     assert!(parse_pack_block(b"nope").is_err());
 }
+
+#[test]
+fn position_defaults_to_after_router_and_the_pack_overrides_the_operator() {
+    let got = effective(Some(&block("{}")), None).unwrap().unwrap();
+    assert_eq!(got.position, Position::AfterRouter);
+    let op = block(r#"{"position":"only"}"#);
+    let pack = block(r#"{"position":"after_router"}"#);
+    let got = effective(Some(&op), Some(&pack)).unwrap().unwrap();
+    assert_eq!(got.position, Position::AfterRouter);
+    let got = effective(Some(&op), None).unwrap().unwrap();
+    assert_eq!(got.position, Position::Only);
+}
