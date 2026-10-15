@@ -26,6 +26,11 @@
 //!   the operator's block only, and a pack's secret name must live under
 //!   `jev/`, so a pack cannot make this host send some other secret (or any
 //!   secret anywhere else) to a third party.
+//! * **`position: only` is not a new exposure.** It changes which classifier
+//!   routes (Jev instead of BM25), not what leaves the process: the message
+//!   text goes to the endpoint whenever the tier is on, with or without it.
+//!   So a pack may select it like any other tuning value, and the operator's
+//!   `enabled: false` (or a bad block) already stops it.
 //! * **The operator can veto.** `enabled: false` in `bundle.yaml` turns the
 //!   tier off whatever a pack says.
 
@@ -50,6 +55,20 @@ const MIN_TIMEOUT_MS: u64 = 100;
 const MAX_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MIN_CONFIDENCE: f32 = 0.5;
 
+/// Where the Jev tier sits relative to the host router (BM25).
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Position {
+    /// Today's order: host router, then Jev, then the LLM fallback.
+    #[default]
+    AfterRouter,
+    /// Jev instead of the host router's ROUTE decision: a `Dispatch` from the
+    /// host is discarded, everything else the host says (`Deny`, `Respond`,
+    /// failures) is unchanged. A Jev miss falls to the LLM fallback and the
+    /// miss policy, never back to BM25.
+    Only,
+}
+
 /// One `jev` block as written (either source). Every field is optional so a
 /// pack block can override single values of the operator's.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
@@ -61,6 +80,9 @@ pub(crate) struct JevBlock {
     pub timeout_ms: Option<u64>,
     pub min_confidence: Option<f64>,
     pub model: Option<String>,
+    /// `after_router` (default) or `only`. Any other value is a parse error,
+    /// which turns the Jev tier off (never a silently chosen mode).
+    pub position: Option<Position>,
 }
 
 /// The settings a turn runs with.
@@ -71,6 +93,7 @@ pub(crate) struct JevSettings {
     pub timeout: Duration,
     pub min_confidence: f32,
     pub model: Option<String>,
+    pub position: Position,
 }
 
 static OPERATOR: OnceLock<Option<JevBlock>> = OnceLock::new();
@@ -205,6 +228,10 @@ pub(crate) fn effective(
         timeout: Duration::from_millis(timeout_ms),
         min_confidence,
         model: pick(|b| b.model.as_ref()),
+        position: pack
+            .and_then(|p| p.position)
+            .or_else(|| operator.and_then(|o| o.position))
+            .unwrap_or_default(),
     }))
 }
 

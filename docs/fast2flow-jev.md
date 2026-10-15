@@ -22,6 +22,7 @@ jev:
   min_confidence: 0.5                              # default 0.5
   model: jev-latest                                # optional
   enabled: false                                   # optional kill switch
+  position: after_router                           # or `only`; default after_router
 ```
 
 The pack (`assets/fast2flow.json`, what a deployed router unit carries):
@@ -39,6 +40,50 @@ Rules:
   `jev/`, so a pack cannot send another secret, or any secret elsewhere, to a
   third party. Either violation turns the tier off for that pack (one `warn`).
 * `enabled: false` in `bundle.yaml` turns the tier off whatever a pack says.
+* `position` accepts exactly `after_router` or `only`. Any other value makes
+  the `jev` block unusable, which turns only the Jev tier off (one `warn`); the
+  host router and everything else behave as without Jev.
+
+## Position: `after_router` (default) and `only`
+
+`after_router` is the order described at the top and is byte-identical to a
+config without `position`.
+
+`only` runs Jev **instead of** the host router's route decision:
+
+```yaml
+jev:
+  position: only
+```
+
+The host routing host is still invoked, because it is also where `Deny` and
+`Respond` come from; with `only` its `Dispatch` answer is discarded before it
+is applied. Everything else it says is unchanged. A turn then goes Jev, the
+embedded LLM fallback, the pack's miss policy. When Jev fails open (error,
+timeout, low confidence, unknown option, `none`) the turn does **not** go back
+to BM25.
+
+| position | host (BM25) answer | Jev result | outcome |
+|---|---|---|---|
+| `after_router` | `Dispatch` | not asked | BM25 route |
+| `after_router` | no match / not configured / failed | route | Jev route |
+| `after_router` | no match / not configured / failed | fail-open | LLM fallback, then miss policy |
+| `after_router` | `Deny` / `Respond` | not asked | routing stops, fixed reply |
+| `only` | `Dispatch` (discarded) | route | Jev route |
+| `only` | `Dispatch` (discarded) | fail-open | LLM fallback, then miss policy |
+| `only` | no match / not configured / failed | route | Jev route |
+| `only` | no match / not configured / failed | fail-open | LLM fallback, then miss policy |
+| `only` | `Deny` / `Respond` | not asked | routing stops, fixed reply |
+
+`only` takes effect only when the tier would actually run for the pack (a
+usable `jev` block, not vetoed, pack declares Fast2Flow). Otherwise BM25 routes
+as before.
+
+A pack may select `only`, like any other tuning value: it changes which
+classifier routes, not what leaves the process. The message text goes to the
+Jev endpoint whenever the tier is on, and the endpoint and secret-name guards
+still apply. The operator's `enabled: false` vetoes it; the pack's own value
+overrides the operator's `position`.
 
 ## Behaviour
 
