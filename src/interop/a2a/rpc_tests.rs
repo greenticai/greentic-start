@@ -24,6 +24,8 @@ const TOKEN: &str = "gtw_test-token";
 struct FakeRunner {
     replies: Vec<Activity>,
     calls: Mutex<Vec<(String, String, Value)>>,
+    /// The validated caller block each turn was handed, if any.
+    forwarded: Mutex<Vec<Option<Value>>>,
 }
 
 impl FakeRunner {
@@ -31,11 +33,16 @@ impl FakeRunner {
         Self {
             replies,
             calls: Mutex::new(Vec::new()),
+            forwarded: Mutex::new(Vec::new()),
         }
     }
 
     fn calls(&self) -> Vec<(String, String, Value)> {
         self.calls.lock().map(|c| c.clone()).unwrap_or_default()
+    }
+
+    fn forwarded(&self) -> Vec<Option<Value>> {
+        self.forwarded.lock().map(|c| c.clone()).unwrap_or_default()
     }
 }
 
@@ -46,7 +53,11 @@ impl TurnRunner for FakeRunner {
         session_hint: &str,
         user: &str,
         payload: &Value,
+        forwarded_caller: Option<&Value>,
     ) -> Result<Vec<Activity>, TurnFailure> {
+        if let Ok(mut forwarded) = self.forwarded.lock() {
+            forwarded.push(forwarded_caller.cloned());
+        }
         if let Ok(mut calls) = self.calls.lock() {
             calls.push((session_hint.to_string(), user.to_string(), payload.clone()));
         }
@@ -61,6 +72,7 @@ fn config() -> InteropConfig {
             id: "c1".into(),
             sha256: Sha256::digest(TOKEN.as_bytes()).into(),
             expires_at_ms: None,
+            forwards_caller: false,
         }],
         ..InteropConfig::default()
     }
@@ -1088,6 +1100,7 @@ impl TurnRunner for FailingRunner {
         _session_hint: &str,
         _user: &str,
         _payload: &Value,
+        _forwarded_caller: Option<&Value>,
     ) -> Result<Vec<Activity>, TurnFailure> {
         Err(TurnFailure)
     }
@@ -1745,4 +1758,165 @@ async fn no_caller_supplied_string_or_turn_content_reaches_a_field() {
         ],
         "a field was added to the request span: {wire}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// A verified caller forwarded by a flagged router credential
+// ---------------------------------------------------------------------------
+
+fn config_forwarding(flag: bool) -> InteropConfig {
+    let mut config = config();
+    config.credentials[0].forwards_caller = flag;
+    config
+}
+
+fn token_hash_hex() -> String {
+    Sha256::digest(TOKEN.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn forwarded_params(block: Value) -> Value {
+    let mut params = send_params(Some("ctx-f"));
+    params["message"]["metadata"] = json!({ "caller": block, "keep": "me" });
+    params
+}
+
+fn verified_block() -> Value {
+    json!({
+        "sub": "u-1",
+        "iss": "https://idp.example",
+        "teams": ["sales"],
+        "groups": ["g"],
+        "role": "member",
+        "user_verified": true,
+    })
+}
+
+/// Both bindings, each as `(name, runner it ran against)`.
+async fn send_both(
+    config: InteropConfig,
+    block: Value,
+) -> Vec<(&'static str, std::sync::Arc<FakeRunner>, Fixture)> {
+    let mut out = Vec::new();
+    for binding in ["jsonrpc", "rest"] {
+        let fixture = Fixture::new(config.clone());
+        let runner = std::sync::Arc::new(FakeRunner::replying(vec![Activity::text("ok")]));
+        let params = forwarded_params(block.clone());
+        let response = if binding == "jsonrpc" {
+            let body = rpc("SendMessage", params);
+            rpc_call(&fixture, Some(BEARER), &request(&body), runner.as_ref()).await
+        } else {
+            let body = params.to_string().into_bytes();
+            rest_call(&fixture, Some(BEARER), &request(&body), runner.as_ref()).await
+        };
+        assert_eq!(response.status(), StatusCode::OK, "{binding}");
+        out.push((binding, runner, fixture));
+    }
+    out
+}
+
+#[tokio::test]
+async fn a_flagged_credential_forwards_a_valid_caller_on_both_bindings() {
+    for (binding, runner, fixture) in send_both(config_forwarding(true), verified_block()).await {
+        let forwarded = runner.forwarded();
+        assert_eq!(forwarded.len(), 1, "{binding}");
+        let block = forwarded[0].clone().expect("accepted");
+        assert_eq!(block["sub"], "u-1", "{binding}");
+        assert_eq!(block["teams"], json!(["sales"]), "{binding}");
+        assert_eq!(block["via"], "router:c1", "{binding}");
+        assert_eq!(block["user_verified"], true, "{binding}");
+        // The session stays per CREDENTIAL, not per forwarded user.
+        let calls = runner.calls();
+        assert_eq!(calls[0].0, "a2a:c1:ctx-f", "{binding}");
+        assert_eq!(calls[0].1, "a2a:c1", "{binding}");
+        // The raw metadata never rides in the turn payload.
+        assert_eq!(calls[0].2, json!({"text": "hello"}), "{binding}");
+        assert_eq!(
+            traced_value(&fixture, "interop.forwarded_via").as_deref(),
+            Some("router:c1"),
+            "{binding}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_unflagged_credential_never_forwards_a_caller() {
+    for (binding, runner, fixture) in send_both(config_forwarding(false), verified_block()).await {
+        assert_eq!(runner.forwarded(), vec![None], "{binding}");
+        assert_eq!(runner.calls()[0].2, json!({"text": "hello"}), "{binding}");
+        assert!(
+            traced_value(&fixture, "interop.forwarded_via").is_none(),
+            "{binding}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_document_without_the_key_behaves_exactly_as_before() {
+    // The wire document has no `forwards_caller`: serde default, false.
+    let parsed = crate::interop::config::parse(
+        json!({
+            "v": 1,
+            "a2a": true,
+            "credentials": [{
+                "id": "c1",
+                "sha256": token_hash_hex(),
+            }],
+        })
+        .to_string()
+        .as_bytes(),
+        "unit",
+    )
+    .expect("parses");
+    assert!(!parsed.credentials[0].forwards_caller);
+    for (binding, runner, _) in send_both(parsed, verified_block()).await {
+        assert_eq!(runner.forwarded(), vec![None], "{binding}");
+    }
+}
+
+#[tokio::test]
+async fn the_flag_is_read_from_the_document_when_set() {
+    let parsed = crate::interop::config::parse(
+        json!({
+            "v": 1,
+            "a2a": true,
+            "credentials": [{
+                "id": "c1",
+                "sha256": token_hash_hex(),
+                "forwards_caller": true,
+            }],
+        })
+        .to_string()
+        .as_bytes(),
+        "unit",
+    )
+    .expect("parses");
+    assert!(parsed.credentials[0].forwards_caller);
+}
+
+#[tokio::test]
+async fn invalid_blocks_from_a_flagged_credential_are_dropped_on_both_bindings() {
+    let mut unverified = verified_block();
+    unverified["user_verified"] = json!(false);
+    let mut foreign = verified_block();
+    foreign["is_admin"] = json!(true);
+    let mut huge = verified_block();
+    huge["teams"] = json!(vec!["t"; 65]);
+    for (name, block) in [
+        ("unverified", unverified),
+        ("foreign field", foreign),
+        ("over limit", huge),
+    ] {
+        for (binding, runner, fixture) in send_both(config_forwarding(true), block).await {
+            assert_eq!(runner.forwarded(), vec![None], "{name} {binding}");
+            assert_eq!(
+                runner.calls()[0].2,
+                json!({"text": "hello"}),
+                "{name} {binding}"
+            );
+            assert!(traced_value(&fixture, "interop.forwarded_via").is_none());
+        }
+    }
 }

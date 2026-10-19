@@ -32,6 +32,12 @@ pub(crate) struct Credential {
     /// A rotated-out credential stays valid until this instant (ms since the
     /// Unix epoch). `None` = no expiry.
     pub expires_at_ms: Option<u64>,
+    /// This credential belongs to a router that forwards an already-verified
+    /// end-user caller (`message.metadata.caller` on the A2A surface; see
+    /// [`crate::interop::a2a::forwarded`]). Absent in the document = `false`.
+    /// Read from the AUTHENTICATED credential's own entry, never from the
+    /// request.
+    pub forwards_caller: bool,
 }
 
 impl std::fmt::Debug for Credential {
@@ -40,6 +46,7 @@ impl std::fmt::Debug for Credential {
         f.debug_struct("Credential")
             .field("id", &self.id)
             .field("expires_at_ms", &self.expires_at_ms)
+            .field("forwards_caller", &self.forwards_caller)
             .finish_non_exhaustive()
     }
 }
@@ -200,6 +207,8 @@ struct RawCredential {
     sha256: String,
     #[serde(default)]
     expires_at_ms: Option<u64>,
+    #[serde(default)]
+    forwards_caller: bool,
 }
 
 /// Wire form of the document, before validation. Unknown fields are ignored.
@@ -531,6 +540,7 @@ fn parse_credential(entry: Value, unit: &str) -> Option<Credential> {
         id: raw.id,
         sha256,
         expires_at_ms: raw.expires_at_ms,
+        forwards_caller: raw.forwards_caller,
     })
 }
 

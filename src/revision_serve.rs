@@ -1947,6 +1947,8 @@ pub(crate) struct TurnSpec<'a> {
     pub cookie: Option<&'a str>,
     pub user: Option<&'a str>,
     pub payload: &'a Value,
+    /// A caller block the host already validated (A2A forwarded caller).
+    pub forwarded_caller: Option<&'a Value>,
 }
 
 /// Read a unit's staged interop config, through the listener's short TTL
@@ -2212,6 +2214,7 @@ impl crate::interop::a2a::rpc::TurnRunner for IngressTurnRunner<'_> {
         session_hint: &str,
         user: &str,
         payload: &Value,
+        forwarded_caller: Option<&Value>,
     ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
         run_turn(
             self.state,
@@ -2226,6 +2229,7 @@ impl crate::interop::a2a::rpc::TurnRunner for IngressTurnRunner<'_> {
                 cookie: None,
                 user: Some(user),
                 payload,
+                forwarded_caller,
             },
             "a2a dispatch",
             "a2a execution",
@@ -2602,6 +2606,7 @@ impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
         session_hint: &str,
         user: &str,
         payload: &Value,
+        _forwarded_caller: Option<&Value>,
     ) -> Result<Vec<Activity>, crate::interop::a2a::rpc::TurnFailure> {
         run_turn(
             &self.state,
@@ -2616,6 +2621,8 @@ impl crate::interop::a2a::rpc::TurnRunner for OwnedTurnRunner {
                 cookie: None,
                 user: Some(user),
                 payload,
+                // MCP never forwards a caller: only the A2A binding does.
+                forwarded_caller: None,
             },
             "mcp dispatch",
             "mcp execution",
@@ -2770,13 +2777,14 @@ async fn run_turn(
         cookie: spec.cookie,
     };
     let outcome = dispatch_turn(activation, &dispatch_req, dispatch_label).await?;
-    let activity = build_activity(
+    let activity = build_activity_with_caller(
         spec.payload,
         spec.tenant,
         spec.user,
         spec.session_hint,
         None,
         None,
+        spec.forwarded_caller,
     );
     let scope = RevisionScope {
         deployment_id: spec.deployment_id,
@@ -2908,6 +2916,7 @@ async fn handle_worker_invoke(
             cookie: None,
             user: user.as_deref(),
             payload: &flow_payload,
+            forwarded_caller: None,
         },
         "worker-invoke dispatch",
         "worker-invoke execution",
@@ -4948,6 +4957,22 @@ fn build_activity(
     endpoint: Option<&str>,
     welcome_hint: Option<WelcomeFlowHint>,
 ) -> Activity {
+    build_activity_with_caller(payload, tenant, user, session, endpoint, welcome_hint, None)
+}
+
+/// [`build_activity`] for a turn whose caller block was ALREADY validated by
+/// the host (`interop::a2a::forwarded`): `forwarded_caller` is written to
+/// `extensions.caller` AFTER the client-supplied one is stripped, so the only
+/// block that can reach the runner is the validated one.
+fn build_activity_with_caller(
+    payload: &Value,
+    tenant: &str,
+    user: Option<&str>,
+    session: Option<&str>,
+    endpoint: Option<&str>,
+    welcome_hint: Option<WelcomeFlowHint>,
+    forwarded_caller: Option<&Value>,
+) -> Activity {
     // Every caller of this function hands it JSON a client wrote, so a caller
     // block in it is a claim, never a verification. Only the provider route
     // (`envelope_to_activity`) may carry one — see `client_caller`.
@@ -4955,6 +4980,20 @@ fn build_activity(
     // Likewise a stored-attachment reference or a host note: only the host's
     // inbound pipeline (provider route) writes those.
     crate::artifacts::provenance::strip_reserved_json(&mut payload);
+    if let (Some(block), Value::Object(map)) = (forwarded_caller, &mut payload) {
+        let extensions = map
+            .entry("extensions")
+            .or_insert_with(|| serde_json::json!({}));
+        if !extensions.is_object() {
+            *extensions = serde_json::json!({});
+        }
+        if let Some(extensions) = extensions.as_object_mut() {
+            extensions.insert(
+                greentic_runner_host::caller_identity::CALLER_EXT_KEY.into(),
+                block.clone(),
+            );
+        }
+    }
     let payload = &payload;
     let mut activity = match payload.get("text").and_then(Value::as_str) {
         // `Activity::text` keeps ONLY the text. That is right for a plain
@@ -4967,7 +5006,7 @@ fn build_activity(
         // sets and `Activity::custom` does not, and it is what flow
         // resolution reads; the `action` that comes with `custom` is a
         // tracing attribute and is read by nothing else.
-        Some(_) if payload.get("metadata").is_some() => {
+        Some(_) if payload.get("metadata").is_some() || forwarded_caller.is_some() => {
             Activity::custom("http.request", payload.clone()).with_flow_type("messaging")
         }
         Some(text) => Activity::text(text),

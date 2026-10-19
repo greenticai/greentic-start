@@ -211,7 +211,11 @@ worker reads its own secrets from the credentials staged for it, never from a to
         // message nor an answer, a bad conversation id, the limiter, a full
         // turn gate) ran nothing and records nothing.
         let started = std::time::Instant::now();
-        let outcome = self.ctx.runner.run(&session_hint, &user, &payload).await;
+        let outcome = self
+            .ctx
+            .runner
+            .run(&session_hint, &user, &payload, None)
+            .await;
         let elapsed = started.elapsed();
         if let Some(metering) = self.ctx.metering.as_ref() {
             let usage = outcome

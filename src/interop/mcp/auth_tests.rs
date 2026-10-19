@@ -25,6 +25,7 @@ fn config(issuer: Option<&str>) -> InteropConfig {
             id: "c1".into(),
             sha256: Sha256::digest(BEARER_TOKEN.as_bytes()).into(),
             expires_at_ms: None,
+            forwards_caller: false,
         }],
         tenant_slug: Some(TENANT.to_string()),
         issuer: issuer.map(str::to_string),

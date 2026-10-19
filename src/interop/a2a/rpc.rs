@@ -51,11 +51,17 @@ pub(crate) struct TurnFailure;
 #[async_trait]
 pub(crate) trait TurnRunner: Send + Sync {
     /// Run `payload` as one turn in conversation `session_hint`.
+    ///
+    /// `forwarded_caller` is a caller block this host has ALREADY validated
+    /// (see [`super::forwarded`]); the runner writes it to the turn's
+    /// `extensions.caller`. Anything else in `payload` claiming to be a caller
+    /// is stripped, as on every non-provider route.
     async fn run(
         &self,
         session_hint: &str,
         user: &str,
         payload: &Value,
+        forwarded_caller: Option<&Value>,
     ) -> Result<Vec<Activity>, TurnFailure>;
 }
 
@@ -210,9 +216,15 @@ enum SendError {
 async fn send_message(
     ctx: &A2aContext<'_>,
     caller: &Caller,
-    request: SendMessageRequest,
+    mut request: SendMessageRequest,
     runner: &dyn TurnRunner,
 ) -> Result<SendMessageResponse, SendError> {
+    // Removes `metadata.caller` from the request whatever the verdict: only the
+    // rebuilt, validated block (if any) goes on to the turn.
+    let forwarded = super::forwarded::accept(ctx.config, caller, &mut request.message.metadata);
+    if let Some(id) = caller.credential_id().filter(|_| forwarded.is_some()) {
+        ctx.trace.forwarded_via(&format!("router:{id}"));
+    }
     let wants_card = accepts_adaptive_card(&request);
     let payload = message_payload(&request.message)?;
     let context_id = match request.message.context_id.as_deref() {
@@ -237,7 +249,9 @@ async fn send_message(
     // refused ABOVE this line — a bad bearer, the limiter, invalid params, a
     // full turn gate — ran nothing and records nothing.
     let started = std::time::Instant::now();
-    let outcome = runner.run(&session_hint, &user, &payload).await;
+    let outcome = runner
+        .run(&session_hint, &user, &payload, forwarded.as_ref())
+        .await;
     let elapsed = started.elapsed();
     if let Some(metering) = ctx.metering.as_ref() {
         let usage = outcome

@@ -142,6 +142,7 @@ struct Recorded {
     route: Option<&'static str>,
     method: Option<&'static str>,
     credential_id: Option<String>,
+    forwarded_via: Option<String>,
     outcome: Option<Outcome>,
     task_state: Option<&'static str>,
     artifacts: Option<u64>,
@@ -207,6 +208,13 @@ impl RequestTrace {
     /// [`crate::ingress_auth`].
     pub(crate) fn credential(&self, credential_id: &str) {
         self.with(|recorded| recorded.credential_id = Some(credential_id.to_string()));
+    }
+
+    /// The router credential that forwarded a verified end-user caller this
+    /// turn ran with (`router:<credential id>`). Recorded only when a block was
+    /// ACCEPTED; a dropped one leaves no trace of its content.
+    pub(crate) fn forwarded_via(&self, via: &str) {
+        self.with(|recorded| recorded.forwarded_via = Some(via.to_string()));
     }
 
     /// Name how the request ended. FIRST call wins: the layer closest to the
@@ -277,6 +285,9 @@ impl RequestTrace {
         if let Some(credential_id) = recorded.credential_id.as_deref() {
             text("interop.credential_id", credential_id);
         }
+        if let Some(via) = recorded.forwarded_via.as_deref() {
+            text("interop.forwarded_via", via);
+        }
         text(
             "interop.outcome",
             recorded.outcome.map_or(UNRECORDED_OUTCOME, Outcome::as_str),
@@ -328,6 +339,7 @@ impl RequestTrace {
             interop.route = tracing::field::Empty,
             interop.method = tracing::field::Empty,
             interop.credential_id = tracing::field::Empty,
+            interop.forwarded_via = tracing::field::Empty,
             interop.outcome = tracing::field::Empty,
             interop.task_state = tracing::field::Empty,
             interop.artifacts = tracing::field::Empty,
