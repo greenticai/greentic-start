@@ -304,6 +304,7 @@ mod tests {
                     id: (*id).to_string(),
                     sha256: sha(token),
                     expires_at_ms: *expiry,
+                    forwards_caller: false,
                 })
                 .collect(),
             ..InteropConfig::default()

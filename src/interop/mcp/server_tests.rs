@@ -46,7 +46,10 @@ impl TurnRunner for FakeRunner {
         session_hint: &str,
         user: &str,
         payload: &Value,
+        forwarded_caller: Option<&Value>,
     ) -> Result<Vec<Activity>, TurnFailure> {
+        // MCP never forwards a caller.
+        assert!(forwarded_caller.is_none());
         if let Ok(mut calls) = self.calls.lock() {
             calls.push((session_hint.to_string(), user.to_string(), payload.clone()));
         }

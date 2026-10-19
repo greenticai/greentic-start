@@ -28,6 +28,7 @@ fn credential(id: &str, token: &str) -> Credential {
         id: id.into(),
         sha256: Sha256::digest(token.as_bytes()).into(),
         expires_at_ms: None,
+        forwards_caller: false,
     }
 }
 

@@ -23,6 +23,7 @@ fn config() -> InteropConfig {
             id: "c1".into(),
             sha256: Sha256::digest(TOKEN.as_bytes()).into(),
             expires_at_ms: None,
+            forwards_caller: false,
         }],
         ..InteropConfig::default()
     }

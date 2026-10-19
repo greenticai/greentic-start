@@ -52,8 +52,9 @@ message it received through the messaging path (verified caller block):
   while re-routing a parked conversation, and (c) a card-navigation key
   (`routeToCardId`, `toCardId`, `nextCardId`) in the inbound metadata, so a
   client cannot name a restricted node itself;
-* nothing is trusted from another hop: teams are read from this message's
-  caller block, never from a forwarded header.
+* nothing is trusted from an unflagged hop: teams are read from this message's
+  caller block, never from a forwarded header (see the next section for the one
+  hop that may forward a caller).
 
 Not covered: the router's assistant (the on-miss default flow), and a
 conversation already parked inside a target resumes without a new check.
@@ -76,3 +77,50 @@ conversation already parked inside a target resumes without a new check.
    `team_hint` advisory input for routing; the router does not read it yet.
 2. Source of the caller's team: `extensions.caller.team` (provider-verified).
    Confirm the providers (webchat OIDC, Teams, Slack) will fill it.
+
+## A router may forward the verified caller (`forwards_caller`)
+
+"The target never sees the caller's teams" holds for every hop EXCEPT a router
+whose credential is flagged `forwards_caller`. For that hop the target receives
+the identity the router's provider verified, and its own flow audience can be
+enforced against it.
+
+**Wire (sender: the `a2a` flow node with `forward_caller`).** In the A2A
+`SendMessage`, on both bindings (JSON-RPC `/a2a` and REST `/a2a/message:send`):
+
+```json
+"message": {"metadata": {"caller": {
+  "sub": "u-1", "iss": "https://idp", "teams": ["sales"], "groups": ["g"],
+  "role": "member", "user_verified": true }}}
+```
+
+**Opt-in (ingress document).** Each entry of `credentials[]` takes an optional
+`forwards_caller: bool` (default `false`; a document without the key behaves
+exactly as before). The flag is read from the entry of the credential the
+request AUTHENTICATED with, never from the request. If a credential id appears
+twice (rotation), every entry must carry the flag.
+
+**Acceptance (all required, else the block is silently dropped, a `warn` without
+the block's content is logged, and the turn runs as it always did):**
+
+1. the authenticated credential is a staged bearer flagged `forwards_caller`
+   (OAuth and anonymous callers never forward);
+2. the block has exactly the fields above (`iss`, `role`, `teams`, `groups`
+   optional), `user_verified` is the boolean `true`, `sub` is non-blank, it is at
+   most 4096 bytes of JSON, `teams`/`groups` at most 64 entries, every string at
+   most 256 characters with no control characters;
+3. the binding is A2A. MCP, `/workers/invoke` and the generic ingress never
+   accept one (and still strip any `extensions.caller` a body carries).
+
+`metadata.caller` is removed from the request unconditionally; an accepted block
+is REBUILT from the validated fields, gets `via: "router:<credential id>"`, and
+is written to the turn's `extensions.caller` — the key the runner's
+`caller_identity` reads. The session hint and the `a2a:<credential id>` user
+stay per credential, not per forwarded user. The request telemetry span carries
+`interop.forwarded_via` (the usage event already names the router credential in
+`credential_id`; its wire format is unchanged).
+
+**Not covered:** the A2A path itself runs no flow-audience gate (the gate lives
+on the provider route and in the router), so a forwarded `teams` list is made
+available to the runner and flows, not enforced by this host on this hop. Teams
+are forwarded as `teams`; this host does not also set the single `team` key.

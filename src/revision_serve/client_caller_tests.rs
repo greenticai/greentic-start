@@ -6,7 +6,7 @@ use greentic_runner_host::caller_identity::caller_block;
 use greentic_types::ChannelMessageEnvelope;
 use serde_json::{Value, json};
 
-use super::super::{build_activity, envelope_to_activity};
+use super::super::{build_activity, build_activity_with_caller, envelope_to_activity};
 use super::without_client_caller;
 
 /// What an attacker holding a unit's bearer (or sitting on loopback) posts.
@@ -288,12 +288,19 @@ fn every_runner_entry_is_fed_by_a_builder_that_decided_about_the_caller() {
     let serve = production_part(
         &std::fs::read_to_string(src.join("revision_serve.rs")).expect("revision_serve.rs"),
     );
+    // `build_activity` is a thin wrapper that forwards no caller; the body
+    // that strips and then (only for a host-validated block) writes one is
+    // `build_activity_with_caller`.
     assert!(
-        code_only(fn_body(&serve, "build_activity")).contains("without_client_caller("),
+        code_only(fn_body(&serve, "build_activity")).contains("build_activity_with_caller("),
+        "build_activity must delegate with no forwarded caller"
+    );
+    assert!(
+        code_only(fn_body(&serve, "build_activity_with_caller")).contains("without_client_caller("),
         "build_activity must strip a client-supplied caller"
     );
     assert!(
-        code_only(fn_body(&serve, "build_activity")).contains("strip_reserved_json("),
+        code_only(fn_body(&serve, "build_activity_with_caller")).contains("strip_reserved_json("),
         "build_activity must strip client-supplied artifact references and host notes"
     );
     assert!(
@@ -311,9 +318,51 @@ fn every_runner_entry_is_fed_by_a_builder_that_decided_about_the_caller() {
     for i in execute_turn_callers {
         let window = lines[i.saturating_sub(40)..i].join("\n");
         assert!(
-            window.contains("build_activity("),
+            window.contains("build_activity(") || window.contains("build_activity_with_caller("),
             "execute_turn at revision_serve.rs:{} is not fed by build_activity",
             i + 1
         );
     }
+}
+
+/// A forwarded caller the HOST validated replaces whatever the body claimed:
+/// the body's own block is stripped first, then the validated one is written.
+#[test]
+fn a_validated_forwarded_caller_replaces_a_forged_one() {
+    let validated = json!({
+        "sub": "u-1", "teams": ["sales"], "groups": [], "user_verified": true,
+        "via": "router:r1",
+    });
+    for (shape, body) in forged_bodies() {
+        let activity = build_activity_with_caller(
+            &body,
+            "acme",
+            Some("a2a:r1"),
+            Some("s1"),
+            None,
+            None,
+            Some(&validated),
+        );
+        assert_eq!(
+            caller_block(activity.payload()),
+            Some(&validated),
+            "{shape}: the validated block must be the only one"
+        );
+    }
+    // A text-only turn (what the A2A binding builds) keeps its text.
+    let activity = build_activity_with_caller(
+        &json!({ "text": "hi" }),
+        "acme",
+        None,
+        None,
+        None,
+        None,
+        Some(&validated),
+    );
+    assert_eq!(activity.payload()["text"], "hi");
+    assert_eq!(activity.flow_type(), Some("messaging"));
+    assert_eq!(caller_block(activity.payload()), Some(&validated));
+    // Without one, nothing is added.
+    let activity = build_activity(&json!({ "text": "hi" }), "acme", None, None, None, None);
+    assert!(caller_block(activity.payload()).is_none());
 }

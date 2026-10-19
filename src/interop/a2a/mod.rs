@@ -25,6 +25,7 @@
 //! whatever `contextId` they send.
 
 pub(crate) mod card;
+pub(crate) mod forwarded;
 pub(crate) mod rpc;
 pub(crate) mod types;
 
