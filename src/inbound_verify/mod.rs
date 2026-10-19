@@ -405,6 +405,9 @@ mod routing_tests;
 #[path = "secrets_error_tests.rs"]
 mod secrets_error_tests;
 #[cfg(test)]
+#[path = "secrets_slash_name_tests.rs"]
+mod secrets_slash_name_tests;
+#[cfg(test)]
 #[path = "secrets_tests.rs"]
 mod secrets_tests;
 #[cfg(test)]
