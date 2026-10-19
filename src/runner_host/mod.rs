@@ -474,8 +474,13 @@ pub(crate) fn secret_read_uris(
     };
     let raw_uri = format!("secrets://{env}/{tenant}/{team_segment}/{raw_provider}/{key}");
     let canonical_uri = crate::secrets_gate::canonical_secret_uri(env, tenant, team, provider, key);
-    if raw_uri == canonical_uri {
-        vec![raw_uri]
+    // A key that carries a `/` (`jev/api_key`) makes the raw URI six segments,
+    // a shape no dev store can hold. Asking for it is not a miss: the store
+    // refuses the path with a backend error, and a caller that walks these
+    // candidates stops on any error that is not `NotFound`, so the canonical
+    // spelling the key was staged under was never read.
+    if raw_uri == canonical_uri || key.contains('/') {
+        vec![canonical_uri]
     } else {
         vec![raw_uri, canonical_uri]
     }
