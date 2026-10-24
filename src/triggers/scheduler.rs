@@ -92,7 +92,7 @@ async fn tick(
 
 /// The revision the traffic split serves right now. No session hint, so the
 /// pick is the weighted one and writes no pin.
-async fn pick_revision(
+pub(super) async fn pick_revision(
     routing: &RevisionIngressRouting,
     env: &str,
     entry: &LoadedTrigger,

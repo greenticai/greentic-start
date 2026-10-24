@@ -110,6 +110,12 @@ impl TriggerTable {
             .filter(|e| matches!(e.spec.kind, TriggerKind::Cron(_)))
     }
 
+    pub(crate) fn email_entries(&self) -> impl Iterator<Item = &Arc<LoadedTrigger>> {
+        self.entries
+            .iter()
+            .filter(|e| matches!(e.spec.kind, TriggerKind::EmailImap(_)))
+    }
+
     /// The `triggers` block of `/status` (contract §7.2): what this host
     /// serves, so an operator — or the designer — can see which triggers
     /// started and where a webhook is mounted. Paths only, no host: the public
@@ -139,6 +145,13 @@ impl TriggerTable {
                         "timezone": c.timezone.name(),
                     }),
                     TriggerKind::Webhook(_) => serde_json::json!({ "routes": paths }),
+                    // Host, mailbox and cadence only: never the username's
+                    // secret reference or any search text.
+                    TriggerKind::EmailImap(m) => serde_json::json!({
+                        "host": m.host,
+                        "mailbox": m.mailbox,
+                        "poll_interval_s": m.poll_interval_s,
+                    }),
                 };
                 serde_json::json!({
                     "deployment_id": e.scope.deployment_id.to_string(),

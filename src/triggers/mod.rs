@@ -8,6 +8,8 @@
 //! - [`table`] — load it per revision; the table travels in
 //!   `RevisionIngressRouting` so a reload swaps it with everything else;
 //! - [`scheduler`] — the cron loop, one task for the server's life;
+//! - [`email`] + [`email_poller`] — the `email_imap` kind: spec parsing and the
+//!   mailbox polling loop (IMAP behind a trait);
 //! - [`webhook`] + [`verify`] — the `/trigger/<id>` route;
 //! - [`dispatch`] — firing → `IngressEnvelope` at the declared entry node;
 //! - [`store`] / [`limits`] — cross-replica claim, idempotency, budget,
@@ -16,6 +18,8 @@
 
 pub(crate) mod cron;
 pub(crate) mod dispatch;
+pub(crate) mod email;
+pub(crate) mod email_poller;
 pub(crate) mod field_ref;
 pub(crate) mod limits;
 pub(crate) mod scheduler;
