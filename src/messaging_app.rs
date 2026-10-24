@@ -176,6 +176,9 @@ fn resolve_from_bundle_yaml(bundle: &Path, packs_root: &Path) -> Option<PathBuf>
     None
 }
 
+/// Upper bound on a pack's decompressed `manifest.cbor`.
+const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
 pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
     let file = File::open(pack_path).with_context(|| format!("unable to open {pack_path:?}"))?;
     let mut archive = ZipArchive::new(file)?;
@@ -183,7 +186,14 @@ pub fn load_app_pack_info(pack_path: &Path) -> Result<AppPackInfo> {
         .by_name("manifest.cbor")
         .with_context(|| format!("pack {pack_path:?} missing manifest.cbor"))?;
     let mut buf = Vec::new();
-    manifest.read_to_end(&mut buf)?;
+    // Bound the read: a crafted pack's compressed manifest must not inflate
+    // without limit.
+    (&mut manifest)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut buf)?;
+    if buf.len() as u64 > MAX_MANIFEST_BYTES {
+        bail!("pack {pack_path:?} manifest.cbor exceeds {MAX_MANIFEST_BYTES} bytes");
+    }
     let value: CborValue = serde_cbor::from_slice(&buf)?;
     let pack_id = extract_text_or_symbol(&value, "pack_id", "pack_ids")
         .ok_or_else(|| anyhow::anyhow!("pack manifest missing pack id in {pack_path:?}"))?;
@@ -497,6 +507,15 @@ fn sign_authorize_url_state(
     Some(new_url)
 }
 
+fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Minimal `%XX`/`+` decode for a query value.
 fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
@@ -504,12 +523,14 @@ fn pct_decode(s: &str) -> String {
     let mut i = 0;
     while i < b.len() {
         match b[i] {
-            b'%' if i + 2 < b.len() => match u8::from_str_radix(&s[i + 1..i + 3], 16) {
-                Ok(v) => {
-                    out.push(v);
+            // Decode over bytes: `&s[i + 1..i + 3]` panics when the bytes after
+            // `%` split a multi-byte char.
+            b'%' if i + 2 < b.len() => match (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
+                (Some(hi), Some(lo)) => {
+                    out.push(hi << 4 | lo);
                     i += 3;
                 }
-                Err(_) => {
+                _ => {
                     out.push(b[i]);
                     i += 1;
                 }

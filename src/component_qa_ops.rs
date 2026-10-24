@@ -12,6 +12,9 @@ use greentic_types::cbor::canonical;
 use greentic_types::decode_pack_manifest;
 use greentic_types::schemas::component::v0_6_0::ComponentQaSpec;
 
+/// Upper bound on a pack's decompressed `manifest.cbor`.
+const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
 pub const APPLY_SECRETS_PATCH_KEY: &str = "__greentic_apply_secrets_patch";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -365,7 +368,18 @@ fn read_manifest_cbor_bytes(pack_path: &Path) -> anyhow::Result<Vec<u8>> {
         .by_name("manifest.cbor")
         .with_context(|| format!("manifest.cbor missing in {}", pack_path.display()))?;
     let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut manifest, &mut bytes)?;
+    // Bound the read: a crafted pack's compressed manifest must not inflate
+    // without limit.
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(&mut manifest, MAX_MANIFEST_BYTES + 1),
+        &mut bytes,
+    )?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        anyhow::bail!(
+            "manifest.cbor in {} exceeds {MAX_MANIFEST_BYTES} bytes",
+            pack_path.display()
+        );
+    }
     Ok(bytes)
 }
 

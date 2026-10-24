@@ -25,9 +25,9 @@ pub fn pack_config_overrides_as_json(
         .get(&deployment_id)
         .and_then(|by_pack| by_pack.get(pack_id))
         .filter(|cfg| !cfg.is_empty())
-        .map(|cfg| {
-            serde_json::to_value(cfg).expect("BTreeMap<String, JsonValue> serializes infallibly")
-        })
+        // A `BTreeMap<String, JsonValue>` always serializes; `.ok()` keeps the
+        // "no config" fallback instead of panicking in production code.
+        .and_then(|cfg| serde_json::to_value(cfg).ok())
 }
 
 pub fn build_render_plan_input(message: JsonValue) -> RenderPlanInV1 {
