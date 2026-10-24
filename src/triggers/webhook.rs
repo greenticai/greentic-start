@@ -163,6 +163,7 @@ where
         body: body_json.as_ref(),
     };
 
+    let mut claimed_key: Option<String> = None;
     if let Some(idem) = &spec.idempotency {
         match idem.key.resolve(&view) {
             Some(delivery_key) => {
@@ -174,7 +175,7 @@ where
                     &delivery_key,
                 );
                 match store.claim(&key, Duration::from_secs(idem.ttl_s)).await {
-                    Ok(true) => {}
+                    Ok(true) => claimed_key = Some(key),
                     Ok(false) => {
                         telemetry::record(&loaded, "deduplicated", "idempotency");
                         return status(StatusCode::OK);
@@ -202,11 +203,15 @@ where
         }
     }
 
+    // A refused delivery (429) must not stay claimed: the sender's retry
+    // would be answered 200 as a duplicate and the event lost.
     if !limits::within_budget(store, env, &loaded).await {
+        release_claim(store, claimed_key.as_deref()).await;
         telemetry::record(&loaded, "skipped", "budget");
         return too_many();
     }
     let Some(permit) = limits::try_acquire(&loaded) else {
+        release_claim(store, claimed_key.as_deref()).await;
         telemetry::record(&loaded, "skipped", "overlap");
         return too_many();
     };
@@ -228,6 +233,17 @@ where
     // (Meta included) retry or disable a subscription that answers slowly.
     host.spawn_fire(loaded, firing, permit);
     status(StatusCode::OK)
+}
+
+async fn release_claim(store: &dyn TriggerStore, key: Option<&str>) {
+    if let Some(key) = key
+        && let Err(err) = store.release(key).await
+    {
+        crate::operator_log::warn(
+            module_path!(),
+            format!("trigger idempotency claim could not be released ({err:#})"),
+        );
+    }
 }
 
 /// The declaration of the revision the traffic split picks. `None` when no

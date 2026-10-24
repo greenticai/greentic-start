@@ -488,3 +488,34 @@ fn an_absent_or_empty_query_is_empty() {
     assert!(parse_query(None).is_empty());
     assert!(parse_query(Some("")).is_empty());
 }
+
+#[tokio::test]
+async fn a_delivery_refused_with_429_can_be_retried_and_is_not_deduplicated() {
+    let mut doc = generic();
+    doc["triggers"][0]["limits"]["max_concurrency"] = json!(1);
+    let (host, store, t) = (
+        FakeHost::with_secrets(),
+        InMemoryTriggerStore::default(),
+        loaded_from(&doc),
+    );
+    let auth = "Bearer orders-ingest-key";
+    let body = br#"{"order":{"customer_id":"c-9"}}"#;
+    let send = |id: &'static str| {
+        request(
+            "POST",
+            "/t",
+            &[("Authorization", auth), ("X-Request-Id", id)],
+            body,
+        )
+    };
+    let first = run(&host, &store, &t, send("req-1")).await;
+    assert_eq!(first.status(), StatusCode::OK);
+    // The fake holds the first permit, so the second delivery is refused.
+    let refused = run(&host, &store, &t, send("req-2")).await;
+    assert_eq!(refused.status(), StatusCode::TOO_MANY_REQUESTS);
+    // The sender's retry must be refused again (429), not swallowed as a
+    // duplicate (200) whose event would be lost.
+    let retry = run(&host, &store, &t, send("req-2")).await;
+    assert_eq!(retry.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(host.fired().len(), 1);
+}

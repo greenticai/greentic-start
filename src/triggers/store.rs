@@ -35,6 +35,12 @@ pub(crate) trait TriggerStore: Send + Sync + std::fmt::Debug {
     async fn claim(&self, key: &str, ttl: Duration) -> Result<bool>;
     /// Increment `key`, starting its `ttl` on first use. Returns the new value.
     async fn incr(&self, key: &str, ttl: Duration) -> Result<u64>;
+    /// Give back a claim that was not acted on (the delivery was refused
+    /// with a retryable status), so the sender's retry is not deduplicated
+    /// away. Default: keep the claim.
+    async fn release(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Namespaced key: `gt:trig:<kind>:<env>:<deployment>:<trigger>:<part>`. The
@@ -155,6 +161,17 @@ impl TriggerStore for RedisTriggerStore {
             .context("redis INCR failed")?;
         Ok(value)
     }
+
+    async fn release(&self, key: &str) -> Result<()> {
+        let mut conn = self.conn.clone();
+        let mut cmd = redis::cmd("DEL");
+        cmd.arg(key);
+        let _: u64 = tokio::time::timeout(REDIS_OP_TIMEOUT, cmd.query_async(&mut conn))
+            .await
+            .context("redis DEL timed out")?
+            .context("redis DEL failed")?;
+        Ok(())
+    }
 }
 
 /// Single-process store. Expired entries are dropped lazily on access and
@@ -203,6 +220,13 @@ impl TriggerStore for InMemoryTriggerStore {
             entry.0
         }))
     }
+
+    async fn release(&self, key: &str) -> Result<()> {
+        self.with_live(|map, _| {
+            map.remove(key);
+        });
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -215,6 +239,14 @@ mod tests {
         assert!(store.claim("k", Duration::from_secs(60)).await.unwrap());
         assert!(!store.claim("k", Duration::from_secs(60)).await.unwrap());
         assert!(store.claim("other", Duration::from_secs(60)).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_released_claim_can_be_taken_again() {
+        let store = InMemoryTriggerStore::default();
+        assert!(store.claim("k", Duration::from_secs(60)).await.unwrap());
+        store.release("k").await.unwrap();
+        assert!(store.claim("k", Duration::from_secs(60)).await.unwrap());
     }
 
     #[tokio::test]

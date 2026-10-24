@@ -107,14 +107,29 @@ impl RedisNotifier {
         let self_id = Uuid::new_v4();
 
         crate::redis_tls::ensure_crypto_provider_for(url); // rustls provider for rediss://
-        let client = Client::open(url).with_context(|| format!("invalid redis url: {url}"))?;
+        let client = Client::open(url).with_context(|| {
+            format!(
+                "invalid redis url: {}",
+                crate::revision_pin::redact_redis_url(url)
+            )
+        })?;
 
         // Open the PUB connection (ConnectionManager auto-reconnects on use).
         let pub_conn =
             tokio::time::timeout(BOOT_CONNECT_TIMEOUT, ConnectionManager::new(client.clone()))
                 .await
-                .with_context(|| format!("timed out opening redis PUB connection to {url}"))?
-                .with_context(|| format!("failed to open redis PUB connection to {url}"))?;
+                .with_context(|| {
+                    format!(
+                        "timed out opening redis PUB connection to {}",
+                        crate::revision_pin::redact_redis_url(url)
+                    )
+                })?
+                .with_context(|| {
+                    format!(
+                        "failed to open redis PUB connection to {}",
+                        crate::revision_pin::redact_redis_url(url)
+                    )
+                })?;
 
         // Verify SUB connectivity once at boot by opening and immediately
         // dropping a probe connection.
@@ -122,8 +137,18 @@ impl RedisNotifier {
             let probe =
                 tokio::time::timeout(BOOT_CONNECT_TIMEOUT, subscribe_once(&client, &channel))
                     .await
-                    .with_context(|| format!("timed out opening redis SUB connection to {url}"))?
-                    .with_context(|| format!("failed to open redis SUB connection to {url}"))?;
+                    .with_context(|| {
+                        format!(
+                            "timed out opening redis SUB connection to {}",
+                            crate::revision_pin::redact_redis_url(url)
+                        )
+                    })?
+                    .with_context(|| {
+                        format!(
+                            "failed to open redis SUB connection to {}",
+                            crate::revision_pin::redact_redis_url(url)
+                        )
+                    })?;
             drop(probe);
         }
 
@@ -228,7 +253,7 @@ async fn background_sub_loop(
                         "redis_reconnect_fail"
                     );
                     *sub_state.write().await = SubState::Reconnecting {
-                        attempt: attempt + 1,
+                        attempt: attempt.saturating_add(1),
                     };
                     tokio::time::sleep(backoff_with_jitter(attempt)).await;
                 }

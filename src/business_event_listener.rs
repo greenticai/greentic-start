@@ -107,11 +107,10 @@ pub fn convert(subject: &str, body: &[u8]) -> Option<(OperatorContext, EventEnve
         .as_ref()
         .map(|t| t.as_str().to_string());
 
-    // Cross-check the subject's `<tenant>` segment against the decoded
-    // envelope's tenant. The envelope's tenant always wins (it's the
-    // authoritative, signed-off value); a mismatch only ever produces a
-    // warning — it's a signal of a misconfigured publisher, never a reason
-    // to drop the message.
+    // The subject's `<tenant>` segment is the authenticated one (NATS
+    // per-tenant publish authorization); the envelope body is unsigned.
+    // A mismatch is a cross-tenant spoof attempt (or a broken publisher):
+    // drop the message rather than route it under the envelope's tenant.
     if let Some(subject_tenant) = tenant_from_subject(subject)
         && subject_tenant != tenant
     {
@@ -119,9 +118,10 @@ pub fn convert(subject: &str, body: &[u8]) -> Option<(OperatorContext, EventEnve
             module_path!(),
             format!(
                 "business event subject tenant '{subject_tenant}' does not match \
-                 envelope tenant '{tenant}'; routing with the envelope tenant"
+                 envelope tenant '{tenant}'; dropping message"
             ),
         );
+        return None;
     }
 
     let ctx = OperatorContext {
@@ -324,7 +324,8 @@ async fn run_listener_loop(
                 module_path!(),
                 format!(
                     "business event listener failed to connect to {}: {err}",
-                    config.nats_url
+                    // The URL can carry `user:pass@` inline credentials.
+                    crate::revision_pin::redact_redis_url(&config.nats_url)
                 ),
             );
             return;
@@ -517,15 +518,12 @@ mod tests {
     }
 
     #[test]
-    fn convert_prefers_envelope_tenant_over_mismatched_subject_tenant() {
+    fn convert_rejects_mismatched_subject_tenant() {
         let env = sample_envelope();
         let body = serde_json::to_vec(&env).expect("serialize envelope");
 
-        // Subject says "t2", envelope says "t1" — the envelope must win.
-        let (ctx, ev) = convert("greentic.events.t2.sorla.pack.order.created", &body)
-            .expect("convert should succeed despite the tenant mismatch");
-        assert_eq!(ctx.tenant, "t1");
-        assert_eq!(ev.scope.tenant, "t1");
+        // Subject says "t2", envelope says "t1" — spoof risk, must be dropped.
+        assert!(convert("greentic.events.t2.sorla.pack.order.created", &body).is_none());
     }
 
     #[test]

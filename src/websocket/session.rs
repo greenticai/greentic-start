@@ -73,20 +73,30 @@ impl SessionManager {
             .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
             .clone();
 
-        if tenant_counter.load(Ordering::SeqCst) >= self.limits.max_concurrent_per_tenant {
+        // Reserve atomically: a load-then-add pair lets concurrent upgrades
+        // all pass the check and overshoot the limit.
+        if !try_reserve(&tenant_counter, self.limits.max_concurrent_per_tenant) {
             return Err(SessionError::TenantLimit(tenant_id.to_string()));
         }
-        if conv_counter.load(Ordering::SeqCst) >= self.limits.max_per_conversation {
+        if !try_reserve(&conv_counter, self.limits.max_per_conversation) {
+            tenant_counter.fetch_sub(1, Ordering::SeqCst);
             return Err(SessionError::ConversationLimit(conversation_id.to_string()));
         }
 
-        tenant_counter.fetch_add(1, Ordering::SeqCst);
-        conv_counter.fetch_add(1, Ordering::SeqCst);
         Ok(SessionGuard {
             tenant_counter,
             conv_counter,
         })
     }
+}
+
+/// Add one to `counter` unless it is already at `limit`.
+fn try_reserve(counter: &AtomicUsize, limit: usize) -> bool {
+    counter
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+            (current < limit).then_some(current + 1)
+        })
+        .is_ok()
 }
 
 #[derive(Debug)]
@@ -138,5 +148,50 @@ mod tests {
         let _g1 = mgr.acquire("t1", "c1").unwrap();
         let err = mgr.acquire("t1", "c1").unwrap_err();
         assert!(matches!(err, SessionError::ConversationLimit(_)));
+    }
+
+    #[test]
+    fn try_reserve_stops_at_the_limit() {
+        let counter = AtomicUsize::new(0);
+        assert!(try_reserve(&counter, 2));
+        assert!(try_reserve(&counter, 2));
+        assert!(!try_reserve(&counter, 2));
+        assert_eq!(counter.load(Ordering::SeqCst), 2);
+        assert!(!try_reserve(&AtomicUsize::new(0), 0));
+    }
+
+    #[test]
+    fn conversation_limit_rejection_releases_the_tenant_slot() {
+        let mgr = SessionManager::new(limits(2, 1));
+        let _g1 = mgr.acquire("t1", "c1").unwrap();
+        assert!(matches!(
+            mgr.acquire("t1", "c1").unwrap_err(),
+            SessionError::ConversationLimit(_)
+        ));
+        let tenant = mgr.per_tenant.get("t1").unwrap().clone();
+        assert_eq!(tenant.load(Ordering::SeqCst), 1, "no leaked tenant slot");
+        // The freed slot is usable by another conversation.
+        let _g2 = mgr.acquire("t1", "c2").unwrap();
+    }
+
+    #[test]
+    fn concurrent_acquires_never_exceed_the_tenant_limit() {
+        let mgr = Arc::new(SessionManager::new(limits(3, 100)));
+        let barrier = Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let mgr = mgr.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    mgr.acquire("t1", &format!("c{i}")).ok()
+                })
+            })
+            .collect();
+        let guards: Vec<_> = handles
+            .into_iter()
+            .filter_map(|h| h.join().expect("thread"))
+            .collect();
+        assert_eq!(guards.len(), 3);
     }
 }

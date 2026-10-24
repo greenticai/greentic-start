@@ -97,15 +97,15 @@ pub fn update_webhooks_if_url_changed(
                 new_url
             ),
         );
+    } else {
+        operator_log::info(
+            module_path!(),
+            format!(
+                "[webhook-updater] public URL changed: {:?} → {}",
+                previous_url, new_url
+            ),
+        );
     }
-
-    operator_log::info(
-        module_path!(),
-        format!(
-            "[webhook-updater] public URL changed: {:?} → {}",
-            previous_url, new_url
-        ),
-    );
 
     // Filter messaging providers only
     let messaging_providers: Vec<&DetectedProvider> = discovery
@@ -490,7 +490,16 @@ pub(crate) fn build_provider_config(
     );
 
     // Load secret keys from pack manifest
-    let secret_keys = load_secret_keys_from_pack(pack_path).unwrap_or_default();
+    let secret_keys = load_secret_keys_from_pack(pack_path).unwrap_or_else(|err| {
+        operator_log::warn(
+            module_path!(),
+            format!(
+                "[webhook-updater] provider={provider_id} could not read secret requirements from {}: {err:#}; webhook config will carry no secrets",
+                pack_path.display()
+            ),
+        );
+        Default::default()
+    });
 
     if secret_keys.is_empty() {
         return Ok(Value::Object(config));

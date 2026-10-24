@@ -34,6 +34,10 @@ pub(crate) fn verify_hmac(
     prefix: &str,
     encoding: &SignatureEncoding,
 ) -> Result<(), VerifyError> {
+    // An empty key is a valid HMAC key anyone can sign with: never verify with it.
+    if secret.is_empty() {
+        return Err(VerifyError::Mismatch);
+    }
     let header_value = header_value.ok_or(VerifyError::MissingHeader)?.trim();
     let presented = header_value
         .strip_prefix(prefix)
@@ -74,6 +78,9 @@ pub(crate) fn verify_bearer(
     secret: &[u8],
     header_value: Option<&str>,
 ) -> Result<(), VerifyError> {
+    if secret.is_empty() {
+        return Err(VerifyError::Mismatch);
+    }
     let raw = header_value.ok_or(VerifyError::MissingHeader)?.trim();
     let presented = if header.eq_ignore_ascii_case("authorization") {
         raw.strip_prefix("Bearer ")
@@ -116,7 +123,7 @@ pub(crate) fn meta_hub_challenge(
     let (Some(token), Some(challenge)) = (get("hub.verify_token"), get("hub.challenge")) else {
         return ChallengeOutcome::Forbidden;
     };
-    if bool::from(token.as_bytes().ct_eq(verify_token)) {
+    if !verify_token.is_empty() && bool::from(token.as_bytes().ct_eq(verify_token)) {
         ChallengeOutcome::Echo(challenge.to_string())
     } else {
         ChallengeOutcome::Forbidden
@@ -243,6 +250,26 @@ mod tests {
         assert_eq!(
             verify_bearer("X-Api-Key", b"tok", None),
             Err(VerifyError::MissingHeader)
+        );
+    }
+
+    #[test]
+    fn an_empty_secret_never_verifies() {
+        let sig = sign(b"", b"{}");
+        assert_eq!(
+            verify_hmac(
+                &HmacAlgo::Sha256,
+                b"",
+                b"{}",
+                Some(&format!("sha256={sig}")),
+                "sha256=",
+                &SignatureEncoding::Hex
+            ),
+            Err(VerifyError::Mismatch)
+        );
+        assert_eq!(
+            verify_bearer("X-Api-Key", b"", Some("")),
+            Err(VerifyError::Mismatch)
         );
     }
 

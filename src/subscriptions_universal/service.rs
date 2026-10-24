@@ -73,6 +73,11 @@ impl<R: ProviderRunner> SubscriptionService<R> {
         }
     }
 
+    /// True when `state` belongs to the tenant/team this service is bound to.
+    pub fn owns_state(&self, state: &SubscriptionState) -> bool {
+        state.tenant == self.context.tenant && state.team == self.context.team
+    }
+
     pub fn ensure_once(
         &self,
         provider: &str,
