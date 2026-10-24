@@ -185,6 +185,13 @@ type RefreshLock = Arc<tokio::sync::Mutex<Option<std::time::Instant>>>;
 /// How long a failed refresh suppresses further attempts for the same key.
 const REFRESH_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// True while a refresh that failed at `last_failure` is still inside the
+/// backoff window at `now`.
+fn refresh_suppressed(last_failure: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_failure
+        .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < REFRESH_FAILURE_BACKOFF)
+}
+
 impl RefreshingResolver {
     pub fn new(inner: DynSecretsManager) -> Self {
         Self {
@@ -262,9 +269,7 @@ impl RefreshingResolver {
             return Some(tok.clone());
         }
 
-        if let Some(failed_at) = *last_failure
-            && failed_at.elapsed() < REFRESH_FAILURE_BACKOFF
-        {
+        if refresh_suppressed(*last_failure, std::time::Instant::now()) {
             crate::operator_log::warn(
                 module_path!(),
                 format!(
@@ -479,6 +484,29 @@ mod tests {
     use super::*;
     use greentic_secrets_lib::SecretError;
     use std::sync::Mutex;
+
+    #[test]
+    fn refresh_is_not_suppressed_without_a_recorded_failure() {
+        assert!(!refresh_suppressed(None, std::time::Instant::now()));
+    }
+
+    #[test]
+    fn refresh_is_suppressed_inside_the_backoff_window() {
+        let failed_at = std::time::Instant::now();
+        let just_before_end =
+            failed_at + REFRESH_FAILURE_BACKOFF - std::time::Duration::from_secs(1);
+        assert!(refresh_suppressed(Some(failed_at), failed_at));
+        assert!(refresh_suppressed(Some(failed_at), just_before_end));
+    }
+
+    #[test]
+    fn refresh_is_retried_once_the_backoff_window_has_passed() {
+        let failed_at = std::time::Instant::now();
+        assert!(!refresh_suppressed(
+            Some(failed_at),
+            failed_at + REFRESH_FAILURE_BACKOFF
+        ));
+    }
 
     #[test]
     fn parses_oauth2_access_token_key() {
