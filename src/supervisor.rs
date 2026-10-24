@@ -180,13 +180,9 @@ pub fn read_status(paths: &RuntimePaths) -> anyhow::Result<Vec<ServiceStatus>> {
         let id = ServiceId::new(stem.to_string())?;
         let pid = read_pid(&path)?;
         let running = pid.map(is_running).unwrap_or(false);
-        let log_path = if let Some(resolved) = read_resolved(paths, &id)? {
-            resolved
-                .log_path
-                .or_else(|| Some(paths.log_path(stem)))
-                .unwrap()
-        } else {
-            paths.log_path(stem)
+        let log_path = match read_resolved(paths, &id)? {
+            Some(resolved) => resolved.log_path.unwrap_or_else(|| paths.log_path(stem)),
+            None => paths.log_path(stem),
         };
         statuses.push(ServiceStatus {
             id,
@@ -228,7 +224,14 @@ fn read_pid(pid_path: &Path) -> anyhow::Result<Option<u32>> {
 fn terminate_process(pid: u32, graceful_timeout_ms: u64) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
-        let _ = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+        // A pidfile is untrusted input: `0`, or a value above i32::MAX, would
+        // wrap to a non-positive pid and signal a whole process group (or every
+        // process we may signal for -1).
+        let raw_pid = match i32::try_from(pid) {
+            Ok(value) if value > 0 => value,
+            _ => return Err(anyhow::anyhow!("refusing to signal invalid pid {pid}")),
+        };
+        let _ = unsafe { libc::kill(raw_pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_millis(graceful_timeout_ms);
         while Instant::now() < deadline {
             if !is_running(pid) {
@@ -236,7 +239,7 @@ fn terminate_process(pid: u32, graceful_timeout_ms: u64) -> anyhow::Result<()> {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        let _ = unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        let _ = unsafe { libc::kill(raw_pid, libc::SIGKILL) };
         Ok(())
     }
 

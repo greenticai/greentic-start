@@ -206,9 +206,7 @@ pub(crate) fn start_env_tunnel(
     let (service, explicit_binary) = match choice {
         TunnelChoice::Cloudflared => ("cloudflared", request.cloudflared_binary.clone()),
         TunnelChoice::Ngrok => ("ngrok", request.ngrok_binary.clone()),
-        TunnelChoice::Off | TunnelChoice::Gtunnel => {
-            unreachable!("Off and Gtunnel handled above")
-        }
+        TunnelChoice::Off | TunnelChoice::Gtunnel => return Ok(None),
     };
     let binary = bin_resolver::resolve_binary(
         service,
@@ -219,9 +217,7 @@ pub(crate) fn start_env_tunnel(
     )?;
     let restart_service = crate::runtime::should_restart(&restart, service);
     let url = match choice {
-        TunnelChoice::Off | TunnelChoice::Gtunnel => {
-            unreachable!("Off and Gtunnel handled above")
-        }
+        TunnelChoice::Off | TunnelChoice::Gtunnel => return Ok(None),
         TunnelChoice::Cloudflared => {
             // Logs live under the shared tunnel record, not this env's log
             // dir — the tunnel is machine-wide and may outlive this boot.

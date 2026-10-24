@@ -138,7 +138,12 @@ async fn connect_once(config: &AgentConfig, client: &reqwest::blocking::Client) 
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if watchdog_seen.lock().expect("last_seen lock").elapsed() > STALE_AFTER {
+            if watchdog_seen
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .elapsed()
+                > STALE_AFTER
+            {
                 return;
             }
         }
@@ -194,7 +199,9 @@ where
 
     while let Some(msg) = read.next().await {
         // Any frame (request or heartbeat pong) proves the socket is alive.
-        *last_seen.lock().expect("last_seen lock") = Instant::now();
+        *last_seen
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Instant::now();
         let text = match msg.context("read frame")? {
             Message::Text(t) => t.as_str().to_owned(),
             Message::Close(_) => break,

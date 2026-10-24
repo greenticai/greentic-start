@@ -176,12 +176,8 @@ fn parse_api_response(body: &str) -> Option<String> {
     let tail = &body[start..];
     let end = tail.find('"')?;
     let url = &body[start..start + end];
-    if is_ngrok_url(url) {
-        Some(url.to_string())
-    } else {
-        // Accept any https URL from ngrok API (could be custom domain)
-        Some(url.to_string())
-    }
+    // Accept any https URL from the ngrok API (could be a custom domain).
+    Some(url.to_string())
 }
 
 fn find_url_in_text(contents: &str) -> Option<String> {
@@ -239,9 +235,12 @@ fn kill_orphaned_ngrok() {
     // ngrok is running but not tracked - kill it
     #[cfg(unix)]
     {
-        // Try pkill first (more reliable)
+        // Exact process name, current user only: never another user's ngrok
+        // and never a process that merely has "ngrok" in its command line.
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() }.to_string();
         let _ = std::process::Command::new("pkill")
-            .args(["-9", "ngrok"])
+            .args(["-9", "-x", "-U", uid.as_str(), "ngrok"])
             .status();
         // Wait a bit for the process to die
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -256,9 +255,16 @@ fn kill_orphaned_ngrok() {
     }
 }
 
-/// Stop ngrok process - can be used for shutdown without pidfile.
-pub fn stop_ngrok() {
-    kill_orphaned_ngrok();
+/// Stop the ngrok this runtime recorded in its pidfile. A hand-started ngrok
+/// (no pidfile) is deliberately left alone.
+pub fn stop_ngrok(paths: &RuntimePaths) {
+    let pid_path = paths.pid_path(SERVICE_ID);
+    if let Err(err) = supervisor::stop_pidfile(&pid_path, 2_000) {
+        eprintln!(
+            "warning: failed to stop ngrok via {}: {err:#}",
+            pid_path.display()
+        );
+    }
 }
 
 fn read_pid(path: &Path) -> anyhow::Result<Option<u32>> {

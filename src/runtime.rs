@@ -1061,19 +1061,42 @@ pub fn demo_up_services(
         match sql_gateway_result {
             Ok((gateway, port)) => {
                 let gateway_app = greentic_runner_host::sql::routes::router(gateway);
-                tokio::spawn(async move {
-                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                        Ok(listener) => {
-                            tracing::info!("sql gateway listening on 127.0.0.1:{port}");
-                            if let Err(serve_error) = axum::serve(listener, gateway_app).await {
-                                tracing::error!("sql gateway server error: {serve_error}");
+                // This path is synchronous (no ambient runtime), so a bare
+                // `tokio::spawn` would panic and a task on the temporary
+                // runtime above would die with it. Serve from a dedicated
+                // thread that owns its own runtime for the process lifetime.
+                thread::Builder::new()
+                    .name("sql-gateway".to_string())
+                    .spawn(move || {
+                        let runtime = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(runtime) => runtime,
+                            Err(err) => {
+                                tracing::error!("sql gateway runtime: {err}");
+                                return;
                             }
-                        }
-                        Err(bind_error) => {
-                            tracing::error!("sql gateway bind 127.0.0.1:{port}: {bind_error}");
-                        }
-                    }
-                });
+                        };
+                        runtime.block_on(async move {
+                            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                                Ok(listener) => {
+                                    tracing::info!("sql gateway listening on 127.0.0.1:{port}");
+                                    if let Err(serve_error) =
+                                        axum::serve(listener, gateway_app).await
+                                    {
+                                        tracing::error!("sql gateway server error: {serve_error}");
+                                    }
+                                }
+                                Err(bind_error) => {
+                                    tracing::error!(
+                                        "sql gateway bind 127.0.0.1:{port}: {bind_error}"
+                                    );
+                                }
+                            }
+                        });
+                    })
+                    .context("failed to spawn sql gateway thread")?;
                 operator_log::info(
                     module_path!(),
                     format!("sql gateway started on 127.0.0.1:{SQL_GATEWAY_DEFAULT_PORT}"),
@@ -1946,10 +1969,9 @@ pub fn demo_down_runtime(
     let timeout_ms = 2_000;
     let paths = RuntimePaths::new(state_dir, tenant, team);
     stop_started_nats(&paths, state_dir)?;
-    // ngrok teardown is still name-based (shared-record treatment is
-    // cloudflared-only for now); cloudflared stops strictly via the shared
-    // pidfile records — tunnels we did not record are never touched.
-    ngrok::stop_ngrok();
+    // Both tunnels stop strictly via recorded pidfiles — processes we did not
+    // record are never touched.
+    ngrok::stop_ngrok(&paths);
     let _ = cloudflared::stop_shared_tunnels();
     // Remove cached tunnel URL so a fresh URL is discovered on next start.
     cloudflared::cleanup_url_file(&paths);
