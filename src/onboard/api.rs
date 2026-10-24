@@ -74,7 +74,12 @@ where
             std::thread::scope(|s| {
                 s.spawn(|| wizard::submit_answers(&state, &body))
                     .join()
-                    .expect("submit thread panicked")
+                    .unwrap_or_else(|_| {
+                        Err(into_error(error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "submit worker thread panicked",
+                        )))
+                    })
             })
         }
         (Method::POST, "/tenants/create") => {
@@ -92,23 +97,34 @@ where
     }
 }
 
+/// Upper bound on an onboarding JSON request body.
+const MAX_ONBOARD_BODY_BYTES: usize = 1024 * 1024;
+
 /// Read and parse a JSON body from the request.
 async fn read_json_body<B>(req: Request<B>) -> OnboardResult<Value>
 where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    let payload_bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .map_err(|err| {
+    let mut body = req.into_body();
+    let mut payload_bytes: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| {
             into_error(error_response(
                 StatusCode::BAD_REQUEST,
                 format!("read body: {err}"),
             ))
         })?;
+        if let Ok(data) = frame.into_data() {
+            if payload_bytes.len().saturating_add(data.len()) > MAX_ONBOARD_BODY_BYTES {
+                return Err(into_error(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body too large".to_string(),
+                )));
+            }
+            payload_bytes.extend_from_slice(&data);
+        }
+    }
 
     if payload_bytes.is_empty() {
         return Ok(json!({}));

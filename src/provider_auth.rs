@@ -137,6 +137,10 @@ pub(crate) async fn authenticate_provider_webhook(
             // failures).
             continue;
         };
+        // An empty stored secret must never authenticate an empty header.
+        if value.is_empty() {
+            continue;
+        }
         if header_bytes.ct_eq(&value).into() {
             return Ok(AuthOutcome::Authenticated((*eid).to_string()));
         }

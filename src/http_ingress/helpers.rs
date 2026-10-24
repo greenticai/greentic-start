@@ -22,7 +22,10 @@ fn url_decode(s: &str) -> String {
     while i < bytes.len() {
         match bytes[i] {
             b'%' if i + 2 < bytes.len() => {
-                if let Ok(b) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+                // Byte-wise: slicing the `str` here could split a multi-byte
+                // character and panic on attacker-controlled input.
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                if let Some(b) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
                     out.push(b);
                     i += 3;
                 } else {
@@ -165,17 +168,36 @@ pub(super) async fn handle_oauth_callback(
     if let Err(err) = manager.write(&key, tokens.access_token.as_bytes()).await {
         return oauth_callback_page(false, &format!("Failed to persist token: {err}"));
     }
-    if let Some(rt) = tokens.refresh_token.as_deref() {
-        let _ = manager
+    if let Some(rt) = tokens.refresh_token.as_deref()
+        && let Err(err) = manager
             .write(&key_uri("refresh_token"), rt.as_bytes())
-            .await;
+            .await
+    {
+        crate::operator_log::warn(
+            module_path!(),
+            format!(
+                "[oauth-callback] failed to persist refresh token for {}: {err}",
+                ctx.provider
+            ),
+        );
     }
     // Persist absolute expiry so the runtime can refresh-on-read before it lapses.
     if let Some(secs) = tokens.expires_in {
-        let exp = chrono::Utc::now().timestamp() + secs as i64;
-        let _ = manager
+        let exp = chrono::Utc::now()
+            .timestamp()
+            .saturating_add(i64::try_from(secs).unwrap_or(i64::MAX));
+        if let Err(err) = manager
             .write(&key_uri("expires_at"), exp.to_string().as_bytes())
-            .await;
+            .await
+        {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-callback] failed to persist token expiry for {}: {err}",
+                    ctx.provider
+                ),
+            );
+        }
     }
     crate::operator_log::info(
         module_path!(),
@@ -192,12 +214,29 @@ pub(super) async fn handle_oauth_callback(
     oauth_callback_page(true, "Signed in. Return to the chat and ask again.")
 }
 
+/// Escape text for an HTML body; messages can embed provider-supplied errors.
+fn html_escape(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn oauth_callback_page(ok: bool, msg: &str) -> Response<Full<Bytes>> {
+    let escaped = html_escape(msg);
     let title = if ok { "Connected" } else { "Sign-in failed" };
     let html = format!(
         "<!doctype html><html><head><meta charset=utf-8><title>{title}</title></head>\
          <body style=\"font-family:system-ui;max-width:32rem;margin:4rem auto;text-align:center\">\
-         <h2>{title}</h2><p>{msg}</p><p>You can close this tab.</p></body></html>"
+         <h2>{title}</h2><p>{escaped}</p><p>You can close this tab.</p></body></html>"
     );
     Response::builder()
         .status(if ok {
@@ -208,4 +247,24 @@ fn oauth_callback_page(ok: bool, msg: &str) -> Response<Full<Bytes>> {
         .header("Content-Type", "text/html; charset=utf-8")
         .body(Full::new(Bytes::from(html)))
         .unwrap_or_else(|_| Response::new(Full::new(Bytes::from(msg.to_string()))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn url_decode_survives_multibyte_after_percent() {
+        assert_eq!(url_decode("%41%zz+b"), "A%zz b");
+        // `%a` followed by a two-byte character must not panic.
+        assert_eq!(url_decode("%a\u{e9}x"), "%a\u{e9}x");
+    }
+
+    #[test]
+    fn html_escape_neutralises_markup() {
+        assert_eq!(
+            html_escape("<b onload=\"x\">&'"),
+            "&lt;b onload=&quot;x&quot;&gt;&amp;&#39;"
+        );
+    }
 }

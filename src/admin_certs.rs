@@ -116,9 +116,29 @@ fn maybe_materialize_admin_certs_from_env(state_dir: &Path) -> anyhow::Result<Op
         .with_context(|| format!("failed to write {}", cert_dir.join("ca.crt").display()))?;
     fs::write(cert_dir.join("server.crt"), cert_pem)
         .with_context(|| format!("failed to write {}", cert_dir.join("server.crt").display()))?;
-    fs::write(cert_dir.join("server.key"), key_pem)
+    write_private_key(&cert_dir.join("server.key"), key_pem.as_bytes())
         .with_context(|| format!("failed to write {}", cert_dir.join("server.key").display()))?;
     Ok(Some(cert_dir))
+}
+
+/// Write the server private key readable by the owner only (0600 on unix),
+/// tightening the mode even when a previous file already existed.
+fn write_private_key(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(bytes)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

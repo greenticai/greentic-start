@@ -25,7 +25,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
-use http_body_util::{BodyExt, Full};
+use http_body_util::Full;
 use hyper::{
     Method, Request, Response, StatusCode,
     body::{Body, Bytes},
@@ -64,6 +64,9 @@ use helpers::{
     handle_oauth_token_exchange, parse_domain, parse_route_segments, with_cors,
 };
 use messaging::route_messaging_envelopes;
+
+use crate::http_helpers::read_body_capped;
+use crate::revision_serve::MAX_BODY_BYTES;
 
 const LEGACY_DIRECTLINE_COMPAT_ENV: &str = "GREENTIC_START_ENABLE_LEGACY_DIRECTLINE";
 
@@ -859,12 +862,7 @@ where
         .map(|value| value.to_string());
     let headers = collect_headers(req.headers());
     let queries = collect_queries(req.uri().query());
-    let payload_bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .unwrap_or_default();
+    let payload_bytes = read_body_capped(req.into_body(), MAX_BODY_BYTES).await?;
 
     let context = OperatorContext {
         tenant: parsed.tenant.clone(),
@@ -1533,12 +1531,7 @@ where
         augment_directline_queries(request.queries, request.tenant, Some(request.team));
     let provider_query_string = encode_directline_query_string(&provider_queries);
     let mut headers = collect_headers(req.headers());
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .unwrap_or_default();
+    let body = read_body_capped(req.into_body(), limits::UPLOAD_BODY_BYTES).await?;
     let ctx = OperatorContext {
         tenant: request.tenant.to_string(),
         team: Some(request.team.to_string()),
@@ -1809,12 +1802,9 @@ where
     // The caller's headers as received: the dedup key below hashes the bearer
     // the caller presented, before the session preflight may rewrite it.
     let caller_headers = headers.clone();
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes().to_vec())
-        .unwrap_or_default();
+    let body = read_body_capped(req.into_body(), limits::UPLOAD_BODY_BYTES)
+        .await?
+        .to_vec();
     let ctx = OperatorContext {
         tenant: request.tenant.to_string(),
         team: Some(request.team.to_string()),
@@ -2084,17 +2074,9 @@ where
     let method = req.method().clone();
     let headers = collect_headers(req.headers());
     let query = collect_queries(req.uri().query());
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes().to_vec())
-        .map_err(|err| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                format!("failed to read request body: {err}"),
-            )
-        })?;
+    let body = read_body_capped(req.into_body(), MAX_BODY_BYTES)
+        .await?
+        .to_vec();
     let ctx = OperatorContext {
         tenant: target.tenant.clone(),
         team: target.team.clone(),

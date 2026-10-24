@@ -269,6 +269,20 @@ fn a_bm25_flow_dispatch_stamps_the_flow_on_the_reply() {
 }
 
 #[test]
+fn a_node_dispatch_for_another_pack_is_not_routed() {
+    let info = pack(false);
+    let mut directive = dispatch("refund", Some("refund_card"), 0.9);
+    if let ControlDirective::Dispatch { target, .. } = &mut directive {
+        target.pack = "some-other-pack".into();
+    }
+    let routed = apply_dispatch(directive, &info, &forged_inbound(), RouteSource::Bm25);
+    assert!(
+        routed.is_err(),
+        "a node of another pack must not route here"
+    );
+}
+
+#[test]
 fn a_node_dispatch_stamps_the_node_and_enters_the_default_flow_there() {
     let dir = tempdir().expect("tempdir");
     let info = pack(false);

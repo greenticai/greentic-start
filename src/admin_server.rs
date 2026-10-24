@@ -62,6 +62,9 @@ pub struct AdminServer {
     handle: Option<thread::JoinHandle<Result<()>>>,
 }
 
+/// Upper bound on an admin request body; the body is buffered in memory.
+const MAX_ADMIN_BODY_BYTES: usize = 8 * 1024 * 1024;
+
 /// Default session TTL: 30 minutes.
 const SESSION_TTL_SECS: u64 = 1800;
 
@@ -152,8 +155,22 @@ impl AdminServer {
                                             return;
                                         }
 
+                                        // Re-check the allowlist per request so a client
+                                        // removed via /admin/v1/admins/remove loses access
+                                        // on its open keep-alive connection too.
                                         let service = service_fn(move |req| {
-                                            handle_admin_request(req, conn_state.clone())
+                                            let state = conn_state.clone();
+                                            let client_cn = client_cn.clone();
+                                            async move {
+                                                let allowed = state.allowed_clients.read().await.clone();
+                                                if !check_client_allowed(&allowed, client_cn.as_deref()) {
+                                                    return Ok(json_response(
+                                                        StatusCode::FORBIDDEN,
+                                                        json!(AdminResponse::<()>::err("client not allowed")),
+                                                    ));
+                                                }
+                                                handle_admin_request(req, state).await
+                                            }
                                         });
                                         let http = Http1Builder::new();
                                         let io = TokioIo::new(tls_stream);
@@ -274,6 +291,29 @@ fn extract_client_cn(server_conn: &rustls::ServerConnection) -> Option<String> {
     extract_cn_from_der(cert.as_ref())
 }
 
+/// Parse a DER length at `pos`. Supports short form and long form with up to
+/// two length octets (0x81, 0x82). Returns `(length, bytes_consumed)`.
+fn parse_der_length(der: &[u8], pos: usize) -> Option<(usize, usize)> {
+    let first = *der.get(pos)?;
+    if first < 0x80 {
+        return Some((usize::from(first), 1));
+    }
+    match first {
+        0x81 => {
+            let len = usize::from(*der.get(pos.checked_add(1)?)?);
+            // DER requires the minimal encoding; < 0x80 must use short form.
+            (len >= 0x80).then_some((len, 2))
+        }
+        0x82 => {
+            let hi = usize::from(*der.get(pos.checked_add(1)?)?);
+            let lo = usize::from(*der.get(pos.checked_add(2)?)?);
+            let len = (hi << 8) | lo;
+            (len >= 0x100).then_some((len, 3))
+        }
+        _ => None,
+    }
+}
+
 fn extract_cn_from_der(der: &[u8]) -> Option<String> {
     // Minimal ASN.1 CN extraction — looks for the OID 2.5.4.3 (CN) in DER.
     // In X.509 DER encoding, Issuer appears before Subject, so we take the
@@ -281,25 +321,30 @@ fn extract_cn_from_der(der: &[u8]) -> Option<String> {
     // OID bytes: 55 04 03
     let cn_oid = [0x55, 0x04, 0x03];
     let mut last_cn: Option<String> = None;
-    for window_start in 0..der.len().saturating_sub(cn_oid.len()) {
-        if der[window_start..window_start + cn_oid.len()] == cn_oid {
-            // After OID, expect: tag(0x0C or 0x13) + length + value
-            let value_start = window_start + cn_oid.len();
-            if value_start + 2 > der.len() {
-                continue;
-            }
-            let tag = der[value_start];
-            if tag != 0x0C && tag != 0x13 {
-                continue;
-            }
-            let len = der[value_start + 1] as usize;
-            let data_start = value_start + 2;
-            if data_start + len > der.len() {
-                continue;
-            }
-            if let Ok(cn) = std::str::from_utf8(&der[data_start..data_start + len]) {
-                last_cn = Some(cn.to_string());
-            }
+    for (window_start, window) in der.windows(cn_oid.len()).enumerate() {
+        if window != cn_oid {
+            continue;
+        }
+        // After OID, expect: tag(0x0C UTF8String or 0x13 PrintableString) + DER length + value
+        let value_start = window_start + cn_oid.len();
+        let Some(&tag) = der.get(value_start) else {
+            continue;
+        };
+        if tag != 0x0C && tag != 0x13 {
+            continue;
+        }
+        let Some((len, len_size)) = parse_der_length(der, value_start + 1) else {
+            continue;
+        };
+        let data_start = value_start + 1 + len_size;
+        let Some(data_end) = data_start.checked_add(len) else {
+            continue;
+        };
+        let Some(value) = der.get(data_start..data_end) else {
+            continue;
+        };
+        if let Ok(cn) = std::str::from_utf8(value) {
+            last_cn = Some(cn.to_string());
         }
     }
     last_cn
@@ -1305,8 +1350,11 @@ fn read_admin_registry(path: &Path) -> anyhow::Result<AdminRegistryDocument> {
     if !path.exists() {
         return Ok(AdminRegistryDocument::default());
     }
-    let raw = std::fs::read_to_string(path)?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", path.display()))?;
+    // Refuse a corrupt registry instead of reading it as empty: the next
+    // add/remove would otherwise overwrite it and drop every admin entry.
+    serde_json::from_str(&raw).with_context(|| format!("invalid admin registry {}", path.display()))
 }
 
 fn write_admin_registry(path: &Path, doc: &AdminRegistryDocument) -> anyhow::Result<()> {
@@ -1341,19 +1389,28 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    let bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .map_err(|err| {
-            Box::new(json_response(
-                StatusCode::BAD_REQUEST,
-                json!(AdminResponse::<()>::err(format!(
-                    "failed to read body: {err}"
-                ))),
-            ))
-        })?;
+    let bad_request = |message: String| {
+        Box::new(json_response(
+            StatusCode::BAD_REQUEST,
+            json!(AdminResponse::<()>::err(message)),
+        ))
+    };
+    let mut body = req.into_body();
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|err| bad_request(format!("failed to read body: {err}")))?;
+        if let Ok(data) = frame.into_data() {
+            if bytes.len().saturating_add(data.len()) > MAX_ADMIN_BODY_BYTES {
+                return Err(Box::new(json_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    json!(AdminResponse::<()>::err(
+                        "request body too large".to_string()
+                    )),
+                )));
+            }
+            bytes.extend_from_slice(&data);
+        }
+    }
     serde_json::from_slice(&bytes).map_err(|err| {
         Box::new(json_response(
             StatusCode::BAD_REQUEST,
@@ -1369,12 +1426,11 @@ fn json_response(status: StatusCode, value: JsonValue) -> Response<Full<Bytes>> 
         .header(CONTENT_TYPE, "application/json")
         .body(Full::from(Bytes::from(body)))
         .unwrap_or_else(|err| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::from(Bytes::from(format!(
-                    "response build error: {err}"
-                ))))
-                .unwrap()
+            let mut response = Response::new(Full::from(Bytes::from(format!(
+                "response build error: {err}"
+            ))));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
         })
 }
 
@@ -1441,6 +1497,76 @@ mod tests {
             0x0C, 0x07, b'c', b'l', b'i', b'e', b'n', b't', b'1',
         ];
         assert_eq!(extract_cn_from_der(&der).as_deref(), Some("client1"));
+    }
+
+    #[test]
+    fn extract_cn_from_der_short_form_cn() {
+        let der = [0x55, 0x04, 0x03, 0x13, 0x03, b'a', b'b', b'c'];
+        assert_eq!(extract_cn_from_der(&der).as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn extract_cn_from_der_long_form_length_0x81() {
+        let name = "a".repeat(0x90);
+        let mut der = vec![0x30, 0x00, 0x55, 0x04, 0x03, 0x0C, 0x81, 0x90];
+        der.extend_from_slice(name.as_bytes());
+        assert_eq!(extract_cn_from_der(&der), Some(name));
+    }
+
+    #[test]
+    fn extract_cn_from_der_long_form_length_0x82() {
+        let name = "b".repeat(0x120);
+        let mut der = vec![0x55, 0x04, 0x03, 0x0C, 0x82, 0x01, 0x20];
+        der.extend_from_slice(name.as_bytes());
+        assert_eq!(extract_cn_from_der(&der), Some(name));
+    }
+
+    #[test]
+    fn extract_cn_from_der_rejects_truncated_inputs() {
+        // OID at the very end, tag only, length header only, long-form header cut short.
+        assert_eq!(extract_cn_from_der(&[0x55, 0x04, 0x03]), None);
+        assert_eq!(extract_cn_from_der(&[0x55, 0x04, 0x03, 0x0C]), None);
+        assert_eq!(extract_cn_from_der(&[0x55, 0x04, 0x03, 0x0C, 0x81]), None);
+        assert_eq!(
+            extract_cn_from_der(&[0x55, 0x04, 0x03, 0x0C, 0x82, 0x01]),
+            None
+        );
+        // Declared long length exceeds available bytes.
+        assert_eq!(
+            extract_cn_from_der(&[0x55, 0x04, 0x03, 0x0C, 0x81, 0x90, b'x']),
+            None
+        );
+        assert_eq!(extract_cn_from_der(&[]), None);
+    }
+
+    #[test]
+    fn extract_cn_from_der_rejects_unsupported_or_non_minimal_lengths() {
+        // 0x83 (3 length octets) unsupported; 0x81 0x05 is non-minimal.
+        assert_eq!(
+            extract_cn_from_der(&[0x55, 0x04, 0x03, 0x0C, 0x83, 0x00, 0x00, 0x01, b'x']),
+            None
+        );
+        assert_eq!(
+            extract_cn_from_der(&[0x55, 0x04, 0x03, 0x0C, 0x81, 0x01, b'x']),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_cn_from_der_absent_cn() {
+        let der = [0x30, 0x05, 0x55, 0x04, 0x0A, 0x0C, 0x00];
+        assert_eq!(extract_cn_from_der(&der), None);
+    }
+
+    #[test]
+    fn extract_cn_from_der_multiple_rdns_takes_subject_last() {
+        let der = [
+            0x55, 0x04, 0x0A, 0x0C, 0x03, b'o', b'r', b'g', // O
+            0x55, 0x04, 0x03, 0x0C, 0x06, b'i', b's', b's', b'u', b'e', b'r', // issuer CN
+            0x55, 0x04, 0x0A, 0x0C, 0x02, b'o', b'2', // O
+            0x55, 0x04, 0x03, 0x13, 0x04, b'l', b'e', b'a', b'f', // subject CN
+        ];
+        assert_eq!(extract_cn_from_der(&der).as_deref(), Some("leaf"));
     }
 
     #[test]
@@ -1523,7 +1649,7 @@ mod tests {
     }
 
     #[test]
-    fn read_and_write_admin_registry_roundtrip_and_tolerate_invalid_json() {
+    fn read_and_write_admin_registry_roundtrip_and_reject_invalid_json() {
         let dir = tempdir().unwrap();
         let path = admin_registry_path(dir.path());
         let doc = AdminRegistryDocument {
@@ -1538,8 +1664,9 @@ mod tests {
         assert_eq!(loaded.admins[0].client_cn, "client-1");
 
         fs::write(&path, "{not-json").unwrap();
-        let loaded = read_admin_registry(&path).unwrap();
-        assert!(loaded.admins.is_empty());
+        assert!(read_admin_registry(&path).is_err());
+        // The corrupt file is left untouched for the operator to repair.
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{not-json");
     }
 
     #[test]
@@ -2364,5 +2491,36 @@ questions:
             ))
             .unwrap_err();
         assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn read_json_body_refuses_bodies_over_the_cap_with_413() {
+        let runtime = Runtime::new().expect("runtime");
+        let big = vec![b' '; MAX_ADMIN_BODY_BYTES + 1];
+        let req = Request::new(Full::new(Bytes::from(big)));
+        let err = runtime
+            .block_on(read_json_body(req))
+            .expect_err("over the cap");
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[test]
+    fn read_json_body_parses_small_bodies_and_rejects_invalid_json() {
+        let runtime = Runtime::new().expect("runtime");
+        let ok = Request::new(Full::new(Bytes::from_static(br#"{"a":1}"#)));
+        let value = runtime.block_on(read_json_body(ok)).expect("valid json");
+        assert_eq!(value["a"], 1);
+        let bad = Request::new(Full::new(Bytes::from_static(b"{nope")));
+        let err = runtime.block_on(read_json_body(bad)).expect_err("invalid");
+        assert_eq!(err.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn check_client_allowed_denies_a_cn_after_it_leaves_the_list() {
+        // The per-request re-check relies on this against the *current* list.
+        let before = vec!["client1".to_string(), "client2".to_string()];
+        let after = vec!["client2".to_string()];
+        assert!(check_client_allowed(&before, Some("client1")));
+        assert!(!check_client_allowed(&after, Some("client1")));
     }
 }

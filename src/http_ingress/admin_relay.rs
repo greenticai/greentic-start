@@ -14,7 +14,13 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
+use subtle::ConstantTimeEq;
+
 use super::helpers::error_response;
+use crate::http_helpers::read_body_capped;
+
+/// Cap on a relayed admin request body.
+const ADMIN_RELAY_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 pub(super) const ADMIN_RELAY_PREFIX: &str = "/admin-relay/v1";
 
@@ -77,17 +83,7 @@ where
         Some(query) if !query.is_empty() => format!("{target_path}?{query}"),
         _ => target_path,
     };
-    let body = req
-        .into_body()
-        .collect()
-        .await
-        .map_err(|err| {
-            error_response(
-                StatusCode::BAD_REQUEST,
-                format!("failed to read admin relay request body: {err}"),
-            )
-        })?
-        .to_bytes();
+    let body = read_body_capped(req.into_body(), ADMIN_RELAY_MAX_BODY_BYTES).await?;
 
     forward_admin_request(&config, method, target_uri, content_type, body)
         .await
@@ -119,7 +115,8 @@ fn authorized(header: Option<&hyper::header::HeaderValue>, expected_token: &str)
     let Some(token) = header.strip_prefix("Bearer ") else {
         return false;
     };
-    token == expected_token
+    // Constant time, so the token cannot be recovered byte by byte by timing.
+    bool::from(token.as_bytes().ct_eq(expected_token.as_bytes()))
 }
 
 async fn forward_admin_request(
@@ -249,5 +246,15 @@ mod tests {
         assert!(!authorized(Some(&wrong), "secret-token"));
         assert!(!authorized(Some(&malformed), "secret-token"));
         assert!(!authorized(None, "secret-token"));
+    }
+
+    #[test]
+    fn authorized_rejects_prefixes_extensions_and_empty_tokens() {
+        let prefix = hyper::header::HeaderValue::from_static("Bearer secret");
+        let longer = hyper::header::HeaderValue::from_static("Bearer secret-token-extra");
+        let empty = hyper::header::HeaderValue::from_static("Bearer ");
+        assert!(!authorized(Some(&prefix), "secret-token"));
+        assert!(!authorized(Some(&longer), "secret-token"));
+        assert!(!authorized(Some(&empty), "secret-token"));
     }
 }

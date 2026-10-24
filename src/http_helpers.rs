@@ -27,7 +27,11 @@ pub(crate) fn cors_preflight_response() -> Response<Full<Bytes>> {
         .header("Access-Control-Allow-Headers", CORS_ALLOW_HEADERS)
         .header("Access-Control-Max-Age", "86400")
         .body(Full::from(Bytes::new()))
-        .unwrap()
+        .unwrap_or_else(|_| {
+            let mut response = Response::new(Full::from(Bytes::new()));
+            *response.status_mut() = StatusCode::NO_CONTENT;
+            response
+        })
 }
 
 pub(crate) fn with_cors(mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
@@ -118,12 +122,11 @@ pub(crate) fn json_response(status: StatusCode, value: serde_json::Value) -> Res
         .header(CONTENT_TYPE, "application/json")
         .body(Full::from(Bytes::from(body)))
         .unwrap_or_else(|err| {
-            Response::builder()
-                .status(StatusCode::INTERNAL_SERVER_ERROR)
-                .body(Full::from(Bytes::from(format!(
-                    "failed to build response: {err}"
-                ))))
-                .unwrap()
+            let mut response = Response::new(Full::from(Bytes::from(format!(
+                "failed to build response: {err}"
+            ))));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response
         })
 }
 
@@ -164,12 +167,7 @@ where
     B: Body<Data = Bytes> + Unpin,
     B::Error: std::fmt::Display,
 {
-    let body_bytes = req
-        .into_body()
-        .collect()
-        .await
-        .map(|c| c.to_bytes())
-        .unwrap_or_default();
+    let body_bytes = read_body_capped(req.into_body(), OAUTH_EXCHANGE_MAX_BODY_BYTES).await?;
 
     let body: serde_json::Value = serde_json::from_slice(&body_bytes)
         .map_err(|e| error_response(StatusCode::BAD_REQUEST, format!("invalid json: {e}")))?;
@@ -183,11 +181,32 @@ where
     let client_secret = body["client_secret"].as_str().unwrap_or("");
     let code_verifier = body["code_verifier"].as_str().unwrap_or("");
 
+    // The caller names the endpoint, so it must not reach internal services.
+    if !token_url_is_allowed(token_url) {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "token_url must be an https URL on a public host",
+        ));
+    }
+
+    // Close the DNS-rebinding gap the syntactic check leaves: every address the
+    // host resolves to must be public.
+    if !token_host_resolves_public(token_url).await {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            "token_url must be an https URL on a public host",
+        ));
+    }
+
     fn encode(s: &str) -> String {
-        s.chars()
-            .map(|c| match c {
-                'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-                _ => format!("%{:02X}", c as u8),
+        // Percent-encode per UTF-8 byte; casting a `char` to `u8` would
+        // truncate every non-ASCII code point.
+        s.bytes()
+            .map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    char::from(b).to_string()
+                }
+                _ => format!("%{b:02X}"),
             })
             .collect()
     }
@@ -204,7 +223,15 @@ where
 
     let token_url_owned = token_url.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        ureq::post(&token_url_owned)
+        // No redirects: a public endpoint must not bounce the request to an
+        // internal address after the host check above.
+        let agent = ureq::Agent::config_builder()
+            .max_redirects(0)
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .new_agent();
+        agent
+            .post(&token_url_owned)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Accept", "application/json")
             .send(form_body.as_bytes())
@@ -244,6 +271,103 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("proxy error: {err}"),
         )),
+    }
+}
+
+/// Cap on the JSON body accepted by the OAuth token-exchange proxy.
+const OAUTH_EXCHANGE_MAX_BODY_BYTES: usize = 64 * 1024;
+
+/// Read a request body up to `cap` bytes. Over the cap is `413`; a body that
+/// breaks off mid-read is `400` (never silently treated as empty).
+pub(crate) async fn read_body_capped<B>(
+    mut body: B,
+    cap: usize,
+) -> Result<Bytes, Response<Full<Bytes>>>
+where
+    B: hyper::body::Body<Data = Bytes> + Unpin,
+    B::Error: std::fmt::Display,
+{
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| {
+            error_response(
+                StatusCode::BAD_REQUEST,
+                "the request body could not be read",
+            )
+        })?;
+        if let Ok(data) = frame.into_data() {
+            if buf.len().saturating_add(data.len()) > cap {
+                return Err(error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the size limit",
+                ));
+            }
+            buf.extend_from_slice(&data);
+        }
+    }
+    Ok(Bytes::from(buf))
+}
+
+/// True when `raw` is an `https` URL whose host is not loopback, private,
+/// link-local or a local-only name. A hostname is not resolved here (see
+/// `token_host_resolves_public` for that).
+fn token_url_is_allowed(raw: &str) -> bool {
+    let Ok(uri) = raw.parse::<hyper::Uri>() else {
+        return false;
+    };
+    if uri.scheme_str() != Some("https") {
+        return false;
+    }
+    let Some(host) = uri.host() else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return crate::artifacts::dns::is_public_ip(ip);
+    }
+    let lower = host.trim_end_matches('.').to_ascii_lowercase();
+    // The system resolver accepts inet_aton shorthands (`127.1`, `0x7f.1`,
+    // `017.0.0.1`) that `IpAddr` refuses to parse; a real TLD is never numeric.
+    let last_label = lower.rsplit('.').next().unwrap_or("");
+    let numeric_tail = !last_label.is_empty()
+        && (last_label.bytes().all(|b| b.is_ascii_digit())
+            || last_label
+                .strip_prefix("0x")
+                .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit())));
+    if numeric_tail {
+        return false;
+    }
+    !(lower == "localhost"
+        || lower.ends_with(".localhost")
+        || lower.ends_with(".local")
+        || lower.ends_with(".internal")
+        || !lower.contains('.'))
+}
+
+/// Resolve the host of an (already syntactically vetted) URL and require ALL
+/// addresses to be public. IP literals were judged by `token_url_is_allowed`.
+/// A residual race remains between this lookup and the HTTP client's own.
+async fn token_host_resolves_public(raw: &str) -> bool {
+    use crate::artifacts::dns::{Lookup, SystemLookup};
+    let Some(host) = raw
+        .parse::<hyper::Uri>()
+        .ok()
+        .and_then(|uri| uri.host().map(str::to_string))
+    else {
+        return false;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    match SystemLookup.lookup(host).await {
+        Ok(addrs) => {
+            !addrs.is_empty()
+                && addrs
+                    .iter()
+                    .all(|a| crate::artifacts::dns::is_public_ip(a.ip()))
+        }
+        Err(_) => false,
     }
 }
 
@@ -406,6 +530,48 @@ mod tests {
                 ("novalue".to_string(), "".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn token_url_allowlist_rejects_internal_targets() {
+        assert!(token_url_is_allowed("https://oauth2.googleapis.com/token"));
+        assert!(!token_url_is_allowed("http://oauth2.googleapis.com/token"));
+        assert!(!token_url_is_allowed("https://127.0.0.1/token"));
+        assert!(!token_url_is_allowed("https://169.254.169.254/latest"));
+        assert!(!token_url_is_allowed("https://[::1]/token"));
+        assert!(!token_url_is_allowed("https://localhost/token"));
+        assert!(!token_url_is_allowed("https://metadata.internal/token"));
+        assert!(!token_url_is_allowed("https://intranet/token"));
+        assert!(!token_url_is_allowed("https://127.1/token"));
+        assert!(!token_url_is_allowed("https://0x7f.0x1/token"));
+        assert!(!token_url_is_allowed("https://10.0.1/token"));
+        assert!(!token_url_is_allowed("not a url"));
+    }
+
+    #[test]
+    fn token_url_allowlist_rejects_private_ranges_and_local_names() {
+        assert!(!token_url_is_allowed("https://10.0.0.5/token"));
+        assert!(!token_url_is_allowed("https://192.168.1.1/token"));
+        assert!(!token_url_is_allowed("https://localhost./token"));
+        assert!(!token_url_is_allowed("https://api.localhost/token"));
+        assert!(!token_url_is_allowed("https://printer.local/token"));
+        assert!(!token_url_is_allowed("/relative/token"));
+        assert!(token_url_is_allowed(
+            "https://login.microsoftonline.com/x/oauth2/v2.0/token"
+        ));
+    }
+
+    #[test]
+    fn read_body_capped_refuses_oversize_bodies() {
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let ok = runtime
+            .block_on(read_body_capped(Full::new(Bytes::from_static(b"abcd")), 4))
+            .expect("within cap");
+        assert_eq!(ok.as_ref(), b"abcd");
+        let err = runtime
+            .block_on(read_body_capped(Full::new(Bytes::from_static(b"abcde")), 4))
+            .expect_err("over cap");
+        assert_eq!(err.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
     #[test]

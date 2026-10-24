@@ -673,10 +673,12 @@ pub(crate) fn parse_dispatch_result(value: &JsonValue) -> anyhow::Result<Ingress
 }
 
 fn parse_http_response(value: &JsonValue) -> anyhow::Result<IngressHttpResponse> {
-    let status = value
+    let raw_status = value
         .get("status")
         .and_then(JsonValue::as_u64)
-        .unwrap_or(200) as u16;
+        .unwrap_or(200);
+    let status = u16::try_from(raw_status)
+        .map_err(|_| anyhow::anyhow!("http response status {raw_status} out of range"))?;
     let headers = parse_headers(value.get("headers"));
     let body = parse_body_bytes(value)?;
     Ok(IngressHttpResponse {
