@@ -174,8 +174,16 @@ pub struct RefreshingResolver {
     inner: DynSecretsManager,
     /// Per-token-key single-flight locks. A rotating refresh token is
     /// single-use, so concurrent refreshes would fail on the second caller.
-    locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The guarded value is when the last refresh for the key failed, so
+    /// callers queued behind a failing refresh back off instead of each
+    /// re-hitting the token endpoint.
+    locks: std::sync::Mutex<std::collections::HashMap<String, RefreshLock>>,
 }
+
+type RefreshLock = Arc<tokio::sync::Mutex<Option<std::time::Instant>>>;
+
+/// How long a failed refresh suppresses further attempts for the same key.
+const REFRESH_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl RefreshingResolver {
     pub fn new(inner: DynSecretsManager) -> Self {
@@ -185,7 +193,7 @@ impl RefreshingResolver {
         }
     }
 
-    fn lock_for(&self, scoped_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn lock_for(&self, scoped_key: &str) -> RefreshLock {
         // A poisoned map only means another thread panicked mid-insert; the
         // map itself is still valid, so recover it.
         let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
@@ -199,13 +207,17 @@ impl ProviderTokenResolver for RefreshingResolver {
         // Serialize per key. The stored token is (re-)read inside the lock, so a
         // caller that waited sees the winner's fresh token and skips refreshing.
         let lock = self.lock_for(&key.scoped_key);
-        let _guard = lock.lock().await;
-        self.resolve_locked(key).await
+        let mut last_failure = lock.lock().await;
+        self.resolve_locked(key, &mut last_failure).await
     }
 }
 
 impl RefreshingResolver {
-    async fn resolve_locked(&self, key: &OAuthTokenKey) -> Option<String> {
+    async fn resolve_locked(
+        &self,
+        key: &OAuthTokenKey,
+        last_failure: &mut Option<std::time::Instant>,
+    ) -> Option<String> {
         let base = key.scoped_key.strip_suffix("_access_token")?;
         let sib = |suffix: &str| format!("{base}_{suffix}");
         let read = |uri: String| {
@@ -248,6 +260,19 @@ impl RefreshingResolver {
             && !force_refresh
         {
             return Some(tok.clone());
+        }
+
+        if let Some(failed_at) = *last_failure
+            && failed_at.elapsed() < REFRESH_FAILURE_BACKOFF
+        {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] skipping refresh for {} — last attempt failed recently; using existing access token",
+                    key.provider_id()
+                ),
+            );
+            return access;
         }
 
         // Expired (or missing/forced) + refreshable: refresh via the engine and persist.
@@ -305,6 +330,7 @@ impl RefreshingResolver {
         {
             Ok(Ok(t)) => t,
             Ok(Err(err)) => {
+                *last_failure = Some(std::time::Instant::now());
                 crate::operator_log::warn(
                     module_path!(),
                     format!(
@@ -315,6 +341,7 @@ impl RefreshingResolver {
                 return access;
             }
             Err(err) => {
+                *last_failure = Some(std::time::Instant::now());
                 crate::operator_log::warn(
                     module_path!(),
                     format!(
@@ -325,6 +352,7 @@ impl RefreshingResolver {
                 return access;
             }
         };
+        *last_failure = None;
         crate::operator_log::info(
             module_path!(),
             format!(

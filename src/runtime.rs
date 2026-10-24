@@ -1076,18 +1076,22 @@ pub fn demo_up_services(
                             return;
                         }
                     };
-                    let _ = ready_tx.send(Ok(port));
-                    let gateway_app = greentic_runner_host::sql::routes::router(gateway);
-                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                        Ok(listener) => {
-                            tracing::info!("sql gateway listening on 127.0.0.1:{port}");
-                            if let Err(serve_error) = axum::serve(listener, gateway_app).await {
-                                tracing::error!("sql gateway server error: {serve_error}");
-                            }
-                        }
+                    // Bind before reporting ready so a taken port aborts boot
+                    // instead of leaving a "started" gateway that never serves.
+                    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                        Ok(listener) => listener,
                         Err(bind_error) => {
-                            tracing::error!("sql gateway bind 127.0.0.1:{port}: {bind_error}");
+                            let _ = ready_tx.send(Err(anyhow::anyhow!(
+                                "sql gateway bind 127.0.0.1:{port}: {bind_error}"
+                            )));
+                            return;
                         }
+                    };
+                    let _ = ready_tx.send(Ok(port));
+                    tracing::info!("sql gateway listening on 127.0.0.1:{port}");
+                    let gateway_app = greentic_runner_host::sql::routes::router(gateway);
+                    if let Err(serve_error) = axum::serve(listener, gateway_app).await {
+                        tracing::error!("sql gateway server error: {serve_error}");
                     }
                 });
             })
