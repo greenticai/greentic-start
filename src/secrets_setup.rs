@@ -113,7 +113,12 @@ impl SecretsSetup {
             );
             debug!(uri = %uri, provider = %provider_id, key = %requirement.key, "canonicalized secret requirement");
             match self.requirement_exists(provider_id, &requirement).await {
-                Ok(true) if !requirement_allows_regeneration(&requirement) => continue,
+                // Present values are never re-minted here, even when the pack
+                // declares `regenerate_if_present`: this runs on every boot and
+                // revision activation against a tenant-scoped (not revision-
+                // scoped) URI, so rotating here would invalidate material that
+                // other replicas and draining revisions still verify against.
+                // Rotation is setup's concern (`greentic_setup::generated_secrets`).
                 Ok(true) => continue,
                 Ok(false) => {
                     let source = if requirement.generated.is_some() {
@@ -210,13 +215,6 @@ impl SecretsSetup {
             .cloned()
             .unwrap_or_else(|| placeholder_entry(uri.clone())))
     }
-}
-
-fn requirement_allows_regeneration(requirement: &PackSecretRequirement) -> bool {
-    requirement
-        .generated
-        .as_ref()
-        .is_some_and(|generated| generated.regenerate_if_present)
 }
 
 fn load_seed_entries(bundle_root: &Path) -> Result<HashMap<String, SeedEntry>> {
@@ -504,6 +502,44 @@ mod tests {
 
         let value = setup.store.get(&uri).await.expect("existing");
         assert_eq!(value, b"existing-webhook-secret".to_vec());
+    }
+
+    #[tokio::test]
+    async fn ensure_pack_secrets_preserves_present_value_despite_regenerate_if_present() {
+        let dir = tempdir().expect("tempdir");
+        let pack = dir.path().join("provider.gtpack");
+        write_pack_with_requirements_json(
+            &pack,
+            serde_json::json!([
+                {
+                    "key": "rotating_key",
+                    "required": true,
+                    "generated": {
+                        "policy": "random",
+                        "length": 20,
+                        "encoding": "raw_text",
+                        "scope": { "level": "tenant", "team": "_" },
+                        "regenerate_if_present": true
+                    }
+                }
+            ]),
+        );
+        let setup = SecretsSetup::new(dir.path(), "dev", "demo", Some("default")).expect("setup");
+        let uri = canonical_secret_uri("dev", "demo", None, "messaging-webex", "rotating_key");
+        setup
+            .store
+            .put(&uri, SecretFormat::Text, b"old-value")
+            .await
+            .expect("seed existing");
+
+        setup
+            .ensure_pack_secrets(&pack, "messaging-webex")
+            .await
+            .expect("ensure secrets");
+
+        // Start never rotates a present secret; rotation belongs to setup.
+        let value = setup.store.get(&uri).await.expect("preserved");
+        assert_eq!(value, b"old-value".to_vec());
     }
 
     #[tokio::test]

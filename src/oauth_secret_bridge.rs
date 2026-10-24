@@ -172,17 +172,40 @@ impl ProviderTokenResolver for NoopProviderTokenResolver {
 /// through to the inner store.
 pub struct RefreshingResolver {
     inner: DynSecretsManager,
+    /// Per-token-key single-flight locks. A rotating refresh token is
+    /// single-use, so concurrent refreshes would fail on the second caller.
+    locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl RefreshingResolver {
     pub fn new(inner: DynSecretsManager) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lock_for(&self, scoped_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+        // A poisoned map only means another thread panicked mid-insert; the
+        // map itself is still valid, so recover it.
+        let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(map.entry(scoped_key.to_string()).or_default())
     }
 }
 
 #[async_trait]
 impl ProviderTokenResolver for RefreshingResolver {
     async fn resolve_access_token(&self, key: &OAuthTokenKey) -> Option<String> {
+        // Serialize per key. The stored token is (re-)read inside the lock, so a
+        // caller that waited sees the winner's fresh token and skips refreshing.
+        let lock = self.lock_for(&key.scoped_key);
+        let _guard = lock.lock().await;
+        self.resolve_locked(key).await
+    }
+}
+
+impl RefreshingResolver {
+    async fn resolve_locked(&self, key: &OAuthTokenKey) -> Option<String> {
         let base = key.scoped_key.strip_suffix("_access_token")?;
         let sib = |suffix: &str| format!("{base}_{suffix}");
         let read = |uri: String| {
@@ -313,24 +336,42 @@ impl ProviderTokenResolver for RefreshingResolver {
             ),
         );
 
-        let _ = self
+        let log_write_failure = |what: &str, err: &dyn std::fmt::Display| {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] failed to persist {what} for {}: {err}",
+                    key.provider_id()
+                ),
+            );
+        };
+        if let Err(err) = self
             .inner
             .write(&key.scoped_key, refreshed.access_token.as_bytes())
-            .await;
+            .await
+        {
+            log_write_failure("access_token", &err);
+        }
         if let Some(secs) = refreshed.expires_in {
-            let _ = self
+            let secs = i64::try_from(secs).unwrap_or(i64::MAX / 2);
+            if let Err(err) = self
                 .inner
                 .write(
                     &sib("expires_at"),
-                    (now + secs as i64).to_string().as_bytes(),
+                    now.saturating_add(secs).to_string().as_bytes(),
                 )
-                .await;
+                .await
+            {
+                log_write_failure("expires_at", &err);
+            }
         }
-        if let Some(new_rt) = &refreshed.refresh_token {
-            let _ = self
+        if let Some(new_rt) = &refreshed.refresh_token
+            && let Err(err) = self
                 .inner
                 .write(&sib("refresh_token"), new_rt.as_bytes())
-                .await;
+                .await
+        {
+            log_write_failure("rotated refresh_token", &err);
         }
         Some(refreshed.access_token)
     }

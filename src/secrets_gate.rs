@@ -6,7 +6,10 @@ use std::{
     fs::File,
     io::Read,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -51,6 +54,10 @@ struct CacheEntry {
 struct CachingSecretsManager {
     inner: DynSecretsManager,
     cache: Mutex<HashMap<String, CacheEntry>>,
+    /// Bumped before and after every write/delete. A read only caches its
+    /// result when the counter is unchanged since the read began, so a read
+    /// that raced a write cannot re-cache the pre-write value.
+    generation: AtomicU64,
     ttl: Duration,
     max_entries: usize,
 }
@@ -72,9 +79,21 @@ impl CachingSecretsManager {
         Arc::new(Self {
             inner,
             cache: Mutex::new(HashMap::new()),
+            generation: AtomicU64::new(0),
             ttl: Duration::from_secs(ttl_secs),
             max_entries: max,
         })
+    }
+
+    /// Drop `path` and bump the generation under the cache lock, so any read
+    /// still in flight declines to cache its (possibly pre-write) value.
+    fn invalidate(&self, path: &str) {
+        let mut cache = self
+            .cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        cache.remove(path);
     }
 }
 
@@ -82,7 +101,10 @@ impl CachingSecretsManager {
 impl SecretsManager for CachingSecretsManager {
     async fn read(&self, path: &str) -> SecretResult<Vec<u8>> {
         {
-            let mut cache = self.cache.lock().expect("secrets cache poisoned");
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(entry) = cache.get(path) {
                 if entry.inserted_at.elapsed() < self.ttl {
                     return Ok(entry.data.clone());
@@ -90,9 +112,17 @@ impl SecretsManager for CachingSecretsManager {
                 cache.remove(path);
             }
         }
+        let generation = self.generation.load(Ordering::SeqCst);
         let data = self.inner.read(path).await?;
         {
-            let mut cache = self.cache.lock().expect("secrets cache poisoned");
+            let mut cache = self
+                .cache
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.generation.load(Ordering::SeqCst) != generation {
+                // A write/delete ran while we were reading; `data` may be stale.
+                return Ok(data);
+            }
             if cache.len() >= self.max_entries {
                 // Evict oldest entry.
                 if let Some(oldest_key) = cache
@@ -115,21 +145,17 @@ impl SecretsManager for CachingSecretsManager {
     }
 
     async fn write(&self, path: &str, bytes: &[u8]) -> SecretResult<()> {
-        self.inner.write(path, bytes).await?;
-        self.cache
-            .lock()
-            .expect("secrets cache poisoned")
-            .remove(path);
-        Ok(())
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.write(path, bytes).await;
+        self.invalidate(path);
+        result
     }
 
     async fn delete(&self, path: &str) -> SecretResult<()> {
-        self.inner.delete(path).await?;
-        self.cache
-            .lock()
-            .expect("secrets cache poisoned")
-            .remove(path);
-        Ok(())
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        let result = self.inner.delete(path).await;
+        self.invalidate(path);
+        result
     }
 }
 
@@ -1309,6 +1335,66 @@ mod tests {
     use tokio::runtime::Runtime;
     use zip::ZipWriter;
     use zip::write::FileOptions;
+
+    /// Returns the value held at call time, then parks until released, so a
+    /// test can land a write between the read's backend call and its re-cache.
+    struct SlowReadStore {
+        value: std::sync::Mutex<Vec<u8>>,
+        read_started: tokio::sync::Notify,
+        release_read: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl SecretsManager for SlowReadStore {
+        async fn read(&self, _path: &str) -> SecretResult<Vec<u8>> {
+            let snapshot = self.value.lock().expect("lock").clone();
+            self.read_started.notify_one();
+            self.release_read.notified().await;
+            Ok(snapshot)
+        }
+        async fn write(&self, _path: &str, bytes: &[u8]) -> SecretResult<()> {
+            *self.value.lock().expect("lock") = bytes.to_vec();
+            Ok(())
+        }
+        async fn delete(&self, _path: &str) -> SecretResult<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn caching_manager_does_not_recache_value_read_before_a_write() {
+        Runtime::new().expect("runtime").block_on(async {
+            let store = Arc::new(SlowReadStore {
+                value: std::sync::Mutex::new(b"old".to_vec()),
+                read_started: tokio::sync::Notify::new(),
+                release_read: tokio::sync::Notify::new(),
+            });
+            let caching = Arc::new(CachingSecretsManager {
+                inner: store.clone(),
+                cache: Mutex::new(HashMap::new()),
+                generation: AtomicU64::new(0),
+                ttl: Duration::from_secs(300),
+                max_entries: 8,
+            });
+            let path = "secrets://dev/demo/_/p/k";
+            let reader = {
+                let caching = caching.clone();
+                tokio::spawn(async move { caching.read(path).await })
+            };
+            store.read_started.notified().await;
+            caching.write(path, b"new").await.expect("write");
+            store.release_read.notify_one();
+            assert_eq!(reader.await.expect("join").expect("read"), b"old");
+            // The racing read must not have cached "old"; the next read hits the store.
+            let next = {
+                let caching = caching.clone();
+                tokio::spawn(async move { caching.read(path).await })
+            };
+            store.read_started.notified().await;
+            store.release_read.notify_one();
+            assert_eq!(next.await.expect("join").expect("read"), b"new");
+        });
+    }
 
     static PACK_FIXTURE: Lazy<PackFixture> = Lazy::new(build_test_pack);
 

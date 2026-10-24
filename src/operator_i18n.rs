@@ -56,11 +56,25 @@ pub fn tr(key: &str, fallback: &str) -> String {
 }
 
 pub fn trf(key: &str, fallback: &str, args: &[&str]) -> String {
-    let mut rendered = tr(key, fallback);
-    for value in args {
-        rendered = rendered.replacen("{}", value, 1);
+    substitute_placeholders(&tr(key, fallback), args)
+}
+
+/// Single-pass sequential `{}` substitution: text inside an argument is never
+/// re-scanned, so an argument containing `{}` cannot consume a later slot.
+fn substitute_placeholders(template: &str, args: &[&str]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut args = args.iter();
+    let mut rest = template;
+    while let Some(pos) = rest.find("{}") {
+        out.push_str(&rest[..pos]);
+        match args.next() {
+            Some(value) => out.push_str(value),
+            None => out.push_str("{}"),
+        }
+        rest = &rest[pos + 2..];
     }
-    rendered
+    out.push_str(rest);
+    out
 }
 
 pub fn tr_for_locale(key: &str, fallback: &str, locale: &str) -> String {
@@ -225,5 +239,11 @@ mod tests {
             trf("missing.key", "hello {} {}", &["demo", "team"]),
             "hello demo team"
         );
+    }
+
+    #[test]
+    fn substitution_does_not_reexpand_braces_in_args() {
+        assert_eq!(trf("missing.key", "a={} b={}", &["{}", "x"]), "a={} b=x");
+        assert_eq!(trf("missing.key", "a={} b={}", &["1"]), "a=1 b={}");
     }
 }
