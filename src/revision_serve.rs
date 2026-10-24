@@ -61,7 +61,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::server::conn::http1::Builder as Http1Builder;
 use hyper::service::service_fn;
 use hyper::{HeaderMap, Request, Response, StatusCode, header};
-use hyper_util::rt::tokio::TokioIo;
+use hyper_util::rt::tokio::{TokioIo, TokioTimer};
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::runtime::{Handle, Runtime};
@@ -878,7 +878,12 @@ impl RevisionServer {
     ) -> (ReloadReport, Activation) {
         // Same lock as `reload`, so a full reload cannot interleave between the
         // snapshot below and the swap.
-        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
+        // The lock guards `()`: a poisoned lock carries no torn state, so recover
+        // it rather than turning one panicked reload into a permanent panic here.
+        let _reload_guard = self
+            .reload_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = self.state.slot.load_full();
         let new = Activation {
             host: Arc::clone(&prev.host),
@@ -946,7 +951,10 @@ impl RevisionServer {
         // Serialize concurrent reloads so the load_full + reanchor_generations
         // + swap sequence is atomic relative to other producers. See the
         // field doc on `reload_lock`.
-        let _reload_guard = self.reload_lock.lock().expect("reload lock poisoned");
+        let _reload_guard = self
+            .reload_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let new_arc = Arc::new(new);
         // Snapshot the previous activation BEFORE publishing the new one so
         // the dispatcher generation bump runs against a stable reference.
@@ -984,7 +992,7 @@ impl RevisionServer {
             let mut watermark = self
                 .generation_watermark
                 .lock()
-                .expect("generation watermark lock poisoned");
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             prev.routing
                 .dispatcher
                 .absorb_into_watermark(&mut watermark);
@@ -1074,6 +1082,27 @@ fn peer_is_loopback_trusted(trust_loopback_peers: bool, peer: std::net::IpAddr) 
     trust_loopback_peers && peer.to_canonical().is_loopback()
 }
 
+/// Max time an accepted connection may take to send its request headers.
+const CONNECTION_HEADER_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Default cap on in-flight detached provider-route pipelines.
+const DEFAULT_MAX_PROVIDER_PIPELINES: usize = 1024;
+
+/// Process-wide bound on detached provider-route pipelines
+/// (`GREENTIC_MAX_PROVIDER_PIPELINES` overrides the default). Exhaustion is
+/// answered with 503 rather than queueing unbounded work.
+fn provider_pipeline_semaphore() -> &'static Arc<tokio::sync::Semaphore> {
+    static SEM: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
+    SEM.get_or_init(|| {
+        let permits = std::env::var("GREENTIC_MAX_PROVIDER_PIPELINES")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_MAX_PROVIDER_PIPELINES);
+        Arc::new(tokio::sync::Semaphore::new(permits))
+    })
+}
+
 /// Accept-loop helper: spawn a task to serve one accepted connection, deciding
 /// loopback trust from this listener's `trust_loopback_peers` and the peer IP.
 /// Shared by the main listener and the optional loopback admin listener so each
@@ -1098,7 +1127,11 @@ fn spawn_revision_connection(
                 // completes — without it hyper closes the TCP connection right
                 // after the 101 response and hyper-tungstenite's
                 // `websocket.await` errors out with "Handshake not finished".
+                // Slowloris guard: a peer that never finishes its request
+                // headers is dropped. `header_read_timeout` needs a timer.
                 if let Err(err) = Http1Builder::new()
+                    .timer(TokioTimer::new())
+                    .header_read_timeout(CONNECTION_HEADER_READ_TIMEOUT)
                     .serve_connection(io, service)
                     .with_upgrades()
                     .await
@@ -3352,11 +3385,25 @@ pub(crate) fn write_marker_durable(
     use std::io::Write;
     let path = env_dir.join(BINARY_UPDATE_PENDING_FILE);
     let bytes = serde_json::to_vec_pretty(marker).map_err(std::io::Error::other)?;
-    let file = std::fs::File::create(&path)?;
-    let mut writer = std::io::BufWriter::new(file);
-    writer.write_all(&bytes)?;
-    let file = writer.into_inner()?;
-    file.sync_all()?;
+    // Temp file in the same dir + fsync + rename: a crash mid-write can never
+    // leave a truncated marker where a valid one (or none) was.
+    let tmp_path = env_dir.join(format!("{BINARY_UPDATE_PENDING_FILE}.tmp"));
+    let write_tmp = || -> std::io::Result<()> {
+        let file = std::fs::File::create(&tmp_path)?;
+        let mut writer = std::io::BufWriter::new(file);
+        writer.write_all(&bytes)?;
+        let file = writer.into_inner()?;
+        file.sync_all()
+    };
+    if let Err(err) = write_tmp().and_then(|()| std::fs::rename(&tmp_path, &path)) {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    // Best effort: persist the rename itself.
+    #[cfg(unix)]
+    if let Ok(dir) = std::fs::File::open(env_dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -3695,7 +3742,7 @@ fn try_apply_binary_update(
     // before either writes. Held for the rest of the function.
     let _swap_guard = BINARY_UPDATE_SWAP_LOCK
         .lock()
-        .expect("binary update swap lock poisoned");
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     // 3d. Lineage protection: the `.prev` backup and pending marker form
     //     the rollback lineage. A second different-version swap before
@@ -4263,8 +4310,15 @@ async fn handle_update_notify(
         }
         Err(NotifyError::Op(err)) => Err(map_op_error(&err)),
         Err(err) => {
-            let (status, public, detail) = notify_failure_response(&err)
-                .expect("only `Op` maps to None and it is matched above");
+            // `Op` is matched above and is the only variant that maps to
+            // `None`; answer an opaque 500 rather than panic if that changes.
+            let (status, public, detail) = notify_failure_response(&err).unwrap_or_else(|| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "internal error staging update plan",
+                    format!("update-notify: unmapped failure: {err:?}"),
+                )
+            });
             operator_log::error(module_path!(), detail);
             Err(error_response(status, public))
         }
@@ -4845,19 +4899,20 @@ fn activity_to_worker_message(activity: &Activity) -> WorkerInvokeMessage {
             payload: serde_json::json!({ "text": text }),
         }
     } else {
-        // Nothing recognizable — log the shape so a future drop of this class is
+        // Nothing recognizable — log the SHAPE (keys only, never values: a reply
+        // payload is user/agent content) so a future drop of this class is
         // diagnosable from the operator log rather than only visible as a blank
         // "universal payload" reply in the channel.
         operator_log::info(
             module_path!(),
             format!(
                 "env-path reply carried no card/text; forwarding as generic activity. \
-                 top-level keys: [{}]; payload={}",
+                 top-level keys: [{}]",
                 match payload {
                     Value::Object(map) => map.keys().cloned().collect::<Vec<_>>().join(", "),
-                    other => other.to_string().chars().take(80).collect(),
+                    Value::Array(items) => format!("array of {}", items.len()),
+                    _ => "non-object".to_string(),
                 },
-                payload.to_string().chars().take(2000).collect::<String>(),
             ),
         );
         WorkerInvokeMessage {
@@ -6156,6 +6211,17 @@ async fn dispatch_provider_route(
     // task — the upstream already received its 2xx ack by the time the
     // egress runs.
     if !result.messaging_envelopes.is_empty() {
+        let pipeline_permit = Arc::clone(provider_pipeline_semaphore())
+            .try_acquire_owned()
+            .map_err(|_| {
+                operator_log::warn(
+                    module_path!(),
+                    format!(
+                        "provider pipeline limit reached; rejecting {provider_type} ingress with 503"
+                    ),
+                );
+                error_response(StatusCode::SERVICE_UNAVAILABLE, "server busy")
+            })?;
         let ingress_envelopes = result.messaging_envelopes.clone();
         let pipeline_activation = Arc::clone(&activation);
         let pipeline_tenant = tenant.to_string();
@@ -6177,6 +6243,8 @@ async fn dispatch_provider_route(
         );
         tokio::spawn(
             async move {
+                // Held for the pipeline's lifetime; released on completion.
+                let _pipeline_permit = pipeline_permit;
                 run_provider_inbound_pipeline(
                     pipeline_activation,
                     pipeline_tenant,

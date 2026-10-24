@@ -267,10 +267,27 @@ fn install_with(
     tmp_name.push(file_name);
     let tmp = parent.join(tmp_name);
 
+    // A crashed earlier run with the same pid (container restarts reuse low
+    // pids over a persisted writable layer) leaves its temp behind, which would
+    // make `create_new` fail on every later boot. `remove_file` unlinks a
+    // symlink itself rather than following it, so this is safe.
+    match fs::remove_file(&tmp) {
+        Ok(()) => {}
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("removing stale seed temp file `{}`", tmp.display()));
+        }
+    }
+
     let result = (|| {
-        let mut dst_f = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut open = fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        // Create owner-only from the start: the seed carries secrets, and a
+        // umask-default mode would expose them until `set_writable` runs.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+        let mut dst_f = open
             .open(&tmp)
             .with_context(|| format!("creating seed temp file `{}`", tmp.display()))?;
         fill(&mut dst_f, &tmp)?;
@@ -335,6 +352,22 @@ mod tests {
             fs::read(dst.path().join(".greentic/dev/.dev.secrets.env")).unwrap(),
             b"SECRET=1"
         );
+    }
+
+    #[test]
+    fn stale_temp_from_a_crashed_run_does_not_block_install() {
+        let src = tempdir().unwrap();
+        let dst = tempdir().unwrap();
+        fs::write(src.path().join("a.txt"), b"new").unwrap();
+        let stale = dst
+            .path()
+            .join(format!(".seedtmp.{}.a.txt", std::process::id()));
+        fs::write(&stale, b"leftover").unwrap();
+
+        let n = copy_tree_into(src.path(), dst.path()).unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(fs::read(dst.path().join("a.txt")).unwrap(), b"new");
+        assert!(!stale.exists(), "temp must be consumed by the rename");
     }
 
     #[test]
