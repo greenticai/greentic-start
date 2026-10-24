@@ -103,7 +103,13 @@ pub struct TokenResponse {
 fn post_form(token_url: &str, form: String) -> Result<TokenResponse, String> {
     let url = token_url.to_string();
     let body = std::thread::spawn(move || {
-        ureq::post(&url)
+        // Bounded: `RefreshingResolver` holds a per-key lock across this call,
+        // so a hung token endpoint must not park every caller for that key.
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .new_agent()
+            .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Accept", "application/json")
             .send(form.as_bytes())

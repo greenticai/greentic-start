@@ -1208,11 +1208,14 @@ fn create_signing_key(path: &Path) -> anyhow::Result<[u8; 32]> {
     // link (atomic, fails if `path` exists). Creating `path` directly would
     // leave a window — or, after a crash, a permanent state — in which the file
     // exists but is empty, which readers reject as corrupt.
-    let mut tmp_name = std::ffi::OsString::from(".");
-    tmp_name.push(SIGNING_KEY_FILE);
-    tmp_name.push(format!(".tmp.{}", std::process::id()));
-    let tmp = path.with_file_name(tmp_name);
-    let _ = std::fs::remove_file(&tmp);
+    //
+    // The temp name carries a random nonce, not only the pid: two boots that
+    // share the env dir can have the same pid (pid 1 in containers), and with a
+    // pid-only name one would unlink and replace the other's temp, so the loser
+    // could hard-link the WINNER's bytes into place while returning its own key.
+    let mut nonce = [0u8; 8];
+    rand::rng().fill_bytes(&mut nonce);
+    let tmp = signing_key_temp_path(path, u64::from_le_bytes(nonce));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1271,6 +1274,16 @@ fn create_signing_key(path: &Path) -> anyhow::Result<[u8; 32]> {
             path.display()
         ))),
     }
+}
+
+/// Per-attempt temp file beside the signing key; unique per `nonce` so
+/// concurrent creators (same pid in different containers included) never share
+/// one.
+fn signing_key_temp_path(path: &Path, nonce: u64) -> std::path::PathBuf {
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(SIGNING_KEY_FILE);
+    tmp_name.push(format!(".tmp.{}.{nonce:016x}", std::process::id()));
+    path.with_file_name(tmp_name)
 }
 
 fn key_from_bytes(bytes: &[u8], path: &Path) -> anyhow::Result<[u8; 32]> {
@@ -1974,6 +1987,35 @@ mod tests {
         let second = load_or_create_signing_key(dir.path()).unwrap();
         assert_eq!(first, second, "key must be stable across boots");
         assert!(first.iter().any(|&b| b != 0), "key must not be all zeroes");
+    }
+
+    #[test]
+    fn signing_key_temp_path_is_unique_per_attempt_and_beside_the_key() {
+        let path = Path::new("/env").join(SIGNING_KEY_FILE);
+        let a = signing_key_temp_path(&path, 1);
+        let b = signing_key_temp_path(&path, 2);
+        assert_ne!(a, b, "same-pid creators must not share a temp file");
+        assert_eq!(a.parent(), path.parent());
+        assert_ne!(a, path);
+    }
+
+    #[test]
+    fn concurrent_signing_key_creators_all_agree_with_the_file() {
+        let dir = tempdir().unwrap();
+        let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| load_or_create_signing_key(dir.path()).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let on_disk = std::fs::read(dir.path().join(SIGNING_KEY_FILE)).unwrap();
+        for key in keys {
+            assert_eq!(
+                &key[..],
+                &on_disk[..],
+                "every boot must sign with the stored key"
+            );
+        }
     }
 
     #[test]
