@@ -384,7 +384,7 @@ App startup currently consumes setup-derived tunnel configuration from `.greenti
 Provider setup has a dedicated persisted-config envelope flow:
 
 - write config envelope in [src/provider_config_envelope.rs](/projects/ai/greentic-ng/greentic-start/src/provider_config_envelope.rs:59)
-- read and reapply that config in [src/providers.rs](/projects/ai/greentic-ng/greentic-start/src/providers.rs:131)
+- read it back via `read_provider_config_envelope` / `require_provider_config_envelope` in the same module (consumers: `src/doctor.rs`, `src/notifier/config.rs`)
 
 App-flow execution is different:
 

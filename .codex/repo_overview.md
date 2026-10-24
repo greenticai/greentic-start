@@ -77,7 +77,7 @@ The repo is centered on startup/runtime concerns rather than setup UX. It integr
     - Supports timer scheduling and post-ingress control directives/hooks.
   - **Key dependencies / integration points:** `DemoRunnerHost`, pack discovery, onboarding API.
 
-- **Path:** `src/onboard/`, `src/component_qa_ops.rs`, `src/demo_qa_bridge.rs`, `src/setup_to_formspec.rs`, `src/setup_input.rs`, `src/qa_persist.rs`, `src/providers.rs`
+- **Path:** `src/onboard/`, `src/component_qa_ops.rs`, `src/demo_qa_bridge.rs`, `src/setup_to_formspec.rs`, `src/setup_input.rs`, `src/qa_persist.rs`
   - **Role:** Onboarding, QA/spec translation, setup flow invocation, and persisted setup outputs.
   - **Key functionality:**
     - Serves onboard API endpoints for provider listing, tenants/teams, deployment status, and QA submit/spec/validate.
