@@ -62,7 +62,17 @@ fn a_pack_cannot_choose_the_endpoint() {
 
 #[test]
 fn a_pack_cannot_name_a_secret_outside_the_jev_namespace() {
-    for name in ["slack/bot_token", "api_key", "../jev/x", " "] {
+    for name in [
+        "slack/bot_token",
+        "api_key",
+        "../jev/x",
+        "jev/../slack/bot_token",
+        "jev/./x",
+        "jev//x",
+        "jev/",
+        "jev/a\\b",
+        " ",
+    ] {
         let pack = JevBlock {
             api_key_secret: Some(name.to_string()),
             ..Default::default()

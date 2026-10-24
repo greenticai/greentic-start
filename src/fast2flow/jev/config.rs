@@ -44,6 +44,8 @@ use crate::operator_log;
 
 /// The pack entry shared with [`crate::fast2flow::pack_config`].
 const PACK_CONFIG_ENTRY: &str = "assets/fast2flow.json";
+/// Largest `assets/fast2flow.json` read from a pack.
+const MAX_PACK_CONFIG_BYTES: u64 = 256 * 1024;
 const PACK_SCHEMA: &str = "greentic.fast2flow-config.v1";
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
@@ -136,8 +138,20 @@ pub(crate) fn read_pack_block(pack_path: &Path) -> Result<Option<JevBlock>, Stri
     };
     let mut bytes = Vec::new();
     match archive.by_name(PACK_CONFIG_ENTRY) {
-        Ok(mut entry) => std::io::Read::read_to_end(&mut entry, &mut bytes)
-            .map_err(|e| format!("read {PACK_CONFIG_ENTRY}: {e}"))?,
+        Ok(entry) => {
+            // Bounded: the entry is pack content, and a tiny archive can
+            // declare a huge entry.
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(entry, MAX_PACK_CONFIG_BYTES + 1),
+                &mut bytes,
+            )
+            .map_err(|e| format!("read {PACK_CONFIG_ENTRY}: {e}"))?;
+            if bytes.len() as u64 > MAX_PACK_CONFIG_BYTES {
+                return Err(format!(
+                    "{PACK_CONFIG_ENTRY} is larger than {MAX_PACK_CONFIG_BYTES} bytes"
+                ));
+            }
+        }
         Err(_) => return Ok(None),
     };
     parse_pack_block(&bytes)
@@ -195,7 +209,7 @@ pub(crate) fn effective(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     if let Some(name) = secret_from_pack
-        && !name.starts_with(PACK_SECRET_PREFIX)
+        && !pack_secret_name_ok(name)
     {
         return Err(format!(
             "a pack's Jev secret name must start with `{PACK_SECRET_PREFIX}`; the tier stays off"
@@ -233,6 +247,21 @@ pub(crate) fn effective(
             .or_else(|| operator.and_then(|o| o.position))
             .unwrap_or_default(),
     }))
+}
+
+/// Whether a PACK-supplied secret name stays under [`PACK_SECRET_PREFIX`]: the
+/// prefix alone is not enough, because `jev/../slack/bot_token` starts with it
+/// and names a different secret once the path is resolved. Every segment after
+/// the prefix must be non-empty and neither `.` nor `..`, with no backslash or
+/// control character.
+fn pack_secret_name_ok(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix(PACK_SECRET_PREFIX) else {
+        return false;
+    };
+    !name.chars().any(|c| c == '\\' || c.is_control())
+        && rest
+            .split('/')
+            .all(|segment| !matches!(segment, "" | "." | ".."))
 }
 
 /// The key travels as a bearer token, so the endpoint must be TLS — or a

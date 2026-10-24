@@ -148,9 +148,28 @@ pub async fn chat_json<T: DeserializeOwned>(
         .chat(req)
         .await
         .map_err(|e| anyhow!("llm chat failed: {e}"))?;
-    let json = extract_json_object(&resp.content)
-        .ok_or_else(|| anyhow!("no JSON object in llm response: {:?}", resp.content))?;
-    serde_json::from_str::<T>(json).with_context(|| format!("decode llm json response: {json:?}"))
+    let json = extract_json_object(&resp.content).ok_or_else(|| {
+        anyhow!(
+            "no JSON object in llm response: {:?}",
+            preview(&resp.content)
+        )
+    })?;
+    serde_json::from_str::<T>(json)
+        .with_context(|| format!("decode llm json response: {:?}", preview(json)))
+}
+
+/// Longest model output quoted in an error message.
+const ERROR_PREVIEW_CHARS: usize = 200;
+
+/// A bounded prefix of model output for an error message. The reply may echo
+/// the user's message and errors end up in operator logs, so it is cut rather
+/// than quoted whole.
+fn preview(text: &str) -> String {
+    let mut out: String = text.chars().take(ERROR_PREVIEW_CHARS).collect();
+    if text.chars().nth(ERROR_PREVIEW_CHARS).is_some() {
+        out.push_str("...");
+    }
+    out
 }
 
 /// Extract the first balanced `{...}` JSON object from free text. Tracks string

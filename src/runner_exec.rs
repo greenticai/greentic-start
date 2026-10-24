@@ -123,6 +123,18 @@ pub(crate) fn session_snapshot_path(
         .join(format!("{safe_id}.snapshot.json"))
 }
 
+/// Log-safe summary of an inbound turn. Carries the verb (a control token) or
+/// the text length, never the user's text.
+fn input_summary(verb: &str, text: &str) -> String {
+    if !verb.is_empty() {
+        format!("verb={verb}")
+    } else if !text.is_empty() {
+        format!("text_chars={}", text.chars().count())
+    } else {
+        "empty".to_string()
+    }
+}
+
 pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> {
     // Ensure flow.log is initialized in bundle's logs directory
     let _ = crate::flow_log::init(&request.root.join("logs"));
@@ -163,18 +175,8 @@ pub fn run_provider_pack_flow(request: RunRequest) -> anyhow::Result<RunOutput> 
         .unwrap_or("?")
         .to_string();
 
-    let input_summary = if !user_verb.is_empty() {
-        format!("verb={user_verb}")
-    } else if !user_text.is_empty() {
-        let truncated = if user_text.len() > 80 {
-            format!("{}...", &user_text[..80])
-        } else {
-            user_text.clone()
-        };
-        format!("text=\"{truncated}\"")
-    } else {
-        "empty".to_string()
-    };
+    // Never log the message text itself (PII); length is enough to correlate.
+    let input_summary = input_summary(&user_verb, &user_text);
 
     crate::flow_log::flow_start(&log_pack, &log_flow, &log_tenant, &log_team);
     crate::flow_log::log(
@@ -349,8 +351,8 @@ fn write_run_artifacts(run_dir: &Path, result: &RunResult) -> anyhow::Result<()>
 
 #[cfg(test)]
 mod tests {
-    use super::verified_caller_user_id;
     use super::{RunRequest, run_provider_pack_flow};
+    use super::{input_summary, verified_caller_user_id};
     use crate::domains::Domain;
     use serde_json::{Value, json};
     use std::path::PathBuf;
@@ -365,6 +367,15 @@ mod tests {
 
         let bare = json!({ "extensions": { "caller": { "user_verified": true, "sub": "bob" } } });
         assert_eq!(verified_caller_user_id(&bare).as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn input_summary_never_contains_user_text_and_handles_multibyte() {
+        let text = "é".repeat(100);
+        let summary = input_summary("", &text);
+        assert_eq!(summary, "text_chars=100");
+        assert_eq!(input_summary("submit", "secret"), "verb=submit");
+        assert_eq!(input_summary("", ""), "empty");
     }
 
     #[test]

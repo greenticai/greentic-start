@@ -47,6 +47,9 @@ use sha2::{Digest, Sha256};
 /// The pack entry the index is read from.
 const PACK_INDEX_ENTRY: &str = "assets/intent-index.json";
 
+/// Largest `assets/intent-index.json` read from a pack.
+const MAX_PACK_INDEX_BYTES: u64 = 32 * 1024 * 1024;
+
 /// Beside `index.json`: the canonical path of the pack that installed it.
 pub(crate) const SOURCE_MARKER: &str = ".index-source";
 
@@ -278,10 +281,16 @@ fn installed_owner(marker: &Path) -> Option<PathBuf> {
 fn read_pack_index(pack_path: &Path) -> Option<Vec<u8>> {
     let file = std::fs::File::open(pack_path).ok()?;
     let mut archive = zip::ZipArchive::new(file).ok()?;
-    let mut entry = archive.by_name(PACK_INDEX_ENTRY).ok()?;
+    let entry = archive.by_name(PACK_INDEX_ENTRY).ok()?;
     let mut buf = Vec::new();
-    std::io::Read::read_to_end(&mut entry, &mut buf).ok()?;
-    Some(buf)
+    // Bounded: a tiny archive can declare a huge entry. An oversized index is
+    // treated as no pack index.
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(entry, MAX_PACK_INDEX_BYTES + 1),
+        &mut buf,
+    )
+    .ok()?;
+    (buf.len() as u64 <= MAX_PACK_INDEX_BYTES).then_some(buf)
 }
 
 /// Write `bytes` to a temp file beside `target`, then rename it over `target`.

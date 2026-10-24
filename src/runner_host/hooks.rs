@@ -89,7 +89,7 @@ impl DemoRunnerHost {
                 }
             };
             if let Some(updated) = parsed.envelope {
-                *envelope = updated;
+                apply_hook_envelope(envelope, updated);
             }
             if parsed.decision.eq_ignore_ascii_case("deny") && matches!(stage, HookStage::Pre) {
                 let reason = parsed
@@ -199,6 +199,20 @@ impl DemoRunnerHost {
     }
 }
 
+/// Adopt the envelope a hook returned, but never let a hook re-home the
+/// operation: tenant, team, correlation id and auth claims are fixed by the caller. Later
+/// hooks in the chain are invoked with `envelope.ctx`, so a hook that rewrote
+/// the tenant would run its successors (and their secrets) in another tenant.
+fn apply_hook_envelope(current: &mut OperationEnvelope, mut updated: OperationEnvelope) {
+    updated.ctx.tenant = std::mem::take(&mut current.ctx.tenant);
+    updated.ctx.team = current.ctx.team.take();
+    updated.ctx.correlation_id = current.ctx.correlation_id.take();
+    // Claims come only from the token-validation step (set directly on the
+    // envelope, not through here); a hook must not forge or clear them.
+    updated.ctx.auth_claims = current.ctx.auth_claims.take();
+    *current = updated;
+}
+
 pub(super) fn decode_hook_response(value: &JsonValue) -> anyhow::Result<HookEvalResponse> {
     if let Some(cbor) = extract_cbor_blob(value)
         && let Ok(parsed) = serde_cbor::from_slice::<HookEvalResponse>(&cbor)
@@ -260,6 +274,27 @@ mod tests {
             status: OperationStatus::Pending,
             result_cbor: None,
         }
+    }
+
+    #[test]
+    fn hook_envelope_cannot_change_tenant_scope() {
+        let mut current = sample_envelope();
+        let mut updated = sample_envelope();
+        updated.ctx.tenant = "other".to_string();
+        updated.ctx.team = Some("evil".to_string());
+        updated.ctx.correlation_id = None;
+        current.ctx.auth_claims = Some(serde_json::json!({"sub": "alice"}));
+        updated.ctx.auth_claims = Some(serde_json::json!({"sub": "admin"}));
+        updated.op_name = "renamed".to_string();
+        apply_hook_envelope(&mut current, updated);
+        assert_eq!(current.ctx.tenant, "demo");
+        assert_eq!(current.ctx.team.as_deref(), Some("ops"));
+        assert_eq!(current.ctx.correlation_id.as_deref(), Some("corr-1"));
+        assert_eq!(
+            current.ctx.auth_claims,
+            Some(serde_json::json!({"sub": "alice"}))
+        );
+        assert_eq!(current.op_name, "renamed");
     }
 
     #[test]
