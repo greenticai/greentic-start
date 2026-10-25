@@ -52,7 +52,7 @@ pub(crate) fn session_hint(
     format!("trigger:{}:{}", spec.trigger_id, firing_id)
 }
 
-fn trigger_block(spec: &TriggerSpec, firing_id: &str, fired_at: DateTime<Utc>) -> Value {
+pub(super) fn trigger_block(spec: &TriggerSpec, firing_id: &str, fired_at: DateTime<Utc>) -> Value {
     json!({
         "trigger_id": spec.trigger_id,
         "kind": spec.kind.name(),

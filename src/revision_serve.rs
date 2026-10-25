@@ -641,6 +641,7 @@ impl RevisionServer {
         let poll_state = Arc::clone(&state);
         let stream_state = Arc::clone(&state);
         let trigger_state = Arc::clone(&state);
+        let email_state = Arc::clone(&state);
         // Wakes the poll loop out of its interval wait when a plan is published.
         let update_wake = Arc::new(Notify::new());
         let poll_wake = Arc::clone(&update_wake);
@@ -722,6 +723,23 @@ impl RevisionServer {
                         },
                         crate::triggers::store(),
                     ));
+                    // Mailbox triggers: started only when this build carries an
+                    // IMAP client (none yet, see triggers::email_poller).
+                    let email_task =
+                        crate::triggers::email_poller::default_connector().map(|connector| {
+                            tokio::spawn(crate::triggers::email_poller::run(
+                                move || {
+                                    let activation = email_state.current();
+                                    (
+                                        Arc::clone(&activation.host),
+                                        Arc::clone(&activation.routing),
+                                    )
+                                },
+                                crate::triggers::store(),
+                                connector,
+                                Arc::new(crate::triggers::email_poller::DroppedAttachments),
+                            ))
+                        });
                     let mut shutdown = rx;
                     loop {
                         tokio::select! {
@@ -744,6 +762,9 @@ impl RevisionServer {
                                     task.abort();
                                 }
                                 trigger_task.abort();
+                                if let Some(task) = &email_task {
+                                    task.abort();
+                                }
                                 break;
                             }
                             // Main listener: the loopback gate + caller-asserted

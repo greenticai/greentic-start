@@ -30,6 +30,7 @@ const DEFAULT_IDEMPOTENCY_TTL_S: u64 = 86_400;
 const MAX_IDEMPOTENCY_TTL_S: u64 = 604_800;
 const DEFAULT_CRON_CONCURRENCY: u32 = 1;
 const DEFAULT_WEBHOOK_CONCURRENCY: u32 = 8;
+const DEFAULT_EMAIL_CONCURRENCY: u32 = 4;
 
 /// One accepted trigger, typed.
 #[derive(Clone, Debug)]
@@ -50,6 +51,7 @@ pub(crate) struct TriggerSpec {
 pub(crate) enum TriggerKind {
     Cron(CronSpec),
     Webhook(WebhookSpec),
+    EmailImap(super::email::EmailImapSpec),
 }
 
 impl TriggerKind {
@@ -57,6 +59,7 @@ impl TriggerKind {
         match self {
             TriggerKind::Cron(_) => "cron",
             TriggerKind::Webhook(_) => "webhook",
+            TriggerKind::EmailImap(_) => "email_imap",
         }
     }
 }
@@ -183,10 +186,12 @@ fn parse_entry(entry: &Value, trigger_id: &str) -> Result<EntryOutcome> {
             Some(spec) => TriggerKind::Webhook(spec),
             None => return Ok(EntryOutcome::Skipped(unknown_scheme_reason(entry))),
         },
+        "email_imap" => TriggerKind::EmailImap(super::email::parse(block(entry, "email_imap")?)?),
         other => return Ok(EntryOutcome::Skipped(format!("unknown kind `{other}`"))),
     };
     let default_concurrency = match kind {
         TriggerKind::Cron(_) => DEFAULT_CRON_CONCURRENCY,
+        TriggerKind::EmailImap(_) => DEFAULT_EMAIL_CONCURRENCY,
         TriggerKind::Webhook(_) => DEFAULT_WEBHOOK_CONCURRENCY,
     };
     let limits = entry.get("limits");
@@ -427,7 +432,7 @@ pub(crate) fn is_valid_secret_ref(value: &str) -> bool {
     }
 }
 
-fn secret_ref(block: &Value, field: &str) -> Result<String> {
+pub(super) fn secret_ref(block: &Value, field: &str) -> Result<String> {
     let value = non_empty(block, field)?;
     if !is_valid_secret_ref(&value) {
         // Never echo the value: if this is a pasted credential, a log line is
@@ -437,19 +442,19 @@ fn secret_ref(block: &Value, field: &str) -> Result<String> {
     Ok(value)
 }
 
-fn block<'a>(v: &'a Value, field: &str) -> Result<&'a Value> {
+pub(super) fn block<'a>(v: &'a Value, field: &str) -> Result<&'a Value> {
     v.get(field)
         .filter(|b| b.is_object())
         .ok_or_else(|| anyhow!("`{field}` block is required"))
 }
 
-fn str_field<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
+pub(super) fn str_field<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
     v.get(field)
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("`{field}` must be a string"))
 }
 
-fn non_empty(v: &Value, field: &str) -> Result<String> {
+pub(super) fn non_empty(v: &Value, field: &str) -> Result<String> {
     let s = str_field(v, field)?.trim();
     if s.is_empty() {
         bail!("`{field}` must not be empty");
@@ -457,7 +462,7 @@ fn non_empty(v: &Value, field: &str) -> Result<String> {
     Ok(s.to_string())
 }
 
-fn positive_u32(v: &Value, field: &str) -> Result<u32> {
+pub(super) fn positive_u32(v: &Value, field: &str) -> Result<u32> {
     v.as_u64()
         .filter(|n| *n >= 1 && *n <= u64::from(u32::MAX))
         .map(|n| n as u32)

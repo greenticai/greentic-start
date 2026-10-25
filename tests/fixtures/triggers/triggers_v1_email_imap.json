@@ -1,0 +1,31 @@
+{
+  "schema": "greentic.triggers.v1",
+  "pack_id": "pack.acme.support",
+  "triggers": [
+    {
+      "trigger_id": "support_inbox",
+      "kind": "email_imap",
+      "flow_id": "main",
+      "entry_node": "triage_mail",
+      "enabled": true,
+      "session": { "mode": "per_run" },
+      "limits": { "max_concurrency": 1, "max_firings_per_hour": 120 },
+      "source": { "extension_id": "greentic.email-trigger", "node_id": "support_inbox" },
+      "email_imap": {
+        "host": "imap.acme.example",
+        "port": 993,
+        "tls": "tls",
+        "mailbox": "INBOX",
+        "username": "support@acme.example",
+        "password_ref": "mail/imap_password",
+        "poll_interval_s": 60,
+        "search": { "unseen": true, "from": "customer@example.com" },
+        "on_success": "mark_seen",
+        "max_messages_per_poll": 10,
+        "max_message_bytes": 1048576,
+        "include_html": false,
+        "attachments": "none"
+      }
+    }
+  ]
+}
