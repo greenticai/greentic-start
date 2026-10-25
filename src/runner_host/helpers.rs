@@ -514,6 +514,9 @@ mod tests {
             correlation_id: Some("corr-1".to_string()),
         };
 
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         unsafe {
             env::set_var("GREENTIC_ENV", "test");
         }

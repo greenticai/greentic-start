@@ -221,9 +221,15 @@ pub const DISABLE_ALIAS_ENV_VAR: &str = "GREENTIC_DISABLE_DEV_ALIAS";
 /// fold both into a shared helper in `greentic-deployer::cli::bootstrap`
 /// or similar.
 pub fn resolve_env(override_env: Option<&str>) -> String {
+    resolve_env_from(override_env, std::env::var("GREENTIC_ENV").ok())
+}
+
+/// Pure core of [`resolve_env`]: the caller supplies the `GREENTIC_ENV` value,
+/// so tests can exercise the precedence without mutating the process env.
+pub(crate) fn resolve_env_from(override_env: Option<&str>, env_value: Option<String>) -> String {
     let raw = override_env
         .map(|v| v.to_string())
-        .or_else(|| std::env::var("GREENTIC_ENV").ok())
+        .or(env_value)
         .unwrap_or_else(|| DEFAULT_ENV_ID.to_string());
     compat_alias::apply_dev_alias(&raw)
 }

@@ -48,8 +48,47 @@ pub struct ForegroundRuntimeHandles {
     pub approval_rail_listener: Option<ApprovalRailListener>,
 }
 
+/// Handle to the SQL gateway thread. The gateway binds one fixed loopback port
+/// per process, so a single slot is enough; it lives here rather than on
+/// [`ForegroundRuntimeHandles`] to keep that public struct source-compatible.
+struct SqlGatewayHandle {
+    shutdown: tokio::sync::oneshot::Sender<()>,
+    done: std::sync::mpsc::Receiver<()>,
+    thread: thread::JoinHandle<()>,
+}
+
+static SQL_GATEWAY: std::sync::Mutex<Option<SqlGatewayHandle>> = std::sync::Mutex::new(None);
+
+/// How long to wait for the gateway to drain before detaching its thread.
+const SQL_GATEWAY_STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Stops the running SQL gateway, if any, so its port is free again. A gateway
+/// that does not drain in time is detached rather than blocking shutdown.
+fn stop_sql_gateway() {
+    let handle = SQL_GATEWAY.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(handle) = handle else {
+        return;
+    };
+    // A send error only means the gateway already stopped on its own.
+    let _ = handle.shutdown.send(());
+    match handle.done.recv_timeout(SQL_GATEWAY_STOP_TIMEOUT) {
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            if handle.thread.join().is_err() {
+                tracing::warn!("sql gateway thread panicked during shutdown");
+            }
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            tracing::warn!(
+                "sql gateway did not stop within {}s; detaching its thread",
+                SQL_GATEWAY_STOP_TIMEOUT.as_secs()
+            );
+        }
+    }
+}
+
 impl ForegroundRuntimeHandles {
     pub fn stop(mut self) -> anyhow::Result<()> {
+        stop_sql_gateway();
         if let Some(server) = self.ingress_server.take() {
             server.stop()?;
         }
@@ -1055,7 +1094,11 @@ pub fn demo_up_services(
         // would leave every pooled connection on a dead reactor. The startup
         // result comes back over a channel so a failure still aborts boot.
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<u16>>();
-        thread::Builder::new()
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        // A previous start in this process still owns the port; stop it first.
+        stop_sql_gateway();
+        let gateway_thread = thread::Builder::new()
             .name("sql-gateway".to_string())
             .spawn(move || {
                 let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -1090,10 +1133,15 @@ pub fn demo_up_services(
                     let _ = ready_tx.send(Ok(port));
                     tracing::info!("sql gateway listening on 127.0.0.1:{port}");
                     let gateway_app = greentic_runner_host::sql::routes::router(gateway);
-                    if let Err(serve_error) = axum::serve(listener, gateway_app).await {
+                    let serve = axum::serve(listener, gateway_app).with_graceful_shutdown(async {
+                        // Either a shutdown signal or a dropped sender stops it.
+                        let _ = shutdown_rx.await;
+                    });
+                    if let Err(serve_error) = serve.await {
                         tracing::error!("sql gateway server error: {serve_error}");
                     }
                 });
+                let _ = done_tx.send(());
             })
             .context("failed to spawn sql gateway thread")?;
         let sql_gateway_result = match tokio::runtime::Handle::try_current() {
@@ -1102,6 +1150,11 @@ pub fn demo_up_services(
         };
         match sql_gateway_result {
             Ok(Ok(port)) => {
+                *SQL_GATEWAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(SqlGatewayHandle {
+                    shutdown: shutdown_tx,
+                    done: done_rx,
+                    thread: gateway_thread,
+                });
                 operator_log::info(
                     module_path!(),
                     format!("sql gateway started on 127.0.0.1:{port}"),
@@ -2297,6 +2350,60 @@ fn read_last_lines(path: &Path, count: usize) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Registers a stand-in gateway thread that exits when told to, the way the
+    /// real one does on its graceful-shutdown signal.
+    fn register_fake_sql_gateway(finished: Arc<std::sync::atomic::AtomicBool>) {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let thread = thread::spawn(move || {
+            let _ = shutdown_rx.blocking_recv();
+            finished.store(true, std::sync::atomic::Ordering::SeqCst);
+            let _ = done_tx.send(());
+        });
+        *SQL_GATEWAY.lock().unwrap_or_else(|e| e.into_inner()) = Some(SqlGatewayHandle {
+            shutdown: shutdown_tx,
+            done: done_rx,
+            thread,
+        });
+    }
+
+    #[test]
+    fn stop_sql_gateway_signals_the_thread_and_frees_the_slot() {
+        let finished = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        register_fake_sql_gateway(Arc::clone(&finished));
+
+        stop_sql_gateway();
+
+        // The slot is process-global, so another test calling `stop()` may have
+        // taken this handle first. Whoever took it signals the thread, so wait
+        // for that rather than assuming this call did.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !finished.load(std::sync::atomic::Ordering::SeqCst)
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            "the gateway thread must have seen the shutdown signal"
+        );
+        assert!(
+            SQL_GATEWAY
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_none(),
+            "the slot must be empty so a restart can bind the port again"
+        );
+    }
+
+    #[test]
+    fn stop_sql_gateway_is_a_no_op_when_nothing_runs() {
+        // Also covers a gateway that already stopped on its own: the second
+        // call finds an empty slot and returns.
+        stop_sql_gateway();
+        stop_sql_gateway();
+    }
     use crate::discovery::{DetectedDomains, DetectedProvider, DiscoveryResult, ProviderIdSource};
     use crate::domains::Domain;
     use crate::secrets_gate;
