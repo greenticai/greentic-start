@@ -172,17 +172,59 @@ impl ProviderTokenResolver for NoopProviderTokenResolver {
 /// through to the inner store.
 pub struct RefreshingResolver {
     inner: DynSecretsManager,
+    /// Per-token-key single-flight locks. A rotating refresh token is
+    /// single-use, so concurrent refreshes would fail on the second caller.
+    /// The guarded value is when the last refresh for the key failed, so
+    /// callers queued behind a failing refresh back off instead of each
+    /// re-hitting the token endpoint.
+    locks: std::sync::Mutex<std::collections::HashMap<String, RefreshLock>>,
+}
+
+type RefreshLock = Arc<tokio::sync::Mutex<Option<std::time::Instant>>>;
+
+/// How long a failed refresh suppresses further attempts for the same key.
+const REFRESH_FAILURE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// True while a refresh that failed at `last_failure` is still inside the
+/// backoff window at `now`.
+fn refresh_suppressed(last_failure: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last_failure
+        .is_some_and(|failed_at| now.saturating_duration_since(failed_at) < REFRESH_FAILURE_BACKOFF)
 }
 
 impl RefreshingResolver {
     pub fn new(inner: DynSecretsManager) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            locks: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lock_for(&self, scoped_key: &str) -> RefreshLock {
+        // A poisoned map only means another thread panicked mid-insert; the
+        // map itself is still valid, so recover it.
+        let mut map = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        Arc::clone(map.entry(scoped_key.to_string()).or_default())
     }
 }
 
 #[async_trait]
 impl ProviderTokenResolver for RefreshingResolver {
     async fn resolve_access_token(&self, key: &OAuthTokenKey) -> Option<String> {
+        // Serialize per key. The stored token is (re-)read inside the lock, so a
+        // caller that waited sees the winner's fresh token and skips refreshing.
+        let lock = self.lock_for(&key.scoped_key);
+        let mut last_failure = lock.lock().await;
+        self.resolve_locked(key, &mut last_failure).await
+    }
+}
+
+impl RefreshingResolver {
+    async fn resolve_locked(
+        &self,
+        key: &OAuthTokenKey,
+        last_failure: &mut Option<std::time::Instant>,
+    ) -> Option<String> {
         let base = key.scoped_key.strip_suffix("_access_token")?;
         let sib = |suffix: &str| format!("{base}_{suffix}");
         let read = |uri: String| {
@@ -225,6 +267,17 @@ impl ProviderTokenResolver for RefreshingResolver {
             && !force_refresh
         {
             return Some(tok.clone());
+        }
+
+        if refresh_suppressed(*last_failure, std::time::Instant::now()) {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] skipping refresh for {} — last attempt failed recently; using existing access token",
+                    key.provider_id()
+                ),
+            );
+            return access;
         }
 
         // Expired (or missing/forced) + refreshable: refresh via the engine and persist.
@@ -282,6 +335,7 @@ impl ProviderTokenResolver for RefreshingResolver {
         {
             Ok(Ok(t)) => t,
             Ok(Err(err)) => {
+                *last_failure = Some(std::time::Instant::now());
                 crate::operator_log::warn(
                     module_path!(),
                     format!(
@@ -292,6 +346,7 @@ impl ProviderTokenResolver for RefreshingResolver {
                 return access;
             }
             Err(err) => {
+                *last_failure = Some(std::time::Instant::now());
                 crate::operator_log::warn(
                     module_path!(),
                     format!(
@@ -302,6 +357,7 @@ impl ProviderTokenResolver for RefreshingResolver {
                 return access;
             }
         };
+        *last_failure = None;
         crate::operator_log::info(
             module_path!(),
             format!(
@@ -313,24 +369,42 @@ impl ProviderTokenResolver for RefreshingResolver {
             ),
         );
 
-        let _ = self
+        let log_write_failure = |what: &str, err: &dyn std::fmt::Display| {
+            crate::operator_log::warn(
+                module_path!(),
+                format!(
+                    "[oauth-refresh] failed to persist {what} for {}: {err}",
+                    key.provider_id()
+                ),
+            );
+        };
+        if let Err(err) = self
             .inner
             .write(&key.scoped_key, refreshed.access_token.as_bytes())
-            .await;
+            .await
+        {
+            log_write_failure("access_token", &err);
+        }
         if let Some(secs) = refreshed.expires_in {
-            let _ = self
+            let secs = i64::try_from(secs).unwrap_or(i64::MAX / 2);
+            if let Err(err) = self
                 .inner
                 .write(
                     &sib("expires_at"),
-                    (now + secs as i64).to_string().as_bytes(),
+                    now.saturating_add(secs).to_string().as_bytes(),
                 )
-                .await;
+                .await
+            {
+                log_write_failure("expires_at", &err);
+            }
         }
-        if let Some(new_rt) = &refreshed.refresh_token {
-            let _ = self
+        if let Some(new_rt) = &refreshed.refresh_token
+            && let Err(err) = self
                 .inner
                 .write(&sib("refresh_token"), new_rt.as_bytes())
-                .await;
+                .await
+        {
+            log_write_failure("rotated refresh_token", &err);
         }
         Some(refreshed.access_token)
     }
@@ -410,6 +484,29 @@ mod tests {
     use super::*;
     use greentic_secrets_lib::SecretError;
     use std::sync::Mutex;
+
+    #[test]
+    fn refresh_is_not_suppressed_without_a_recorded_failure() {
+        assert!(!refresh_suppressed(None, std::time::Instant::now()));
+    }
+
+    #[test]
+    fn refresh_is_suppressed_inside_the_backoff_window() {
+        let failed_at = std::time::Instant::now();
+        let just_before_end =
+            failed_at + REFRESH_FAILURE_BACKOFF - std::time::Duration::from_secs(1);
+        assert!(refresh_suppressed(Some(failed_at), failed_at));
+        assert!(refresh_suppressed(Some(failed_at), just_before_end));
+    }
+
+    #[test]
+    fn refresh_is_retried_once_the_backoff_window_has_passed() {
+        let failed_at = std::time::Instant::now();
+        assert!(!refresh_suppressed(
+            Some(failed_at),
+            failed_at + REFRESH_FAILURE_BACKOFF
+        ));
+    }
 
     #[test]
     fn parses_oauth2_access_token_key() {

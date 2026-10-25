@@ -379,9 +379,7 @@ pub fn run_from_env() -> anyhow::Result<()> {
     }
     artifacts::pdf_isolation::enable_worker_from_current_exe();
     let raw_tail: Vec<String> = std::env::args().skip(1).collect();
-    let tunnel_explicit = raw_tail.iter().any(|a| {
-        a.starts_with("--cloudflared") || a.starts_with("--ngrok") || a.starts_with("--gtunnel")
-    });
+    let tunnel_explicit = raw_tail.iter().any(|a| is_tunnel_mode_flag(a));
     let args = normalize_args(raw_tail);
     let cli = match Cli::try_parse_from(args) {
         Ok(cli) => cli,
@@ -425,6 +423,21 @@ pub fn run_from_env() -> anyhow::Result<()> {
             Ok(())
         }
     }
+}
+
+/// Whether `arg` is a tunnel MODE flag (`--cloudflared on`, `--ngrok=off`, ...).
+/// A prefix match would also catch `--cloudflared-binary`, `--ngrok-binary`,
+/// `--gtunnel-worker-url` and `--gtunnel-tunnel-id`, which configure a tunnel
+/// without choosing one and must not count as an explicit tunnel decision.
+fn is_tunnel_mode_flag(arg: &str) -> bool {
+    ["--cloudflared", "--ngrok", "--gtunnel"]
+        .iter()
+        .any(|flag| {
+            arg == *flag
+                || arg
+                    .strip_prefix(flag)
+                    .is_some_and(|rest| rest.starts_with('='))
+        })
 }
 
 fn run_resolve_secret(args: cli_args::ResolveSecretArgs) -> anyhow::Result<()> {
@@ -1060,8 +1073,11 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // endpoints become unavailable while the tunnel is up rather than
         // publicly reachable). Mirrors `env_tunnel::choose_tunnel`'s `Off`
         // condition without re-running its both-on log line.
+        // gtunnel counts too: its agent proxies public requests to this
+        // listener over loopback, so the TCP peer is 127.0.0.1 there as well.
         let will_tunnel = matches!(request.cloudflared, CloudflaredModeArg::On)
-            || matches!(request.ngrok, NgrokModeArg::On);
+            || matches!(request.ngrok, NgrokModeArg::On)
+            || matches!(request.gtunnel, GtunnelModeArg::On);
         let activation = std::sync::Arc::new(revision_serve::Activation {
             host: std::sync::Arc::new(host),
             routing: std::sync::Arc::new(routing),
@@ -1707,7 +1723,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 binary,
                 local_port: demo_config.services.gateway.port,
                 extra_args: Vec::new(),
-                restart: restart.contains("cloudflared"),
+                restart: runtime::should_restart(&restart, "cloudflared"),
             })
         }
         _ => None,
@@ -1727,7 +1743,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
                 binary,
                 local_port: demo_config.services.gateway.port,
                 extra_args: Vec::new(),
-                restart: restart.contains("ngrok"),
+                restart: runtime::should_restart(&restart, "ngrok"),
             })
         }
         _ => None,
@@ -1737,7 +1753,7 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         env_tunnel::TunnelChoice::Gtunnel => Some(env_tunnel::gtunnel_config(
             &request,
             demo_config.services.gateway.port,
-            restart.contains("gtunnel") || restart.contains("all"),
+            runtime::should_restart(&restart, "gtunnel"),
         )),
         _ => None,
     };
@@ -2864,6 +2880,17 @@ mod tests {
     use std::path::Path;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn tunnel_mode_flag_ignores_binary_and_config_flags() {
+        assert!(is_tunnel_mode_flag("--cloudflared"));
+        assert!(is_tunnel_mode_flag("--ngrok=on"));
+        assert!(is_tunnel_mode_flag("--gtunnel"));
+        assert!(!is_tunnel_mode_flag("--cloudflared-binary"));
+        assert!(!is_tunnel_mode_flag("--ngrok-binary"));
+        assert!(!is_tunnel_mode_flag("--gtunnel-worker-url"));
+        assert!(!is_tunnel_mode_flag("--gtunnel-tunnel-id"));
+    }
 
     /// Stage `tunnel.json` under a revision id, as the env store lays it out.
     fn stage_tunnel_json(env_dir: &Path, revision: &str, body: &str) {

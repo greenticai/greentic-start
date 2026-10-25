@@ -203,7 +203,7 @@ fn find_best_pack(dir: &Path) -> Result<Option<PathBuf>> {
             ),
         );
     }
-    Ok(Some(packs.into_iter().next().unwrap()))
+    Ok(packs.into_iter().next())
 }
 
 #[cfg(test)]

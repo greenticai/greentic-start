@@ -555,7 +555,7 @@ fn persist_pack_meta_cache(
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::write(&path, serde_json::to_vec_pretty(cache)?)?;
+    crate::runtime_state::atomic_write(&path, &serde_json::to_vec_pretty(cache)?)?;
     Ok(())
 }
 

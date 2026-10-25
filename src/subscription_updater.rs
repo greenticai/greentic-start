@@ -143,6 +143,29 @@ pub fn sync_subscriptions_if_public_url_available(
         ),
     );
 
+    // One provider's failure must not abort the sync of the others: record it
+    // in the summary and move on.
+    macro_rules! or_skip {
+        ($provider:expr, $step:expr, $result:expr) => {
+            match $result {
+                Ok(value) => value,
+                Err(err) => {
+                    operator_log::warn(
+                        module_path!(),
+                        format!(
+                            "[subscription-updater] provider={} {} failed: {err:#}",
+                            $provider.provider_id, $step
+                        ),
+                    );
+                    summary
+                        .results
+                        .push(($provider.provider_id.clone(), format!("Error: {err:#}")));
+                    continue;
+                }
+            }
+        };
+    }
+
     for provider in messaging_providers {
         let extension = match read_subscriptions_extension(&provider.pack_path) {
             Ok(Some(extension)) => extension,
@@ -191,7 +214,11 @@ pub fn sync_subscriptions_if_public_url_available(
             continue;
         };
 
-        let setup_answers = read_provider_setup_answers(config_dir, &provider.provider_id)?;
+        let setup_answers = or_skip!(
+            provider,
+            "read setup answers",
+            read_provider_setup_answers(config_dir, &provider.provider_id)
+        );
         let Some(state) = build_subscription_state(
             &extension,
             setup_answers.as_ref(),
@@ -214,31 +241,43 @@ pub fn sync_subscriptions_if_public_url_available(
             continue;
         };
 
-        let config = build_provider_config(
-            config_dir,
-            secrets_handle,
-            tenant,
-            team,
-            &provider.provider_id,
-            &provider.pack_path,
-            public_base_url,
-        )?;
-        let config = filter_config_for_subscription_component(
-            &extension,
-            &provider.pack_path,
-            &extension.component_ref,
-            config,
-        )?;
+        let config = or_skip!(
+            provider,
+            "build provider config",
+            build_provider_config(
+                config_dir,
+                secrets_handle,
+                tenant,
+                team,
+                &provider.provider_id,
+                &provider.pack_path,
+                public_base_url,
+            )
+        );
+        let config = or_skip!(
+            provider,
+            "filter provider config",
+            filter_config_for_subscription_component(
+                &extension,
+                &provider.pack_path,
+                &extension.component_ref,
+                config,
+            )
+        );
         let config_keys = object_keys_label(&config);
         let diagnostic = subscription_state_diagnostic(&state);
-        let attempt_path = write_subscription_attempt_audit(
-            config_dir,
-            &provider.provider_id,
-            &extension,
-            &state,
-            &config_keys,
-            None,
-        )?;
+        let attempt_path = or_skip!(
+            provider,
+            "write attempt audit",
+            write_subscription_attempt_audit(
+                config_dir,
+                &provider.provider_id,
+                &extension,
+                &state,
+                &config_keys,
+                None,
+            )
+        );
         operator_log::info(
             module_path!(),
             format!(
@@ -276,15 +315,19 @@ pub fn sync_subscriptions_if_public_url_available(
             team: Some(team.to_string()),
             correlation_id: None,
         };
-        let mut outcome = host.invoke_pack_component_op_direct(
-            Domain::Messaging,
-            &pack,
-            &extension.component_ref,
-            &extension.export_name,
-            &config,
-            &state,
-            &ctx,
-        )?;
+        let mut outcome = or_skip!(
+            provider,
+            "component invocation",
+            host.invoke_pack_component_op_direct(
+                Domain::Messaging,
+                &pack,
+                &extension.component_ref,
+                &extension.export_name,
+                &config,
+                &state,
+                &ctx,
+            )
+        );
         if !outcome.success
             && let Some(expected_fields) =
                 expected_config_fields_from_invalid_config_error(&outcome)
@@ -299,15 +342,19 @@ pub fn sync_subscriptions_if_public_url_available(
                         expected_fields.join(", ")
                     ),
                 );
-                outcome = host.invoke_pack_component_op_direct(
-                    Domain::Messaging,
-                    &pack,
-                    &extension.component_ref,
-                    &extension.export_name,
-                    &retry_config,
-                    &state,
-                    &ctx,
-                )?;
+                outcome = or_skip!(
+                    provider,
+                    "component retry invocation",
+                    host.invoke_pack_component_op_direct(
+                        Domain::Messaging,
+                        &pack,
+                        &extension.component_ref,
+                        &extension.export_name,
+                        &retry_config,
+                        &state,
+                        &ctx,
+                    )
+                );
             }
         }
 
@@ -335,7 +382,11 @@ pub fn sync_subscriptions_if_public_url_available(
                 "state": state,
                 "output": outcome.output,
             });
-            write_json(&state_path, &persisted)?;
+            or_skip!(
+                provider,
+                "persist subscription state",
+                write_json(&state_path, &persisted)
+            );
             summary.results.push((
                 provider.provider_id.clone(),
                 subscription_result_description(&state, setup_answers.as_ref()),
@@ -345,14 +396,18 @@ pub fn sync_subscriptions_if_public_url_available(
                 .error
                 .or(outcome.raw)
                 .unwrap_or_else(|| "unknown subscription sync failure".to_string());
-            let attempt_path = write_subscription_attempt_audit(
-                config_dir,
-                &provider.provider_id,
-                &extension,
-                &state,
-                &config_keys,
-                Some(&error),
-            )?;
+            let attempt_path = or_skip!(
+                provider,
+                "write attempt audit",
+                write_subscription_attempt_audit(
+                    config_dir,
+                    &provider.provider_id,
+                    &extension,
+                    &state,
+                    &config_keys,
+                    Some(&error),
+                )
+            );
             let detail = format!(
                 "{error}; {diagnostic}; config_keys={config_keys}; audit={}",
                 attempt_path.display()
@@ -537,11 +592,15 @@ fn object_keys_label(value: &Value) -> String {
     }
 }
 
+/// Strip everything of a URL that can carry a credential (userinfo, query,
+/// fragment) before it reaches a log line, the summary or the audit file.
 fn redact_url_for_log(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
-        return url.to_string();
+        return url.split(['?', '#']).next().unwrap_or("").to_string();
     };
-    let (host, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
     format!("{scheme}://{host}/{path}")
 }
 
@@ -1123,6 +1182,18 @@ fn expand_template_string(input: &str, context: &BTreeMap<String, String>) -> St
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn redact_url_for_log_drops_userinfo_query_and_fragment() {
+        assert_eq!(
+            redact_url_for_log("https://user:pw@example.test/hook/a?token=s3cret#frag"),
+            "https://example.test/hook/a"
+        );
+        assert_eq!(
+            redact_url_for_log("https://example.test?x=1"),
+            "https://example.test/"
+        );
+    }
+
     use super::*;
     use crate::discovery::{DetectedDomains, DetectedProvider, DiscoveryResult, ProviderIdSource};
     use greentic_types::{

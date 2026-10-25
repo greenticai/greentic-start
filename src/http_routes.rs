@@ -856,11 +856,12 @@ pub(crate) fn derive_provider_name(provider_type: &str) -> Option<String> {
     if parts.is_empty() {
         return None;
     }
-    if parts.len() > 1 {
-        let last = *parts.last().unwrap();
-        if matches!(last, "bot" | "graph" | "client" | "gui" | "webhook") {
-            parts.pop();
-        }
+    if parts.len() > 1
+        && parts
+            .last()
+            .is_some_and(|last| matches!(*last, "bot" | "graph" | "client" | "gui" | "webhook"))
+    {
+        parts.pop();
     }
     let name = parts.join("-").to_ascii_lowercase();
     if name.is_empty() { None } else { Some(name) }

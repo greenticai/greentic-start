@@ -1049,38 +1049,69 @@ pub fn demo_up_services(
             ))
         };
 
-        let sql_gateway_result = match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| handle.block_on(sql_future)),
-            Err(_) => tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed to build temporary tokio runtime for sql gateway")?
-                .block_on(sql_future),
-        };
-
-        match sql_gateway_result {
-            Ok((gateway, port)) => {
-                let gateway_app = greentic_runner_host::sql::routes::router(gateway);
-                tokio::spawn(async move {
-                    match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
-                        Ok(listener) => {
-                            tracing::info!("sql gateway listening on 127.0.0.1:{port}");
-                            if let Err(serve_error) = axum::serve(listener, gateway_app).await {
-                                tracing::error!("sql gateway server error: {serve_error}");
-                            }
+        // The pools hold sockets and background tasks bound to the runtime
+        // that builds them, so build AND serve on one dedicated runtime that
+        // lives for the process: a temporary runtime dropped after the build
+        // would leave every pooled connection on a dead reactor. The startup
+        // result comes back over a channel so a failure still aborts boot.
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<anyhow::Result<u16>>();
+        thread::Builder::new()
+            .name("sql-gateway".to_string())
+            .spawn(move || {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(err) => {
+                        let _ = ready_tx.send(Err(anyhow::anyhow!("sql gateway runtime: {err}")));
+                        return;
+                    }
+                };
+                runtime.block_on(async move {
+                    let (gateway, port) = match sql_future.await {
+                        Ok(built) => built,
+                        Err(err) => {
+                            let _ = ready_tx.send(Err(err));
+                            return;
                         }
+                    };
+                    // Bind before reporting ready so a taken port aborts boot
+                    // instead of leaving a "started" gateway that never serves.
+                    let listener = match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                        Ok(listener) => listener,
                         Err(bind_error) => {
-                            tracing::error!("sql gateway bind 127.0.0.1:{port}: {bind_error}");
+                            let _ = ready_tx.send(Err(anyhow::anyhow!(
+                                "sql gateway bind 127.0.0.1:{port}: {bind_error}"
+                            )));
+                            return;
                         }
+                    };
+                    let _ = ready_tx.send(Ok(port));
+                    tracing::info!("sql gateway listening on 127.0.0.1:{port}");
+                    let gateway_app = greentic_runner_host::sql::routes::router(gateway);
+                    if let Err(serve_error) = axum::serve(listener, gateway_app).await {
+                        tracing::error!("sql gateway server error: {serve_error}");
                     }
                 });
+            })
+            .context("failed to spawn sql gateway thread")?;
+        let sql_gateway_result = match tokio::runtime::Handle::try_current() {
+            Ok(_) => tokio::task::block_in_place(|| ready_rx.recv()),
+            Err(_) => ready_rx.recv(),
+        };
+        match sql_gateway_result {
+            Ok(Ok(port)) => {
                 operator_log::info(
                     module_path!(),
-                    format!("sql gateway started on 127.0.0.1:{SQL_GATEWAY_DEFAULT_PORT}"),
+                    format!("sql gateway started on 127.0.0.1:{port}"),
                 );
             }
-            Err(gateway_error) => {
+            Ok(Err(gateway_error)) => {
                 anyhow::bail!("sql gateway startup failed: {gateway_error:#}");
+            }
+            Err(_) => {
+                anyhow::bail!("sql gateway startup failed: gateway thread exited early");
             }
         }
     }
@@ -1946,10 +1977,9 @@ pub fn demo_down_runtime(
     let timeout_ms = 2_000;
     let paths = RuntimePaths::new(state_dir, tenant, team);
     stop_started_nats(&paths, state_dir)?;
-    // ngrok teardown is still name-based (shared-record treatment is
-    // cloudflared-only for now); cloudflared stops strictly via the shared
-    // pidfile records — tunnels we did not record are never touched.
-    ngrok::stop_ngrok();
+    // Both tunnels stop strictly via recorded pidfiles — processes we did not
+    // record are never touched.
+    ngrok::stop_ngrok(&paths);
     let _ = cloudflared::stop_shared_tunnels();
     // Remove cached tunnel URL so a fresh URL is discovered on next start.
     cloudflared::cleanup_url_file(&paths);

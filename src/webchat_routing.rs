@@ -656,6 +656,15 @@ fn rebuild_path(segments: &[&str]) -> String {
     }
 }
 
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 /// Minimal percent-decode (only `%XX`). Does not handle `+` as space — URL
 /// path segments use `%20`, not `+`.
 fn percent_decode(s: &str) -> String {
@@ -663,11 +672,14 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Decode over bytes, not `&s[i+1..i+3]`: that str slice panics when the
+        // two bytes after `%` split a multi-byte char (untrusted URL input),
+        // and `from_str_radix` would also accept a leading `+`.
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
-            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
         {
-            out.push(v);
+            out.push(hi << 4 | lo);
             i += 3;
             continue;
         }
@@ -1571,6 +1583,10 @@ mod tests {
         assert_eq!(percent_decode("%ZZ"), "%ZZ");
         // Truncated sequence at end.
         assert_eq!(percent_decode("trail%2"), "trail%2");
+        // Multi-byte char right after `%` must not panic; `+f` is not hex.
+        assert_eq!(percent_decode("%aé"), "%aé");
+        assert_eq!(percent_decode("%é1"), "%é1");
+        assert_eq!(percent_decode("%+f"), "%+f");
     }
 
     // ── stripped_path ↔ route-matcher integration ──────────────────

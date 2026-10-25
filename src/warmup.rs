@@ -252,6 +252,9 @@ fn collect_component_wasm(root: &Path) -> Result<Vec<CollectedWasm>> {
     Ok(out)
 }
 
+const MAX_WASM_ENTRY_BYTES: usize = 512 * 1024 * 1024;
+const MAX_WASM_PREALLOC_BYTES: usize = 16 * 1024 * 1024;
+
 fn walk(dir: &Path, out: &mut Vec<CollectedWasm>) -> Result<()> {
     let entries = std::fs::read_dir(dir)
         .with_context(|| format!("read dir {}", dir.display()))?
@@ -259,7 +262,14 @@ fn walk(dir: &Path, out: &mut Vec<CollectedWasm>) -> Result<()> {
         .with_context(|| format!("iterate dir {}", dir.display()))?;
     for entry in entries {
         let path = entry.path();
-        if path.is_dir() {
+        // symlink_metadata does not follow links: a symlinked dir (possibly a
+        // cycle) is skipped rather than recursed into.
+        let meta =
+            std::fs::symlink_metadata(&path).with_context(|| format!("stat {}", path.display()))?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
+        if meta.is_dir() {
             walk(&path, out)?;
             continue;
         }
@@ -305,10 +315,22 @@ fn extract_pack_wasms(pack_path: &Path, out: &mut Vec<CollectedWasm>) -> Result<
         let mut entry = archive
             .by_name(&name)
             .with_context(|| format!("open zip entry {name} in {}", pack_path.display()))?;
-        let mut bytes = Vec::with_capacity(entry.size() as usize);
-        entry
+        // The zip header size is attacker-controlled: cap the preallocation and
+        // bound the read so a lying header cannot exhaust memory.
+        let prealloc = usize::try_from(entry.size())
+            .unwrap_or(MAX_WASM_ENTRY_BYTES)
+            .min(MAX_WASM_PREALLOC_BYTES);
+        let mut bytes = Vec::with_capacity(prealloc);
+        (&mut entry)
+            .take(MAX_WASM_ENTRY_BYTES as u64 + 1)
             .read_to_end(&mut bytes)
             .with_context(|| format!("read zip entry {name} in {}", pack_path.display()))?;
+        if bytes.len() > MAX_WASM_ENTRY_BYTES {
+            anyhow::bail!(
+                "zip entry {name} in {} exceeds {MAX_WASM_ENTRY_BYTES} bytes",
+                pack_path.display()
+            );
+        }
         out.push(CollectedWasm { bytes });
     }
     Ok(())

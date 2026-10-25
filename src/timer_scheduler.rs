@@ -87,6 +87,16 @@ struct TimerTickInputV1 {
     last_run: Option<String>,
 }
 
+/// The next tick `interval_seconds` from now: at least one second (a zero
+/// interval would re-fire every loop turn) and never an `Instant` overflow
+/// (a huge manifest value would panic the scheduler thread).
+fn next_tick_after(interval_seconds: u64) -> Instant {
+    const MAX_INTERVAL: Duration = Duration::from_secs(10 * 365 * 24 * 3600);
+    let interval = Duration::from_secs(interval_seconds.max(1)).min(MAX_INTERVAL);
+    let now = Instant::now();
+    now.checked_add(interval).unwrap_or(now)
+}
+
 fn run_scheduler_loop(config: TimerSchedulerConfig, rx: mpsc::Receiver<()>) -> anyhow::Result<()> {
     if config.handlers.is_empty() {
         return Ok(());
@@ -96,7 +106,7 @@ fn run_scheduler_loop(config: TimerSchedulerConfig, rx: mpsc::Receiver<()>) -> a
         .iter()
         .cloned()
         .map(|handler| ScheduledTimer {
-            next_tick: Instant::now() + Duration::from_secs(handler.interval_seconds.max(1)),
+            next_tick: next_tick_after(handler.interval_seconds),
             config: handler,
             last_run_rfc3339: None,
         })
@@ -121,7 +131,7 @@ fn run_scheduler_loop(config: TimerSchedulerConfig, rx: mpsc::Receiver<()>) -> a
             if let Err(err) = run_timer_handler(&config, timer) {
                 operator_log::error(module_path!(), format!("timer handler failed: {err}"));
             }
-            timer.next_tick = Instant::now() + Duration::from_secs(timer.config.interval_seconds);
+            timer.next_tick = next_tick_after(timer.config.interval_seconds);
         }
 
         let sleep_for = timers
@@ -418,6 +428,14 @@ mod tests {
     };
     use crate::ingress_types::EventEnvelopeV1;
     use serde_json::json;
+
+    #[test]
+    fn next_tick_never_fires_at_once_and_never_overflows() {
+        let before = std::time::Instant::now();
+        assert!(super::next_tick_after(0) > before);
+        // Must not panic on an absurd manifest value.
+        assert!(super::next_tick_after(u64::MAX) > before);
+    }
 
     #[test]
     fn timer_op_conventions_are_detected() {

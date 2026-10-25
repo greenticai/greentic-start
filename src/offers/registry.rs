@@ -9,6 +9,9 @@ use zip::result::ZipError;
 
 use crate::domains;
 
+/// Largest `manifest.cbor` read from a pack.
+const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
+
 pub const HOOK_STAGE_POST_INGRESS: &str = "post_ingress";
 pub const HOOK_CONTRACT_CONTROL_V1: &str = "greentic.hook.control.v1";
 
@@ -247,7 +250,17 @@ pub fn load_pack_offers(pack_ref: &Path) -> anyhow::Result<PackOffers> {
         ),
     })?;
     let mut bytes = Vec::new();
-    manifest_entry.read_to_end(&mut bytes)?;
+    // Bounded: the entry is pack content, and a tiny archive can declare a
+    // huge one.
+    (&mut manifest_entry)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        anyhow::bail!(
+            "manifest.cbor in {} is larger than {MAX_MANIFEST_BYTES} bytes",
+            pack_ref.display()
+        );
+    }
     let manifest: JsonValue = serde_cbor::from_slice(&bytes)
         .with_context(|| format!("decode manifest.cbor {}", pack_ref.display()))?;
 
@@ -345,7 +358,11 @@ fn parse_pack_offers(manifest: &JsonValue, pack_ref: &Path) -> anyhow::Result<Ve
         let priority = raw_obj
             .get("priority")
             .and_then(JsonValue::as_i64)
-            .map(|value| value as i32)
+            .map(|value| {
+                // Saturate rather than wrap: `as i32` would turn an
+                // out-of-range priority into an arbitrary (possibly top) one.
+                i32::try_from(value).unwrap_or(if value < 0 { i32::MIN } else { i32::MAX })
+            })
             .unwrap_or(100);
 
         let stage = raw_obj
@@ -436,6 +453,22 @@ mod tests {
 
         let err = load_pack_offers(&pack_path).unwrap_err().to_string();
         assert!(err.contains("duplicate offer id"));
+    }
+
+    #[test]
+    fn out_of_range_priority_saturates_instead_of_wrapping() {
+        let manifest = json!({
+            "offers": [
+                { "id": "big", "kind": "hook", "priority": 4294967296i64, "provider": { "op": "a" } },
+                { "id": "small", "kind": "hook", "priority": -4294967296i64, "provider": { "op": "b" } },
+                { "id": "dflt", "kind": "hook", "provider": { "op": "c" } }
+            ]
+        });
+        let offers = parse_pack_offers(&manifest, Path::new("p.gtpack")).expect("parse");
+        let by_id = |id: &str| offers.iter().find(|o| o.id == id).map(|o| o.priority);
+        assert_eq!(by_id("big"), Some(i32::MAX));
+        assert_eq!(by_id("small"), Some(i32::MIN));
+        assert_eq!(by_id("dflt"), Some(100));
     }
 
     #[test]

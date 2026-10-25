@@ -293,13 +293,30 @@ pub fn install_record_path(
     stable_id: &str,
 ) -> PathBuf {
     let team = team.unwrap_or("default");
+    // `stable_id` comes from a pack's `offer_id`; tenant/team come from the
+    // request scope. None may introduce a path separator or `..`.
     bundle_root
         .join("state")
         .join("runtime")
-        .join(tenant)
-        .join(team)
+        .join(safe_path_segment(tenant))
+        .join(safe_path_segment(team))
         .join("capabilities")
-        .join(format!("{stable_id}.install.json"))
+        .join(format!("{}.install.json", safe_path_segment(stable_id)))
+}
+
+pub(crate) fn safe_path_segment(raw: &str) -> String {
+    if raw == ".." || raw == "." {
+        return "_".to_string();
+    }
+    raw.chars()
+        .map(|c| {
+            if matches!(c, '/' | '\\' | '\0') {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 pub fn write_install_record(
@@ -347,6 +364,9 @@ pub fn is_binding_ready(
     Ok(record.status.eq_ignore_ascii_case("ready"))
 }
 
+/// Upper bound on a pack's decompressed `manifest.cbor`.
+const MAX_MANIFEST_BYTES: u64 = 32 * 1024 * 1024;
+
 fn read_capabilities_extension(path: &Path) -> anyhow::Result<Option<CapabilitiesExtensionV1>> {
     let file = std::fs::File::open(path)?;
     let mut archive = ZipArchive::new(file)?;
@@ -354,7 +374,15 @@ fn read_capabilities_extension(path: &Path) -> anyhow::Result<Option<Capabilitie
         anyhow::anyhow!("failed to open manifest.cbor in {}: {err}", path.display())
     })?;
     let mut bytes = Vec::new();
-    manifest_entry.read_to_end(&mut bytes)?;
+    (&mut manifest_entry)
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        anyhow::bail!(
+            "manifest.cbor in {} exceeds {MAX_MANIFEST_BYTES} bytes",
+            path.display()
+        );
+    }
     let manifest = decode_pack_manifest(&bytes)
         .with_context(|| format!("failed to decode pack manifest in {}", path.display()))?;
     let Some(extension) = manifest
@@ -519,6 +547,32 @@ mod tests {
         assert!(value_matches(&[], None));
         assert!(value_matches(&["demo".to_string()], Some("demo")));
         assert!(!value_matches(&["demo".to_string()], Some("prod")));
+    }
+
+    #[test]
+    fn install_record_path_stays_under_bundle_state() {
+        let root = Path::new("/bundle");
+        let path = install_record_path(root, "..", Some("a/../b"), "../../evil");
+        assert!(path.starts_with("/bundle/state/runtime"));
+        assert!(
+            path.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir))
+        );
+    }
+
+    #[test]
+    fn install_record_path_keeps_ordinary_ids_and_neutralises_separators() {
+        let root = Path::new("/bundle");
+        let plain = install_record_path(root, "demo", Some("default"), "offer-1");
+        assert_eq!(
+            plain,
+            Path::new("/bundle/state/runtime/demo/default/capabilities/offer-1.install.json")
+        );
+        let hostile = install_record_path(root, "a\\b", None, "x/y");
+        assert_eq!(
+            hostile,
+            Path::new("/bundle/state/runtime/a_b/default/capabilities/x_y.install.json")
+        );
     }
 
     #[test]

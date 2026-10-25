@@ -46,8 +46,20 @@ fn signing_key() -> &'static [u8] {
             .ok()
             .filter(|k| !k.is_empty())
             .map(String::into_bytes)
-            // Dev default — fine for local; production should set the env/secret.
-            .unwrap_or_else(|| b"greentic-oauth-state-signing-key-dev".to_vec())
+            // No configured key: use a random per-process key rather than a
+            // publicly known constant (which would let anyone forge `state`).
+            // In-flight sign-ins do not survive a restart; set the env var
+            // for multi-replica or restart-stable deployments.
+            .unwrap_or_else(|| {
+                crate::operator_log::warn(
+                    module_path!(),
+                    "GREENTIC_OAUTH_STATE_KEY is not set: OAuth state is signed with a \
+                     random per-process key, so a sign-in started on another replica or \
+                     before a restart will fail its callback",
+                );
+                let a: [u8; 32] = rand::random();
+                a.to_vec()
+            })
     })
 }
 
@@ -86,21 +98,17 @@ pub fn team_segment(team: &str) -> String {
     }
 }
 
-/// Canonicalize a logical secret key the way the runner host secret store does
-/// (lowercase; non-alphanumeric → `_`). e.g. `auth.oauth2.githubOAuth.client_id`
-/// → `auth_oauth2_githuboauth_client_id`.
+/// Canonicalize a logical secret key exactly as the secret store does.
+///
+/// Delegates to the single ecosystem-wide definition
+/// (`greentic_secrets_lib::canonical_secret_name`): lowercase, `-`/`.`/space/`/`
+/// become `_`, any other character is dropped, runs of `_` collapse, edge `_`
+/// are trimmed and an empty result becomes `secret`. A local copy that only
+/// mapped non-alphanumerics to `_` diverged on `a--b`, `a/b/`, `_x` and
+/// non-ASCII names, so a write and a read could derive different keys.
+/// e.g. `auth.oauth2.githubOAuth.client_id` -> `auth_oauth2_githuboauth_client_id`.
 pub fn canonical_secret_name(key: &str) -> String {
-    key.trim()
-        .chars()
-        .map(|c| {
-            let c = c.to_ascii_lowercase();
-            if c.is_ascii_alphanumeric() || c == '_' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect()
+    crate::secret_name::canonical_secret_name(key)
 }
 
 #[cfg(test)]
@@ -155,5 +163,21 @@ mod tests {
             "auth_oauth2_githuboauth_client_id"
         );
         assert_eq!(team_segment("default"), "_");
+    }
+
+    #[test]
+    fn canonical_agrees_with_secrets_lib_on_edge_names() {
+        for raw in ["jev/api_key", "a--b", "_x_", " a b ", "pack/é", "", "..."] {
+            assert_eq!(
+                canonical_secret_name(raw),
+                greentic_secrets_lib::canonical_secret_name(raw),
+                "{raw:?}"
+            );
+        }
+        assert_eq!(canonical_secret_name("jev/api_key"), "jev_api_key");
+        assert_eq!(
+            canonical_secret_name("github--review-pack"),
+            "github_review_pack"
+        );
     }
 }

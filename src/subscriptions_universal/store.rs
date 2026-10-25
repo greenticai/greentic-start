@@ -99,12 +99,13 @@ impl SubscriptionStore {
         team: Option<&str>,
         binding_id: &str,
     ) -> PathBuf {
-        let team_dir = team.unwrap_or("default");
+        use crate::capabilities::safe_path_segment;
+        let team_dir = safe_path_segment(team.unwrap_or("default"));
         self.base
-            .join(provider)
-            .join(tenant)
+            .join(safe_path_segment(provider))
+            .join(safe_path_segment(tenant))
             .join(team_dir)
-            .join(format!("{binding_id}.json"))
+            .join(format!("{}.json", safe_path_segment(binding_id)))
     }
 
     pub fn write_state(&self, state: &SubscriptionState) -> Result<()> {
@@ -153,8 +154,20 @@ impl SubscriptionStore {
                 .map(|value| value.eq_ignore_ascii_case("json"))
                 .unwrap_or(false)
             {
-                if let Some(state) = runtime_state::read_json(&path)? {
-                    states.push(state);
+                // The root is shared with `subscription_updater`, which writes
+                // `<provider>.json` / `<provider>.attempt.json` here in a different
+                // shape, and a half-written or hand-edited file must not stop every
+                // other binding from renewing. Skip what is not a state file.
+                match runtime_state::read_json::<SubscriptionState>(&path) {
+                    Ok(Some(state)) => states.push(state),
+                    Ok(None) => {}
+                    Err(err) => crate::operator_log::debug(
+                        module_path!(),
+                        format!(
+                            "skipping non-subscription-state file {}: {err:#}",
+                            path.display()
+                        ),
+                    ),
                 }
             }
         }
@@ -197,6 +210,35 @@ mod tests {
             expiration_unix_ms: Some(123456789),
             last_error: Some("boom".to_string()),
         }
+    }
+
+    #[test]
+    fn state_path_neutralises_traversal_segments() {
+        let dir = tempdir().expect("tempdir");
+        let store = SubscriptionStore::new(dir.path());
+        let path = store.state_path("..", "a/b", Some("."), "../../etc/x");
+        assert!(path.starts_with(dir.path()));
+        assert!(
+            path.components()
+                .all(|c| !matches!(c, std::path::Component::ParentDir))
+        );
+    }
+
+    #[test]
+    fn list_states_skips_foreign_and_corrupt_json_files() {
+        let dir = tempdir().expect("tempdir");
+        let store = SubscriptionStore::new(dir.path());
+        store.write_state(&sample_state()).expect("write");
+        // Shape written by subscription_updater into the same root.
+        std::fs::write(
+            dir.path().join("messaging-graph.json"),
+            r#"{"provider_id":"messaging-graph","state":{}}"#,
+        )
+        .expect("foreign");
+        std::fs::write(dir.path().join("broken.json"), "{not json").expect("corrupt");
+        let states = store.list_states().expect("list");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].binding_id, "binding-1");
     }
 
     #[test]

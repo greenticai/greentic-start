@@ -372,7 +372,12 @@ pub fn submit_answers(state: &OnboardState, body: &Value) -> OnboardResult {
 
     // Persist secrets + config (single DevStore instance writes all secrets in one batch)
     let providers_root = bundle_root.join(".providers");
-    let rt = tokio::runtime::Runtime::new().expect("persist runtime");
+    let rt = tokio::runtime::Runtime::new().map_err(|err| {
+        into_error(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("persist runtime: {err}"),
+        ))
+    })?;
     let persist_result = rt
         .block_on(qa_persist::persist_qa_results(
             bundle_root,

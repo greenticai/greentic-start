@@ -592,7 +592,7 @@ pub fn emit_pack_config_input(
     std::fs::create_dir_all(&dir)
         .with_context(|| format!("create pack-config-input dir {}", dir.display()))?;
     let body = serde_json::to_string_pretty(&input).context("serialize pack-config-input.v1")?;
-    std::fs::write(&path, format!("{body}\n"))
+    crate::runtime_state::atomic_write(&path, format!("{body}\n").as_bytes())
         .with_context(|| format!("write pack-config-input {}", path.display()))?;
 
     tracing::debug!(

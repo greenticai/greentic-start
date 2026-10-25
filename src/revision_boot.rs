@@ -421,7 +421,7 @@ pub(crate) async fn activate_runtime_config(
     // revision is no longer in the runtime-config.
     let carried = revision_stores
         .lock()
-        .expect("revision store registry poisoned")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .clone();
     let mut retained = HashMap::with_capacity(rc.revisions.len());
 
@@ -483,17 +483,25 @@ pub(crate) async fn activate_runtime_config(
     for block in &rc.revisions {
         // Both lookups are infallible: the validation loop above proved every
         // block's deployment is present, and registered a host config for its
-        // tenant. `expect` documents that structural invariant.
+        // tenant. They still return errors rather than panic.
         let meta = deployments
             .get(block.deployment_id.as_str())
-            .expect("deployment validated in the loop above");
+            .ok_or_else(|| {
+                anyhow!(
+                    "deployment `{}` vanished between validation and activation",
+                    block.deployment_id
+                )
+            })?;
         let deployment_id = DeploymentId(parse_ulid(&block.deployment_id, "deployment_id")?);
         let revision_id = RevisionId(parse_ulid(&block.revision_id, "revision_id")?);
         let bundle_id = BundleId::new(&block.bundle_id);
-        let config = configs
-            .get(&meta.tenant)
-            .cloned()
-            .expect("host config registered for tenant in the loop above");
+        let config = configs.get(&meta.tenant).cloned().ok_or_else(|| {
+            anyhow!(
+                "no host config registered for tenant `{}` (deployment `{}`)",
+                meta.tenant,
+                block.deployment_id
+            )
+        })?;
 
         let pack_refs = read_revision_pack_refs(&env_dir, &revision_id, &block.pack_list_refs)
             .with_context(|| {
@@ -812,7 +820,7 @@ pub(crate) async fn activate_runtime_config(
     // of the runtime-config are released here rather than accumulating.
     *revision_stores
         .lock()
-        .expect("revision store registry poisoned") = retained;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = retained;
 
     Ok(RuntimeConfigActivation { host, routing })
 }
@@ -1196,6 +1204,18 @@ fn create_signing_key(path: &Path) -> anyhow::Result<[u8; 32]> {
     let mut key = [0u8; 32];
     rand::rng().fill_bytes(&mut key);
 
+    // Write the full key to a private temp file, then publish it with a hard
+    // link (atomic, fails if `path` exists). Creating `path` directly would
+    // leave a window — or, after a crash, a permanent state — in which the file
+    // exists but is empty, which readers reject as corrupt.
+    //
+    // The temp name carries a random nonce, not only the pid: two boots that
+    // share the env dir can have the same pid (pid 1 in containers), and with a
+    // pid-only name one would unlink and replace the other's temp, so the loser
+    // could hard-link the WINNER's bytes into place while returning its own key.
+    let mut nonce = [0u8; 8];
+    rand::rng().fill_bytes(&mut nonce);
+    let tmp = signing_key_temp_path(path, u64::from_le_bytes(nonce));
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);
     #[cfg(unix)]
@@ -1203,14 +1223,45 @@ fn create_signing_key(path: &Path) -> anyhow::Result<[u8; 32]> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    match opts.open(path) {
-        Ok(mut file) => {
-            use std::io::Write;
-            file.write_all(&key)
-                .with_context(|| format!("writing revision signing key `{}`", path.display()))?;
-            let _ = file.sync_all();
-            Ok(key)
+    let written = (|| -> anyhow::Result<()> {
+        use std::io::Write;
+        let mut file = opts
+            .open(&tmp)
+            .with_context(|| format!("creating revision signing key temp `{}`", tmp.display()))?;
+        file.write_all(&key)
+            .with_context(|| format!("writing revision signing key `{}`", tmp.display()))?;
+        file.sync_all()
+            .with_context(|| format!("syncing revision signing key `{}`", tmp.display()))?;
+        Ok(())
+    })();
+    let published = match written {
+        Ok(()) => match std::fs::hard_link(&tmp, path) {
+            // Some mounts (e.g. FUSE-backed volumes) do not support hard
+            // links; fall back to the previous direct `create_new` publish
+            // rather than failing the boot.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied
+                ) =>
+            {
+                opts.open(path).and_then(|mut file| {
+                    use std::io::Write;
+                    file.write_all(&key)?;
+                    let _ = file.sync_all();
+                    Ok(())
+                })
+            }
+            other => other,
+        },
+        Err(err) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(err);
         }
+    };
+    let _ = std::fs::remove_file(&tmp);
+    match published {
+        Ok(()) => Ok(key),
         // Another boot created it between our read and create — use its key so
         // both processes sign with the same secret.
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -1223,6 +1274,16 @@ fn create_signing_key(path: &Path) -> anyhow::Result<[u8; 32]> {
             path.display()
         ))),
     }
+}
+
+/// Per-attempt temp file beside the signing key; unique per `nonce` so
+/// concurrent creators (same pid in different containers included) never share
+/// one.
+fn signing_key_temp_path(path: &Path, nonce: u64) -> std::path::PathBuf {
+    let mut tmp_name = std::ffi::OsString::from(".");
+    tmp_name.push(SIGNING_KEY_FILE);
+    tmp_name.push(format!(".tmp.{}.{nonce:016x}", std::process::id()));
+    path.with_file_name(tmp_name)
 }
 
 fn key_from_bytes(bytes: &[u8], path: &Path) -> anyhow::Result<[u8; 32]> {
@@ -1926,6 +1987,35 @@ mod tests {
         let second = load_or_create_signing_key(dir.path()).unwrap();
         assert_eq!(first, second, "key must be stable across boots");
         assert!(first.iter().any(|&b| b != 0), "key must not be all zeroes");
+    }
+
+    #[test]
+    fn signing_key_temp_path_is_unique_per_attempt_and_beside_the_key() {
+        let path = Path::new("/env").join(SIGNING_KEY_FILE);
+        let a = signing_key_temp_path(&path, 1);
+        let b = signing_key_temp_path(&path, 2);
+        assert_ne!(a, b, "same-pid creators must not share a temp file");
+        assert_eq!(a.parent(), path.parent());
+        assert_ne!(a, path);
+    }
+
+    #[test]
+    fn concurrent_signing_key_creators_all_agree_with_the_file() {
+        let dir = tempdir().unwrap();
+        let keys: Vec<[u8; 32]> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| load_or_create_signing_key(dir.path()).unwrap()))
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let on_disk = std::fs::read(dir.path().join(SIGNING_KEY_FILE)).unwrap();
+        for key in keys {
+            assert_eq!(
+                &key[..],
+                &on_disk[..],
+                "every boot must sign with the stored key"
+            );
+        }
     }
 
     #[test]

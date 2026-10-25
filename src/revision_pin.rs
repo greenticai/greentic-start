@@ -163,8 +163,10 @@ struct InMemoryEntry {
 ///   is a miss but is left intact (generation-monotonic — see the trait doc).
 #[derive(Debug, Default)]
 pub struct InMemoryPinStore {
-    inner: Mutex<HashMap<(DeploymentId, String, String, String), InMemoryEntry>>,
+    inner: Mutex<PinMap>,
 }
+
+type PinMap = HashMap<(DeploymentId, String, String, String), InMemoryEntry>;
 
 impl InMemoryPinStore {
     pub fn new() -> Self {
@@ -174,7 +176,16 @@ impl InMemoryPinStore {
     /// Test helper: number of live entries (post-eviction).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.inner.lock().expect("pin mutex poisoned").len()
+        self.entries().len()
+    }
+
+    /// Lock the map. A poisoned lock is recovered: every mutation is a single
+    /// `HashMap` call, and a pin is a routing hint, so a panic elsewhere must not
+    /// turn into a panic on every later dispatch.
+    fn entries(&self) -> std::sync::MutexGuard<'_, PinMap> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -201,7 +212,7 @@ impl RevisionPinStore for InMemoryPinStore {
     ) -> PinOutcome {
         let map_key = owned_key(key);
         let now = SystemTime::now();
-        let mut guard = self.inner.lock().expect("pin mutex poisoned");
+        let mut guard = self.entries();
 
         // Monotonic eviction: an at-or-newer generation already owns the slot,
         // so report it and do NOT clobber. This covers same-generation (the
@@ -246,7 +257,7 @@ impl RevisionPinStore for InMemoryPinStore {
     async fn lookup(&self, key: PinKey<'_>, current_generation: u64) -> Option<RevisionId> {
         let map_key = owned_key(key);
         let now = SystemTime::now();
-        let mut guard = self.inner.lock().expect("pin mutex poisoned");
+        let mut guard = self.entries();
         match guard.get(&map_key) {
             Some(entry) if entry.expires_at > now && entry.generation == current_generation => {
                 Some(entry.revision_id)
@@ -268,6 +279,10 @@ impl RevisionPinStore for InMemoryPinStore {
 
 // ── Redis backend ───────────────────────────────────────────────────────
 
+/// Members inspected per at-cap pruning pass (SSCAN COUNT hint); bounds the
+/// EXISTS calls one script run can issue.
+const PRUNE_SCAN_BUDGET: usize = 128;
+
 /// Lua script that atomically performs the `try_pin` contract:
 ///
 /// 1. If `KEYS[1]` already holds a pin at an AT-OR-NEWER generation
@@ -278,7 +293,8 @@ impl RevisionPinStore for InMemoryPinStore {
 ///    existing key, check the tracking-set cardinality, and if under cap, write
 ///    the new pin + add it to the tracking set + refresh the set's TTL. Return
 ///    `{0, value}` (caller gets `Inserted`).
-/// 3. If the tracking set is at cap, return `{2}` (caller gets a no-pin
+/// 3. If the tracking set is at cap (after pruning members whose pin key has
+///    expired), return `{2}` (caller gets a no-pin
 ///    fallthrough that becomes `Inserted` with the caller's own
 ///    revision_id — see `RedisPinStore::try_pin`).
 ///
@@ -289,6 +305,7 @@ impl RevisionPinStore for InMemoryPinStore {
 ///   ARGV[2] = new value (`revision_id|generation|expires_at_unix_secs`)
 ///   ARGV[3] = ttl_secs (string-encoded u64)
 ///   ARGV[4] = cardinality cap (string-encoded usize)
+///   ARGV[5] = max members inspected per at-cap call (SSCAN COUNT hint)
 ///
 /// Why Lua: SET NX EX + GET is racy across stale generations.
 /// SCAN-based after-the-fact pruning is racy across cardinality.
@@ -308,6 +325,36 @@ if existing then
 end
 local card = redis.call('SCARD', KEYS[2])
 local cap = tonumber(ARGV[4])
+if card >= cap then
+  -- Pin keys expire on their own TTL but their set membership does not, and
+  -- every insert refreshes the set's TTL, so under steady traffic expired
+  -- members would fill the set and refuse all new pins forever. Drop members
+  -- whose pin key is gone before deciding the scope is really at cap.
+  --
+  -- Cost bound: this only runs when SCARD >= cap (the fast path above skips
+  -- it), and each call inspects ONE SSCAN chunk (~ARGV[5] members), not the
+  -- whole set, so Redis is never blocked on ~cap EXISTS calls.
+  -- Liveness: the SSCAN cursor is persisted in KEYS[2]..':cur' (same TTL as
+  -- the set). Each at-cap call resumes where the last stopped, and SSCAN
+  -- guarantees every member present for the whole iteration is returned, so
+  -- any dead member is visited within ceil(cap / ARGV[5]) at-cap calls. Until
+  -- then a call may conservatively refuse a pin (result {2}, the same
+  -- fail-safe fallthrough as a genuinely full scope); it never admits past cap.
+  local cur_key = KEYS[2] .. ':cur'
+  local cursor = redis.call('GET', cur_key) or '0'
+  local res = redis.call('SSCAN', KEYS[2], cursor, 'COUNT', tonumber(ARGV[5]))
+  for _, member in ipairs(res[2]) do
+    if redis.call('EXISTS', member) == 0 then
+      redis.call('SREM', KEYS[2], member)
+    end
+  end
+  if res[1] == '0' then
+    redis.call('DEL', cur_key)
+  else
+    redis.call('SET', cur_key, res[1], 'EX', tonumber(ARGV[3]))
+  end
+  card = redis.call('SCARD', KEYS[2])
+end
 if card >= cap then
   return {2}
 end
@@ -569,7 +616,8 @@ impl RevisionPinStore for RedisPinStore {
             .arg(generation.to_string())
             .arg(&value)
             .arg(ttl_secs.to_string())
-            .arg(self.cardinality_cap.to_string());
+            .arg(self.cardinality_cap.to_string())
+            .arg(PRUNE_SCAN_BUDGET.to_string());
         let mut conn = self.conn.clone();
         let fut = invocation.invoke_async::<(i64, Option<String>)>(&mut conn);
 
@@ -689,6 +737,15 @@ mod tests {
     }
     fn rev() -> RevisionId {
         RevisionId::new()
+    }
+
+    // The Lua pruning path needs a live Redis (covered by the gated Redis
+    // integration tests below); here we only pin the static script contract.
+    #[test]
+    fn try_pin_script_prunes_in_bounded_chunks() {
+        assert!(TRY_PIN_SCRIPT.contains("SSCAN"));
+        assert!(!TRY_PIN_SCRIPT.contains("SMEMBERS"));
+        const { assert!(PRUNE_SCAN_BUDGET > 0) };
     }
 
     #[test]

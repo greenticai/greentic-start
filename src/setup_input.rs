@@ -280,7 +280,9 @@ fn parse_question_value(question: &SetupQuestion, input: &str) -> anyhow::Result
                 return Ok(Value::String(input.to_string()));
             }
             if let Ok(index) = input.parse::<usize>()
-                && let Some(choice) = question.choices.get(index - 1)
+                && let Some(choice) = index
+                    .checked_sub(1)
+                    .and_then(|zero_based| question.choices.get(zero_based))
             {
                 return Ok(Value::String(choice.clone()));
             }
@@ -439,6 +441,8 @@ questions:
             Value::String("beta".to_string())
         );
         assert!(parse_question_value(&choice, "3").is_err());
+        // "0" must be rejected, not underflow `index - 1`.
+        assert!(parse_question_value(&choice, "0").is_err());
 
         let boolean = SetupQuestion {
             name: "enabled".to_string(),

@@ -106,12 +106,29 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut tmp = path.to_path_buf();
-    tmp.set_extension("tmp");
-    let mut file = std::fs::File::create(&tmp)?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, path)?;
+    // Unique temp name per call: a shared `<name>.tmp` lets two concurrent
+    // writers (admin API + foreground loop) interleave bytes into one file.
+    static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut tmp_name = path
+        .file_name()
+        .map(|name| name.to_os_string())
+        .unwrap_or_default();
+    tmp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let tmp = path.with_file_name(tmp_name);
+    let write_result = (|| -> std::io::Result<()> {
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err.into());
+    }
     if let Some(parent) = path.parent()
         && let Ok(dir) = std::fs::File::open(parent)
     {

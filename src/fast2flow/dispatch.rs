@@ -139,6 +139,16 @@ pub(crate) fn apply_dispatch(
     };
     let source = source.log_label();
     if let Some(node) = target.node.clone() {
+        if target.pack != pack_info.pack_id {
+            operator_log::info(
+                module_path!(),
+                format!(
+                    "[{source}] dispatch to pack={} node={node} is not this app pack {}; ignored",
+                    target.pack, pack_info.pack_id
+                ),
+            );
+            return Err(Unrouted::NoMatch);
+        }
         operator_log::info(
             module_path!(),
             format!(

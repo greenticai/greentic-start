@@ -220,7 +220,11 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
 
 #[cfg(unix)]
 fn is_process_running(pid: u32) -> anyhow::Result<bool> {
-    let result = unsafe { libc::kill(pid as i32, 0) };
+    let raw_pid = match i32::try_from(pid) {
+        Ok(value) if value > 0 => value,
+        _ => return Ok(false),
+    };
+    let result = unsafe { libc::kill(raw_pid, 0) };
     if result == 0 {
         return Ok(true);
     }
@@ -234,7 +238,12 @@ fn is_process_running(pid: u32) -> anyhow::Result<bool> {
 
 #[cfg(unix)]
 fn kill_process(pid: u32) -> anyhow::Result<()> {
-    let pid = pid as i32;
+    // Pidfile contents are untrusted: 0 or > i32::MAX would wrap to a
+    // non-positive pid and signal our own process group / every process.
+    let pid = match i32::try_from(pid) {
+        Ok(value) if value > 0 => value,
+        _ => return Err(anyhow::anyhow!("refusing to signal invalid pid {pid}")),
+    };
     let result = unsafe { libc::kill(-pid, libc::SIGTERM) };
     if result == 0 {
         return Ok(());

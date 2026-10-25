@@ -23,6 +23,9 @@ use std::path::Path;
 /// The pack entry the settings are read from.
 const PACK_CONFIG_ENTRY: &str = "assets/fast2flow.json";
 
+/// Largest `assets/fast2flow.json` read from a pack.
+const MAX_PACK_CONFIG_BYTES: u64 = 256 * 1024;
+
 /// The only schema this reader understands.
 const SCHEMA: &str = "greentic.fast2flow-config.v1";
 
@@ -52,8 +55,20 @@ pub(crate) fn read(pack_path: &Path) -> Result<Option<PackRouting>, String> {
     };
     let mut bytes = Vec::new();
     match archive.by_name(PACK_CONFIG_ENTRY) {
-        Ok(mut entry) => std::io::Read::read_to_end(&mut entry, &mut bytes)
-            .map_err(|e| format!("read {PACK_CONFIG_ENTRY}: {e}"))?,
+        Ok(entry) => {
+            // Bounded: the entry is pack content, and a tiny archive can
+            // declare a huge entry.
+            std::io::Read::read_to_end(
+                &mut std::io::Read::take(entry, MAX_PACK_CONFIG_BYTES + 1),
+                &mut bytes,
+            )
+            .map_err(|e| format!("read {PACK_CONFIG_ENTRY}: {e}"))?;
+            if bytes.len() as u64 > MAX_PACK_CONFIG_BYTES {
+                return Err(format!(
+                    "{PACK_CONFIG_ENTRY} is larger than {MAX_PACK_CONFIG_BYTES} bytes"
+                ));
+            }
+        }
         Err(_) => return Ok(None),
     };
     parse(&bytes).map(Some)

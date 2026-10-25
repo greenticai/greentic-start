@@ -34,6 +34,13 @@ impl<R: ProviderRunner> Scheduler<R> {
         let skew_ms = skew.as_millis() as i64;
         let states = self.store.list_states()?;
         for state in states {
+            // The store is shared across tenants/teams under one bundle; this
+            // scheduler's runner is bound to a single context, so renewing a
+            // foreign binding would invoke the provider with the wrong tenant
+            // and rewrite the state under a different path.
+            if !self.service.owns_state(&state) {
+                continue;
+            }
             if let Some(expiration) = state.expiration_unix_ms {
                 let renew_at = expiration.saturating_sub(skew_ms);
                 if now >= renew_at
@@ -61,7 +68,18 @@ impl<R: ProviderRunner> Scheduler<R> {
             change_types: state.change_types.clone(),
             expiration_target_unix_ms: Some(next_expiration_target(state)),
         };
-        let renewed = self.service.renew_once(&state.provider, &request)?;
+        let mut renewed = self.service.renew_once(&state.provider, &request)?;
+        // A renew response does not echo the ensure-time inputs or always the
+        // subscription id; keep what we already know so later renewals work.
+        if renewed.notification_url.is_none() {
+            renewed.notification_url = state.notification_url.clone();
+        }
+        if renewed.client_state.is_none() {
+            renewed.client_state = state.client_state.clone();
+        }
+        if renewed.subscription_id.is_none() {
+            renewed.subscription_id = state.subscription_id.clone();
+        }
         self.store.write_state(&renewed)
     }
 
@@ -78,12 +96,16 @@ impl<R: ProviderRunner> Scheduler<R> {
 
 fn next_expiration_target(state: &SubscriptionState) -> u64 {
     let now_ms = Utc::now().timestamp_millis();
+    let now = now_ms.max(0) as u64;
+    // Never target a moment in the past: an already-expired binding extended
+    // from its stale expiration would still be expired.
     let base = state
         .expiration_unix_ms
         .filter(|ms| *ms > 0)
         .map(|ms| ms as u64)
-        .unwrap_or_else(|| now_ms as u64);
-    base + DEFAULT_RENEW_EXTENSION_MS
+        .unwrap_or(now)
+        .max(now);
+    base.saturating_add(DEFAULT_RENEW_EXTENSION_MS)
 }
 
 #[cfg(test)]
@@ -247,5 +269,51 @@ mod tests {
             .expect("read later")
             .expect("later state");
         assert_eq!(untouched.subscription_id.as_deref(), Some("sub-later"));
+    }
+
+    #[test]
+    fn renew_due_skips_foreign_tenant_and_keeps_ensure_inputs() {
+        let dir = tempdir().expect("tempdir");
+        let store = SubscriptionStore::new(dir.path());
+        let expired = Utc::now().timestamp_millis() - 1_000;
+        let own = sample_state(Some(expired));
+        let foreign = SubscriptionState {
+            tenant: "other".to_string(),
+            ..sample_state(Some(expired))
+        };
+        store.write_state(&own).expect("write own");
+        store.write_state(&foreign).expect("write foreign");
+
+        // Exactly one outcome: a second invocation would panic in FakeRunner.
+        let service = SubscriptionService::new(
+            FakeRunner::new(vec![success_outcome(json!({
+                "subscription_id": "sub-renewed",
+                "expiration_unix_ms": Utc::now().timestamp_millis() + 172_800_000
+            }))]),
+            test_context(),
+        );
+        let scheduler = Scheduler::new(service, store.clone());
+        scheduler.renew_due(Duration::from_secs(0)).expect("renew");
+
+        let renewed = store
+            .read_state("messaging-graph", "demo", Some("ops"), "binding-1")
+            .expect("read")
+            .expect("state");
+        assert_eq!(
+            renewed.notification_url.as_deref(),
+            Some("https://example.test/hook")
+        );
+        assert_eq!(renewed.client_state.as_deref(), Some("secret"));
+        let untouched = store
+            .read_state("messaging-graph", "other", Some("ops"), "binding-1")
+            .expect("read")
+            .expect("state");
+        assert_eq!(untouched.subscription_id.as_deref(), Some("sub-123"));
+    }
+
+    #[test]
+    fn next_expiration_target_never_in_the_past() {
+        let state = sample_state(Some(1_000));
+        assert!(next_expiration_target(&state) > Utc::now().timestamp_millis() as u64);
     }
 }

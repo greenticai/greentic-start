@@ -56,7 +56,8 @@ pub(crate) fn serve_static_route_from_pack(
     // Redirect to trailing-slash when the matched route is a directory (no asset path)
     // and the request doesn't end with '/'.
     if route_match.asset_path.is_empty() && !route_match.request_is_directory {
-        let redirect_path = format!("{}/", request_path.trim_end_matches('/'));
+        // Single leading slash: `//host/..` would be a protocol-relative redirect.
+        let redirect_path = format!("/{}/", request_path.trim_matches('/'));
         operator_log::info(
             module_path!(),
             format!("[static] redirect {request_path} -> {redirect_path}"),
@@ -180,7 +181,8 @@ pub(crate) fn serve_static_route(
     // and the request doesn't end with '/'. Without this, relative paths in index.html
     // (e.g. ./runtime-bootstrap.js) resolve against the wrong parent directory.
     if route_match.asset_path.is_empty() && !route_match.request_is_directory {
-        let redirect_path = format!("{}/", request_path.trim_end_matches('/'));
+        // Single leading slash: `//host/..` would be a protocol-relative redirect.
+        let redirect_path = format!("/{}/", request_path.trim_matches('/'));
         operator_log::info(
             module_path!(),
             format!("[static] redirect {request_path} -> {redirect_path}"),

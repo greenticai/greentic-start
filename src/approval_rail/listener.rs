@@ -142,7 +142,7 @@ async fn run_listener_loop(
                 module_path!(),
                 format!(
                     "approval bridge failed to connect to {}: {err}",
-                    config.nats_url
+                    redact_userinfo(&config.nats_url)
                 ),
             );
             return;
@@ -202,6 +202,20 @@ async fn run_listener_loop(
                 break;
             }
         }
+    }
+}
+
+/// `url` without any `user:password@` part, for logging.
+fn redact_userinfo(url: &str) -> String {
+    match url.split_once("://") {
+        Some((scheme, rest)) => {
+            let authority_end = rest.find(['/', '?']).unwrap_or(rest.len());
+            match rest[..authority_end].rfind('@') {
+                Some(at) => format!("{scheme}://<redacted>@{}", &rest[at + 1..]),
+                None => url.to_string(),
+            }
+        }
+        None => url.to_string(),
     }
 }
 
@@ -385,6 +399,19 @@ mod tests {
     use crate::approval_rail::ledger::Delivery;
     use serde_json::json;
     use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn redact_userinfo_hides_credentials_only() {
+        assert_eq!(
+            redact_userinfo("nats://user:secret@host:4222"),
+            "nats://<redacted>@host:4222"
+        );
+        assert_eq!(redact_userinfo("nats://host:4222"), "nats://host:4222");
+        assert_eq!(
+            redact_userinfo("nats://host:4222/p@th"),
+            "nats://host:4222/p@th"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingDelivery {

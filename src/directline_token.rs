@@ -30,9 +30,7 @@ pub struct DirectLineTokenClaims {
     pub conv: Option<String>,
 }
 
-// Variants are surfaced by the WS upgrade handler (Task 9). Until that lands
-// they are only consumed in tests, so silence dead_code warnings on the lib build.
-#[allow(dead_code)]
+// Variants are surfaced by the WS upgrade handler (`websocket::upgrade`).
 #[derive(Debug, thiserror::Error)]
 pub enum TokenVerifyError {
     #[error("malformed token")]
@@ -54,8 +52,7 @@ pub enum TokenVerifyError {
 ///
 /// `signing_key` is the same shared secret the WASM provider uses to sign
 /// (loaded from secrets capability under `jwt_signing_key`).
-// Consumed by tests today; the WS upgrade handler (Task 9) will call it next.
-#[allow(dead_code)]
+// Called by the WS upgrade handler (`websocket::upgrade`).
 pub fn verify_directline_token(
     token: &str,
     expected_conv_id: &str,
@@ -88,7 +85,7 @@ pub fn verify_directline_token(
         serde_json::from_slice(&payload_bytes).map_err(|_| TokenVerifyError::Malformed)?;
 
     let now = chrono::Utc::now().timestamp();
-    if claims.exp < now {
+    if claims.exp <= now {
         return Err(TokenVerifyError::Expired);
     }
     let bound_conv = claims

@@ -433,7 +433,7 @@ impl RevisionDispatcher {
         // the canonical call site fires before `self` is published to the
         // live slot. Matches the mutation discipline of
         // [`Self::mutate_deployment`].
-        let _w = self.write_lock.lock().expect("write lock poisoned");
+        let _w = self.lock_writes();
         let cur = self.snapshot.load_full();
         let mut next = (*cur).clone();
         for (dep_id, entry) in next.deployments.iter_mut() {
@@ -540,6 +540,15 @@ impl RevisionDispatcher {
             .unwrap_or_default()
     }
 
+    /// Take the writer lock. It guards `()` (ordering only; the data lives in
+    /// the `ArcSwap`), so a poisoned lock carries no broken invariant and is
+    /// recovered rather than turning one panic into a permanent dispatcher outage.
+    fn lock_writes(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Serialize a per-deployment entry mutation under `write_lock`. `f`
     /// returns whether a change actually occurred — we only store the new
     /// snapshot when something changed, so a no-op call doesn't churn the
@@ -549,16 +558,15 @@ impl RevisionDispatcher {
     where
         F: FnOnce(&mut DeploymentEntry) -> bool,
     {
-        let _w = self.write_lock.lock().expect("write lock poisoned");
+        let _w = self.lock_writes();
         let prev = self.snapshot.load_full();
         if !prev.deployments.contains_key(&deployment_id) {
             return false;
         }
         let mut next = (*prev).clone();
-        let entry = next
-            .deployments
-            .get_mut(&deployment_id)
-            .expect("checked above");
+        let Some(entry) = next.deployments.get_mut(&deployment_id) else {
+            return false;
+        };
         let changed = f(entry);
         if changed {
             self.snapshot.store(std::sync::Arc::new(next));
@@ -610,7 +618,7 @@ impl RevisionDispatcher {
         // concurrent callers with the same `expected_generation` both observe
         // the pre-update snapshot and the second `store` clobbers the first
         // (also losing unrelated deployment updates in the clone).
-        let _w = self.write_lock.lock().expect("write lock poisoned");
+        let _w = self.lock_writes();
 
         let prev = self.snapshot.load_full();
         let existing = prev.deployments.get(&deployment_id);
@@ -1046,12 +1054,12 @@ fn weighted_pick_healthy<R: Rng + ?Sized>(
         pick -= w;
     }
     // Unreachable: pick < total and sum(non-draining w) == total.
-    Ok(revisions
+    revisions
         .iter()
         .rev()
         .find(|r| !draining.contains(&r.revision_id))
-        .expect("at least one non-draining checked above")
-        .revision_id)
+        .map(|r| r.revision_id)
+        .ok_or_else(|| anyhow::anyhow!("no non-zero-weight, non-draining revisions available"))
 }
 
 /// Parse a Crockford-base32 ULID string into a typed [`Ulid`], with a labelled

@@ -97,10 +97,9 @@ pub fn refusal_response(err: &UpgradeError) -> Response<Full<Bytes>> {
         UpgradeError::NotWebSocket => StatusCode::BAD_REQUEST,
         UpgradeError::UpgradeFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    Response::builder()
-        .status(status)
-        .body(Full::new(Bytes::from(err.to_string())))
-        .expect("static response")
+    let mut response = Response::new(Full::new(Bytes::from(err.to_string())));
+    *response.status_mut() = status;
+    response
 }
 
 #[cfg(test)]

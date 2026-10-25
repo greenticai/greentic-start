@@ -186,7 +186,7 @@ fn parse_reply(decoded: &JsonValue, deny: bool) -> IngressReply {
     let status_code = decoded
         .get("status_code")
         .and_then(JsonValue::as_u64)
-        .map(|value| value as u16)
+        .and_then(|value| u16::try_from(value).ok())
         .or(if deny { Some(403) } else { Some(200) });
     IngressReply {
         text,

@@ -33,10 +33,13 @@ pub fn pkce() -> Pkce {
 
 /// Percent-encode a query/form value (unreserved chars pass through).
 pub fn enc(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.' | '~' => c.to_string(),
-            _ => format!("%{:02X}", c as u8),
+    // Encode per UTF-8 byte (RFC 3986): `c as u8` would truncate non-ASCII chars.
+    s.bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
         })
         .collect()
 }
@@ -100,7 +103,13 @@ pub struct TokenResponse {
 fn post_form(token_url: &str, form: String) -> Result<TokenResponse, String> {
     let url = token_url.to_string();
     let body = std::thread::spawn(move || {
-        ureq::post(&url)
+        // Bounded: `RefreshingResolver` holds a per-key lock across this call,
+        // so a hung token endpoint must not park every caller for that key.
+        ureq::Agent::config_builder()
+            .timeout_global(Some(std::time::Duration::from_secs(30)))
+            .build()
+            .new_agent()
+            .post(&url)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .header("Accept", "application/json")
             .send(form.as_bytes())
@@ -109,10 +118,10 @@ fn post_form(token_url: &str, form: String) -> Result<TokenResponse, String> {
     .join()
     .map_err(|_| "token request thread panicked".to_string())?
     .map_err(|e| format!("token request failed: {e}"))?;
-    let parsed: TokenResponse = serde_json::from_str(&body)
-        .map_err(|e| format!("token response parse failed: {e}; body={body}"))?;
+    let parsed: TokenResponse =
+        serde_json::from_str(&body).map_err(|e| format!("token response parse failed: {e}"))?;
     if parsed.access_token.trim().is_empty() {
-        return Err(format!("no access_token in response: {body}"));
+        return Err("no access_token in response".to_string());
     }
     Ok(parsed)
 }
@@ -223,7 +232,9 @@ fn verifier_store() -> &'static Mutex<HashMap<String, (String, Instant)>> {
 
 /// Stash a PKCE verifier under the state `jti` (evicts entries older than 10 min).
 pub fn store_verifier(jti: &str, verifier: &str) {
-    let mut m = verifier_store().lock().expect("verifier store poisoned");
+    let mut m = verifier_store()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     let now = Instant::now();
     m.retain(|_, (_, t)| now.duration_since(*t) < Duration::from_secs(600));
     m.insert(jti.to_string(), (verifier.to_string(), now));
@@ -233,7 +244,7 @@ pub fn store_verifier(jti: &str, verifier: &str) {
 pub fn take_verifier(jti: &str) -> Option<String> {
     verifier_store()
         .lock()
-        .expect("verifier store poisoned")
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
         .remove(jti)
         .map(|(v, _)| v)
 }
@@ -284,5 +295,6 @@ mod tests {
     fn enc_encodes_reserved() {
         assert_eq!(enc("a b/c?"), "a%20b%2Fc%3F");
         assert_eq!(enc("safe-_.~"), "safe-_.~");
+        assert_eq!(enc("é"), "%C3%A9");
     }
 }

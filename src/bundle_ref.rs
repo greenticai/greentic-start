@@ -371,7 +371,7 @@ fn extract_bundle_archive(
     }
 
     let marker_contents = format!("source={}\ndigest={}\n", fetched.source_ref, fetched.digest);
-    fs::write(&marker, marker_contents)
+    crate::runtime_state::atomic_write(&marker, marker_contents.as_bytes())
         .with_context(|| format!("write bundle extraction marker {}", marker.display()))?;
     Ok(ResolvedBundle {
         source_ref: fetched.source_ref.clone(),
@@ -465,6 +465,50 @@ fn bytes_digest(bytes: &[u8]) -> String {
     output
 }
 
+/// Upper bound on the total bytes one bundle archive may expand to.
+const MAX_EXTRACT_TOTAL_BYTES: u64 = 8 * 1024 * 1024 * 1024;
+/// Upper bound on the number of entries one bundle archive may contain.
+const MAX_EXTRACT_ENTRIES: u64 = 200_000;
+
+/// Tracks expanded size and entry count so a decompression bomb is refused.
+struct ExtractBudget {
+    remaining_bytes: u64,
+    entries: u64,
+}
+
+impl Default for ExtractBudget {
+    fn default() -> Self {
+        Self {
+            remaining_bytes: MAX_EXTRACT_TOTAL_BYTES,
+            entries: 0,
+        }
+    }
+}
+
+impl ExtractBudget {
+    fn count_entry(&mut self) -> anyhow::Result<()> {
+        self.entries += 1;
+        if self.entries > MAX_EXTRACT_ENTRIES {
+            bail!("bundle archive has more than {MAX_EXTRACT_ENTRIES} entries");
+        }
+        Ok(())
+    }
+}
+
+fn copy_within_budget<R: Read, W: std::io::Write>(
+    source: &mut R,
+    target: &mut W,
+    budget: &mut ExtractBudget,
+) -> anyhow::Result<()> {
+    let limit = budget.remaining_bytes;
+    let copied = std::io::copy(&mut (&mut *source).take(limit.saturating_add(1)), target)?;
+    if copied > limit {
+        bail!("bundle archive expands beyond {MAX_EXTRACT_TOTAL_BYTES} bytes");
+    }
+    budget.remaining_bytes -= copied;
+    Ok(())
+}
+
 fn extract_zip(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
     let file =
         fs::File::open(path).with_context(|| format!("open zip bundle {}", path.display()))?;
@@ -473,19 +517,19 @@ fn extract_zip(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create zip output dir {}", out_dir.display()))?;
     let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut budget = ExtractBudget::default();
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
             .with_context(|| format!("read zip entry {index} in {}", path.display()))?;
         let raw_name = entry.name().to_string();
-        let normalized = normalize_archive_inner_path(&raw_name)?;
-        if normalized.is_none() {
+        let Some(normalized) = normalize_archive_inner_path(&raw_name)? else {
             continue;
-        }
-        let normalized = normalized.unwrap();
+        };
         if !seen_paths.insert(normalized.clone()) {
             bail!("duplicate zip entry rejected: {normalized}");
         }
+        budget.count_entry()?;
         let destination = safe_output_path(out_dir, &normalized)?;
         if entry.is_dir() || raw_name.ends_with('/') {
             safe_create_dir_all(out_dir, &destination)
@@ -504,7 +548,7 @@ fn extract_zip(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
             .unwrap_or(false);
         let mut target = File::create(&destination)
             .with_context(|| format!("create file {}", destination.display()))?;
-        std::io::copy(&mut entry, &mut target)
+        copy_within_budget(&mut entry, &mut target, &mut budget)
             .with_context(|| format!("extract zip entry {normalized}"))?;
         mark_executable_if(&destination, executable)
             .with_context(|| format!("set mode for {normalized}"))?;
@@ -541,6 +585,7 @@ fn extract_tar_reader<R: Read>(
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create tar output dir {}", out_dir.display()))?;
     let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut budget = ExtractBudget::default();
     let entries = archive
         .entries()
         .with_context(|| format!("read tar entries in {}", source.display()))?;
@@ -557,6 +602,7 @@ fn extract_tar_reader<R: Read>(
         if !seen_paths.insert(normalized.clone()) {
             bail!("duplicate tar entry rejected: {normalized}");
         }
+        budget.count_entry()?;
         let destination = safe_output_path(out_dir, &normalized)?;
         let header = entry.header();
         let entry_type = header.entry_type();
@@ -576,7 +622,7 @@ fn extract_tar_reader<R: Read>(
                     .with_context(|| format!("validate destination for {normalized}"))?;
                 let mut target = File::create(&destination)
                     .with_context(|| format!("create file {}", destination.display()))?;
-                std::io::copy(&mut entry, &mut target)
+                copy_within_budget(&mut entry, &mut target, &mut budget)
                     .with_context(|| format!("extract tar entry {normalized}"))?;
                 mark_executable_if(&destination, executable)
                     .with_context(|| format!("set mode for {normalized}"))?;
@@ -628,6 +674,7 @@ fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
     fs::create_dir_all(out_dir)
         .with_context(|| format!("create squashfs output dir {}", out_dir.display()))?;
     let mut seen_paths: HashSet<String> = HashSet::new();
+    let mut budget = ExtractBudget::default();
     for node in filesystem.files() {
         let full = node.fullpath.to_string_lossy();
         let Some(normalized) = normalize_archive_inner_path(full.as_ref())? else {
@@ -636,6 +683,7 @@ fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
         if !seen_paths.insert(normalized.clone()) {
             bail!("duplicate squashfs entry rejected: {normalized}");
         }
+        budget.count_entry()?;
         let destination = safe_output_path(out_dir, &normalized)?;
         match &node.inner {
             InnerNode::Dir(_) => {
@@ -652,7 +700,7 @@ fn extract_squashfs(path: &Path, out_dir: &Path) -> anyhow::Result<()> {
                 let mut source = filesystem.file(file).reader();
                 let mut target = File::create(&destination)
                     .with_context(|| format!("create file {}", destination.display()))?;
-                std::io::copy(&mut source, &mut target)
+                copy_within_budget(&mut source, &mut target, &mut budget)
                     .with_context(|| format!("extract squashfs entry {normalized}"))?;
                 mark_executable_if(&destination, node.header.permissions & 0o111 != 0)
                     .with_context(|| format!("set mode for {normalized}"))?;
@@ -1145,6 +1193,32 @@ mod tests {
     use flate2::write::GzEncoder;
     use std::io::Write;
     use tar::Builder as TarBuilder;
+
+    #[test]
+    fn copy_within_budget_refuses_expansion_past_budget() {
+        let mut budget = ExtractBudget {
+            remaining_bytes: 4,
+            entries: 0,
+        };
+        let mut sink = Vec::new();
+        copy_within_budget(&mut &b"abcd"[..], &mut sink, &mut budget).expect("fits");
+        assert_eq!(budget.remaining_bytes, 0);
+        let err =
+            copy_within_budget(&mut &b"e"[..], &mut sink, &mut budget).expect_err("over budget");
+        assert!(err.to_string().contains("expands beyond"));
+    }
+
+    #[test]
+    fn extract_budget_refuses_more_entries_than_the_cap() {
+        let mut budget = ExtractBudget {
+            remaining_bytes: 0,
+            entries: MAX_EXTRACT_ENTRIES,
+        };
+        let err = budget.count_entry().expect_err("one entry too many");
+        assert!(err.to_string().contains("entries"));
+        let mut fresh = ExtractBudget::default();
+        fresh.count_entry().expect("first entry fits");
+    }
     use tempfile::tempdir;
     use zip::write::FileOptions;
 

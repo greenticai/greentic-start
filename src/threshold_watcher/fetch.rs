@@ -33,11 +33,14 @@ pub fn extract_number(body: &Value, json_path: &str) -> Option<f64> {
     for segment in json_path.split('.') {
         current = current.as_object()?.get(segment)?;
     }
+    // `"NaN"` / `"inf"` parse as f64 but are not measurements: reading one
+    // as a metric could fire (or suppress) an alert spuriously.
     match current {
         Value::Number(n) => n.as_f64(),
         Value::String(s) => s.trim().parse::<f64>().ok(),
         _ => None,
     }
+    .filter(|value| value.is_finite())
 }
 
 /// Fetch `source.url`, applying `source.headers`, and extract the numeric
@@ -99,6 +102,14 @@ mod tests {
     fn extract_number_non_numeric_leaf_is_none() {
         let body = json!({"data": {"available": true}});
         assert_eq!(extract_number(&body, "data.available"), None);
+    }
+
+    #[test]
+    fn extract_number_rejects_non_finite_strings() {
+        for text in ["NaN", "inf", "-infinity"] {
+            let body = json!({"v": text});
+            assert_eq!(extract_number(&body, "v"), None, "{text}");
+        }
     }
 
     #[test]

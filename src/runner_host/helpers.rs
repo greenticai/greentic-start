@@ -233,7 +233,17 @@ pub(super) fn payload_preview(bytes: &[u8]) -> String {
         return "<empty>".to_string();
     }
     let preview_len = bytes.len().min(MAX_PREVIEW);
-    if let Ok(text) = std::str::from_utf8(&bytes[..preview_len]) {
+    let window = &bytes[..preview_len];
+    // A cut that lands inside a multi-byte character is truncation, not binary
+    // data: keep the valid prefix instead of base64-encoding a text payload.
+    let text_prefix = match std::str::from_utf8(window) {
+        Ok(text) => Some(text),
+        Err(err) if err.error_len().is_none() && bytes.len() > MAX_PREVIEW => {
+            std::str::from_utf8(&window[..err.valid_up_to()]).ok()
+        }
+        Err(_) => None,
+    };
+    if let Some(text) = text_prefix {
         if bytes.len() <= MAX_PREVIEW {
             text.to_string()
         } else {
@@ -457,6 +467,12 @@ mod tests {
 
         let long = vec![b'a'; 300];
         assert!(payload_preview(&long).ends_with("..."));
+
+        // 255 ASCII bytes then a 2-byte char straddling the 256-byte cut.
+        let mut straddle = vec![b'a'; 255];
+        straddle.extend_from_slice("é".as_bytes());
+        let preview = payload_preview(&straddle);
+        assert_eq!(preview, format!("{}...", "a".repeat(255)));
 
         let dir = tempdir().expect("tempdir");
         assert!(
