@@ -21,6 +21,7 @@ pub(crate) mod dispatch;
 pub(crate) mod email;
 pub(crate) mod email_poller;
 pub(crate) mod field_ref;
+pub(crate) mod imap_client;
 pub(crate) mod limits;
 pub(crate) mod scheduler;
 pub(crate) mod schema;

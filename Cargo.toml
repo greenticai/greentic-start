@@ -33,6 +33,7 @@ test-support = []
 [dependencies]
 anyhow = "1.0"
 arc-swap = "1"
+async-imap = { version = "0.12", default-features = false, features = ["runtime-tokio"] }
 # 0.49, not 0.46: every async-nats 0.46.x pins `rustls-webpki = "0.102"`, whose
 # newest release (0.102.8) carries GHSA-82j2-j2ch-gfr8 (high) and
 # GHSA-pwjx-qhcg-rvj4. No fixed 0.102.x exists; 0.47 moved to the patched 0.103
@@ -96,6 +97,7 @@ jsonschema = "0.46"
 # verifies tokens itself.
 jsonwebtoken = "10"
 libc = "0.2"
+mail-parser = "0.11"
 notify-debouncer-full = "0.7"
 once_cell = "1.21"
 open = "5"
@@ -167,6 +169,7 @@ ulid = "1"
 unic-langid = "0.9"
 urlencoding = "2"
 wasmtime = { version = "45", default-features = false, features = ["component-model", "cranelift", "runtime"] }
+webpki-roots = "1"
 zip = "8"
 zstd = "0.13"
 
@@ -521,6 +524,7 @@ greentic-llm = { version = ">=1.2.0-dev.35838533452, <1.3.0-0", features = ["tes
 # This crate with `test-support`, for the integration tests (see [features]).
 greentic-start = { path = ".", features = ["test-support"] }
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+rcgen = "0.14"
 tokio = { version = "1", features = ["test-util"] }
 wat = "1"
 

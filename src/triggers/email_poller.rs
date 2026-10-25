@@ -88,10 +88,6 @@ pub(crate) struct MailMessage {
     pub attachments: Vec<MailAttachment>,
 }
 
-#[allow(
-    dead_code,
-    reason = "constructed by the IMAP connector, not compiled in yet"
-)]
 #[derive(Clone, Debug)]
 pub(crate) enum Fetched {
     Message(Box<MailMessage>),
@@ -141,9 +137,9 @@ impl AttachmentSink for DroppedAttachments {
     }
 }
 
-/// The real IMAP client. `None` until a crate is chosen (see addendum).
+/// The real IMAP client (`async-imap` over `rustls`).
 pub(crate) fn default_connector() -> Option<Arc<dyn ImapConnector>> {
-    None
+    Some(Arc::new(super::imap_client::RustlsImapConnector::new()))
 }
 
 /// What one poll of one trigger concluded, for the caller's scheduling.
