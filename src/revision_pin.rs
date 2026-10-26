@@ -1641,6 +1641,77 @@ mod tests {
         );
     }
 
+    /// The set's membership outlives the pin keys it names, so a scope can
+    /// look full while every member is dead. The Lua script must prune those
+    /// members at cap instead of refusing new pins until the set expires.
+    #[tokio::test]
+    async fn redis_at_cap_prunes_members_whose_pin_expired() {
+        let Some(url) = redis_url_or_skip() else {
+            return;
+        };
+        let store = RedisPinStore::from_url(&url)
+            .await
+            .expect("redis open")
+            .with_cardinality_cap(3);
+        let dep_id = dep();
+        let tenant = format!("tenant-prune-{}", Ulid::new());
+        let pin = |hint: &'static str, ttl: u64| {
+            let store = &store;
+            let tenant = tenant.clone();
+            async move {
+                store
+                    .try_pin(
+                        PinKey {
+                            env_id: "local",
+                            deployment_id: dep_id,
+                            tenant: &tenant,
+                            hint,
+                        },
+                        rev(),
+                        1,
+                        Duration::from_secs(ttl),
+                    )
+                    .await
+            }
+        };
+
+        // Two short-lived pins, then one long-lived pin: the third insert
+        // refreshes the set's TTL, so the set outlives the two dead keys and
+        // sits at the cap with two dead members.
+        assert!(matches!(
+            pin("dead-a", 1).await,
+            PinOutcome::Inserted { .. }
+        ));
+        assert!(matches!(
+            pin("dead-b", 1).await,
+            PinOutcome::Inserted { .. }
+        ));
+        assert!(matches!(pin("live", 60).await, PinOutcome::Inserted { .. }));
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+
+        // Without pruning this would be `Skipped`: SCARD is still 3.
+        assert!(
+            matches!(pin("fresh", 60).await, PinOutcome::Inserted { .. }),
+            "a scope full of expired members must admit a new pin"
+        );
+        // The live member survived the prune.
+        assert!(
+            store
+                .lookup(
+                    PinKey {
+                        env_id: "local",
+                        deployment_id: dep_id,
+                        tenant: &tenant,
+                        hint: "live",
+                    },
+                    1
+                )
+                .await
+                .is_some(),
+            "pruning must only drop members whose pin key is gone"
+        );
+    }
+
     /// Regression (live): two scopes that pre-fix collided to the
     /// same Redis key (`a:b:c`) must now route to independent pins.
     #[tokio::test]

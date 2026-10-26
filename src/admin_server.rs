@@ -1471,6 +1471,9 @@ fn internal_server_error(err: anyhow::Error) -> AdminHttpError {
 }
 
 #[cfg(test)]
+mod mtls_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::runtime_state::{RuntimePaths, StopRequest};
