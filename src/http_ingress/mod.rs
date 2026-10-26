@@ -3059,6 +3059,11 @@ mod tests {
     #[test]
     fn legacy_setup_surface_is_gated_for_non_loopback_peers() {
         use sha2::{Digest, Sha256};
+        // Resolving the secrets manager reads `GREENTIC_ENV`; hold the lock so
+        // a test that mutates it cannot flip the store read-only mid-run.
+        let _env_guard = crate::test_env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let runtime = Runtime::new().unwrap();
         let dir = tempdir().unwrap();
         let discovery = crate::discovery::discover(dir.path()).unwrap();

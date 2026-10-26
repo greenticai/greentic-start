@@ -320,19 +320,17 @@ mod tests {
     fn resolve_env_prefers_override_then_env_then_default() {
         // Updated for A4b: the bare default is now `local` (was `dev`),
         // and any `dev` value goes through the compat-alias remap.
-        // Env-var mutation is serialized via the shared `ENV_LOCK` /
-        // `with_clean_env` helper in `lib.rs::tests`; this test stays
-        // intentionally simple by avoiding `GREENTIC_DISABLE_DEV_ALIAS`
-        // (the gate is tested in `lib.rs`).
-        assert_eq!(resolve_env(Some("stage")), "stage");
-        unsafe {
-            std::env::set_var("GREENTIC_ENV", "prod");
-        }
-        assert_eq!(resolve_env(None), "prod");
-        unsafe {
-            std::env::remove_var("GREENTIC_ENV");
-        }
-        assert_eq!(resolve_env(None), "local");
+        // Exercises the pure core so the process-global `GREENTIC_ENV` is never
+        // touched: other tests read it without `test_env_lock`, and a transient
+        // `prod` made them see a read-only env store. The alias gate
+        // (`GREENTIC_DISABLE_DEV_ALIAS`) is tested in `lib.rs`.
+        use crate::resolve_env_from;
+        assert_eq!(
+            resolve_env_from(Some("stage"), Some("prod".into())),
+            "stage"
+        );
+        assert_eq!(resolve_env_from(None, Some("prod".into())), "prod");
+        assert_eq!(resolve_env_from(None, None), "local");
     }
 
     #[test]
