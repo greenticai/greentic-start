@@ -266,6 +266,78 @@ mod tests {
         assert_eq!(store.incr("c", Duration::from_millis(20)).await.unwrap(), 1);
     }
 
+    // ── Redis integration tests ───────────────────────────────────────
+    //
+    // Gated by `GREENTIC_TEST_REDIS_URL`, like the session-pin store's.
+    // Run locally:
+    //   docker run --rm -p 6379:6379 redis
+    //   GREENTIC_TEST_REDIS_URL=redis://127.0.0.1:6379 \
+    //     cargo test -p greentic-start triggers::store
+
+    async fn redis_store_or_skip() -> Option<RedisTriggerStore> {
+        match std::env::var("GREENTIC_TEST_REDIS_URL") {
+            Ok(url) if !url.is_empty() => {
+                Some(RedisTriggerStore::from_url(&url).await.expect("redis open"))
+            }
+            _ => {
+                eprintln!("skipping: GREENTIC_TEST_REDIS_URL not set");
+                None
+            }
+        }
+    }
+
+    fn unique_key(label: &str) -> String {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        format!("gt:trig:test:{label}:{}:{nanos}", std::process::id())
+    }
+
+    #[tokio::test]
+    async fn redis_a_released_claim_can_be_taken_again() {
+        let Some(store) = redis_store_or_skip().await else {
+            return;
+        };
+        let key = unique_key("release");
+        assert!(store.claim(&key, Duration::from_secs(60)).await.unwrap());
+        assert!(
+            !store.claim(&key, Duration::from_secs(60)).await.unwrap(),
+            "a held claim must not be taken twice"
+        );
+        store.release(&key).await.unwrap();
+        assert!(
+            store.claim(&key, Duration::from_secs(60)).await.unwrap(),
+            "a released claim must be claimable again"
+        );
+        store.release(&key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_releasing_an_absent_key_is_not_an_error() {
+        let Some(store) = redis_store_or_skip().await else {
+            return;
+        };
+        store.release(&unique_key("absent")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn redis_incr_counts_within_its_window_and_restarts_after_it() {
+        let Some(store) = redis_store_or_skip().await else {
+            return;
+        };
+        let key = unique_key("incr");
+        assert_eq!(store.incr(&key, Duration::from_secs(1)).await.unwrap(), 1);
+        assert_eq!(store.incr(&key, Duration::from_secs(1)).await.unwrap(), 2);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        assert_eq!(
+            store.incr(&key, Duration::from_secs(1)).await.unwrap(),
+            1,
+            "the window restarts once the key expires"
+        );
+        store.release(&key).await.unwrap();
+    }
+
     #[test]
     fn a_colon_in_the_free_part_cannot_collide_with_the_key_structure() {
         let a = key("seen", "prod", "dep", "t", "a:b");
