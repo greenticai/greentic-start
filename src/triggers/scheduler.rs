@@ -123,6 +123,26 @@ pub(super) async fn pick_revision(
     }
 }
 
+/// Claim one cron tick in the shared store. `Ok(true)` means this replica is
+/// the one that fires it; with a store the replicas genuinely share, exactly
+/// one caller per `(env, deployment, trigger, tick)` gets that answer.
+pub(super) async fn claim_tick(
+    store: &dyn TriggerStore,
+    env: &str,
+    deployment: &str,
+    trigger_id: &str,
+    due: DateTime<Utc>,
+) -> anyhow::Result<bool> {
+    let claim_key = store::key(
+        "fire",
+        env,
+        deployment,
+        trigger_id,
+        &due.timestamp().to_string(),
+    );
+    store.claim(&claim_key, TICK_CLAIM_TTL).await
+}
+
 async fn fire_due(
     host: &Arc<RunnerHost>,
     store: &Arc<dyn TriggerStore>,
@@ -141,14 +161,15 @@ async fn fire_due(
     }
     // One firer per tick. A store ERROR skips the tick: firing anyway would
     // let every replica fire it, which multiplies whatever the flow does.
-    let claim_key = store::key(
-        "fire",
+    match claim_tick(
+        store.as_ref(),
         env,
         &entry.scope.deployment_id.to_string(),
         &entry.spec.trigger_id,
-        &due.timestamp().to_string(),
-    );
-    match store.claim(&claim_key, TICK_CLAIM_TTL).await {
+        due,
+    )
+    .await
+    {
         Ok(true) => {}
         Ok(false) => return,
         Err(err) => {

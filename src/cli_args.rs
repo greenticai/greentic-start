@@ -24,6 +24,9 @@ pub(crate) enum Command {
     Restart(StartArgs),
     Warmup(WarmupArgs),
     Doctor(DoctorArgs),
+    /// Print the runtime's capability flags as JSON (e.g. `shared-state-backend`)
+    /// so a deployer can gate features on what this build supports.
+    Capabilities,
     #[command(hide = true)]
     ResolveSecret(ResolveSecretArgs),
     /// Internal: run the outbound tunnel agent. Spawned by the gtunnel provider;
@@ -439,6 +442,7 @@ pub(crate) fn normalize_args(raw_tail: Vec<String>) -> Vec<String> {
         "restart",
         "warmup",
         "doctor",
+        "capabilities",
         "resolve-secret",
         "__tunnel-agent",
     ];

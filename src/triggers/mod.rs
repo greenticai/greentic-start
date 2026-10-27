@@ -24,6 +24,8 @@ pub(crate) mod field_ref;
 pub(crate) mod imap_client;
 pub(crate) mod limits;
 pub(crate) mod scheduler;
+#[cfg(test)]
+mod scheduler_tests;
 pub(crate) mod schema;
 pub(crate) mod store;
 pub(crate) mod table;
@@ -41,6 +43,11 @@ static STORE: OnceLock<Arc<dyn store::TriggerStore>> = OnceLock::new();
 /// starts; a second call is ignored (the first store stays authoritative).
 pub(crate) fn install_store(store: Arc<dyn store::TriggerStore>) {
     let _ = STORE.set(store);
+}
+
+/// Whether [`install_store`] has run.
+pub(crate) fn store_installed() -> bool {
+    STORE.get().is_some()
 }
 
 /// The installed store, or a process-local in-memory one if none was

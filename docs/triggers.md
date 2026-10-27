@@ -35,6 +35,13 @@ Without Redis the in-memory store is used. It is correct for a single
 replica. With two or more, every replica fires every cron tick, and
 deduplication only works per replica. Boot logs which store is active.
 
+A workload that receives no env vars (Cloud Run / k8s from the designer) is
+pointed at the shared Redis by the staged secret `shared_state/redis_url`; see
+[shared-state-backend.md](shared-state-backend.md). A Redis configured through
+`GREENTIC_TRIGGER_REDIS_URL` or that secret and unreachable at boot **stops the
+boot** instead of falling back to memory; only the pin-URL fallback stays
+fail-open.
+
 ## Webhook responses
 
 | Status | Meaning |
