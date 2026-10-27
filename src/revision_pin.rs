@@ -464,6 +464,37 @@ pub(crate) fn resolve_pin_store(
     }
 }
 
+/// [`resolve_pin_store`] for a workload that may have been told about a shared
+/// backend through the staged secret store.
+///
+/// `GREENTIC_REVISION_PIN_REDIS_URL` still wins and keeps its fail-open
+/// behaviour. A URL that came from the shared backend is an explicit request
+/// for sharing, so an unreachable Redis there FAILS the boot: a second
+/// instance on in-memory pins would route a resumed conversation to a
+/// different revision than the one it parked on.
+pub(crate) fn resolve_pin_store_with(
+    rt: &tokio::runtime::Runtime,
+    shared: &crate::shared_backend::SharedBackend,
+) -> anyhow::Result<std::sync::Arc<dyn RevisionPinStore>> {
+    use std::sync::Arc;
+    if redis_url_from_raw(std::env::var(PIN_REDIS_URL_ENV).ok()).is_some() {
+        return Ok(resolve_pin_store(rt));
+    }
+    let Some(url) = shared.url() else {
+        return Ok(Arc::new(InMemoryPinStore::new()));
+    };
+    let store = rt
+        .block_on(RedisPinStore::from_url(url))
+        .context(
+            "the shared state backend is configured but the session-pin store cannot reach it;              refusing to boot on in-memory pins, which would break revision affinity across              instances",
+        )?;
+    crate::operator_log::info(
+        module_path!(),
+        "session-pin store: redis (shared state backend)",
+    );
+    Ok(Arc::new(store))
+}
+
 pub struct RedisPinStore {
     /// `ConnectionManager` is `Clone` and internally pipelines/multiplexes
     /// commands across a shared connection, so we hold it bare — no Mutex

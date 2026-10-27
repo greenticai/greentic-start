@@ -53,33 +53,114 @@ pub(crate) fn key(kind: &str, env: &str, deployment: &str, trigger_id: &str, par
     )
 }
 
-/// Resolve the store for this process. Fail open to in-memory on a bad or
-/// unreachable Redis, like the session-pin store: triggers still fire, and the
-/// warning names exactly which guarantee is weakened.
-pub(crate) async fn resolve() -> Arc<dyn TriggerStore> {
-    let url = crate::revision_pin::redis_url_from_raw(std::env::var(TRIGGER_REDIS_URL_ENV).ok())
-        .or_else(|| {
-            crate::revision_pin::redis_url_from_raw(
-                std::env::var(crate::revision_pin::PIN_REDIS_URL_ENV).ok(),
-            )
-        });
-    let Some(url) = url else {
+/// Where the trigger store's Redis URL came from, which decides whether an
+/// unreachable Redis is fatal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Selection {
+    pub(crate) url: Option<String>,
+    /// `true` when the operator or the deployer asked for sharing explicitly:
+    /// `GREENTIC_TRIGGER_REDIS_URL` or the shared-backend secret. `false` for
+    /// the session-pin URL fallback, which was never a request for this store.
+    pub(crate) strict: bool,
+    pub(crate) origin: &'static str,
+}
+
+/// Pure precedence: trigger env > shared-backend secret > pin env (non-strict).
+pub(crate) fn select(
+    trigger_env: Option<String>,
+    pin_env: Option<String>,
+    shared: &crate::shared_backend::SharedBackend,
+) -> Selection {
+    use crate::revision_pin::redis_url_from_raw;
+    if let Some(url) = redis_url_from_raw(trigger_env) {
+        return Selection {
+            url: Some(url),
+            strict: true,
+            origin: TRIGGER_REDIS_URL_ENV,
+        };
+    }
+    if let Some(url) = shared.url() {
+        return Selection {
+            url: Some(url.to_string()),
+            strict: true,
+            origin: "the shared state backend (shared_state/redis_url secret)",
+        };
+    }
+    if let Some(url) = redis_url_from_raw(pin_env) {
+        return Selection {
+            url: Some(url),
+            strict: false,
+            origin: crate::revision_pin::PIN_REDIS_URL_ENV,
+        };
+    }
+    Selection {
+        url: None,
+        strict: false,
+        origin: "none",
+    }
+}
+
+/// Resolve the store for this process.
+///
+/// # Fail loudly when sharing was asked for
+///
+/// A URL from `GREENTIC_TRIGGER_REDIS_URL` or the shared-backend secret is an
+/// explicit request for a store several replicas can share. If it cannot be
+/// reached this returns an error and the boot stops: falling back to in-memory
+/// would let every replica fire each cron tick and deduplicate webhooks per
+/// replica, with every probe green. Only the session-pin URL FALLBACK stays
+/// fail-open, because setting that variable never promised a shared trigger
+/// store.
+pub(crate) async fn resolve(
+    shared: &crate::shared_backend::SharedBackend,
+) -> Result<Arc<dyn TriggerStore>> {
+    let selection = select(
+        std::env::var(TRIGGER_REDIS_URL_ENV).ok(),
+        std::env::var(crate::revision_pin::PIN_REDIS_URL_ENV).ok(),
+        shared,
+    );
+    resolve_selection(&selection, |url| async move {
+        let store = RedisTriggerStore::from_url(&url).await?;
+        Ok(Arc::new(store) as Arc<dyn TriggerStore>)
+    })
+    .await
+}
+
+/// [`resolve`] with the connection injected, so the fail-loud rule is testable
+/// without a Redis.
+pub(crate) async fn resolve_selection<F, Fut>(
+    selection: &Selection,
+    connect: F,
+) -> Result<Arc<dyn TriggerStore>>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Arc<dyn TriggerStore>>>,
+{
+    let Some(url) = selection.url.clone() else {
         crate::operator_log::info(
             module_path!(),
             "trigger store: in-memory. Correct for ONE replica only — with more, every \
-             replica fires each cron tick and webhook deduplication is per replica. Set \
-             GREENTIC_TRIGGER_REDIS_URL (or GREENTIC_REVISION_PIN_REDIS_URL) to share it.",
+             replica fires each cron tick and webhook deduplication is per replica. Stage the \
+             shared_state/redis_url secret (or set GREENTIC_TRIGGER_REDIS_URL) to share it.",
         );
-        return Arc::new(InMemoryTriggerStore::default());
+        return Ok(Arc::new(InMemoryTriggerStore::default()));
     };
-    match RedisTriggerStore::from_url(&url).await {
+    match connect(url).await {
         Ok(store) => {
             crate::operator_log::info(
                 module_path!(),
-                "trigger store: redis (shared across replicas)",
+                format!(
+                    "trigger store: redis (shared across replicas; configured by {})",
+                    selection.origin
+                ),
             );
-            Arc::new(store)
+            Ok(store)
         }
+        Err(err) if selection.strict => Err(err).context(format!(
+            "the trigger store Redis configured by {} is unreachable; refusing to boot on an \
+             in-memory store, which would double-fire cron ticks across replicas",
+            selection.origin
+        )),
         Err(err) => {
             crate::operator_log::warn(
                 module_path!(),
@@ -88,7 +169,7 @@ pub(crate) async fn resolve() -> Arc<dyn TriggerStore> {
                      is correct for one replica only"
                 ),
             );
-            Arc::new(InMemoryTriggerStore::default())
+            Ok(Arc::new(InMemoryTriggerStore::default()))
         }
     }
 }

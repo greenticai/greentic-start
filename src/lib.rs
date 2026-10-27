@@ -48,6 +48,7 @@ mod endpoint_resolver;
 mod env_tunnel;
 mod gtunnel;
 mod gtunnel_agent;
+mod shared_backend;
 mod sorla_state;
 // `pub` (doc-hidden) so `tests/threshold_watcher.rs` can drive
 // `select_target_flows` and the event-routing types directly.
@@ -420,6 +421,10 @@ pub fn run_from_env() -> anyhow::Result<()> {
         Command::ResolveSecret(args) => run_resolve_secret(args),
         Command::TunnelAgent => {
             crate::gtunnel::agent_config_from_env().and_then(crate::gtunnel_agent::run)
+        }
+        Command::Capabilities => {
+            println!("{}", crate::shared_backend::capabilities_json());
+            Ok(())
         }
         Command::Doctor(args) => {
             let has_errors = crate::doctor::run_doctor(args)?;
@@ -956,12 +961,21 @@ fn run_start(mut request: StartRequest) -> anyhow::Result<()> {
         // `resolve_pin_store` backs it with Redis when
         // `GREENTIC_REVISION_PIN_REDIS_URL` is configured (fail-open to
         // in-memory); see that fn for the rationale.
-        let pin_store = revision_pin::resolve_pin_store(&activation_rt);
+        // The shared state backend a deployed workload learns about from the
+        // staged secret store (it receives no arbitrary env vars). Read once;
+        // env vars still override each setting. See docs/shared-state-backend.md.
+        let shared_backend = activation_rt.block_on(shared_backend::SharedBackend::read(
+            &secrets, &env_id, tenant,
+        ))?;
+        let pin_store = revision_pin::resolve_pin_store_with(&activation_rt, &shared_backend)?;
+        // Resolved here so an unreachable shared trigger store stops the BOOT
+        // rather than a background task after the listener is already up.
+        triggers::install_store(activation_rt.block_on(triggers::store::resolve(&shared_backend))?);
         // Where a parked conversation lives. Resolved ONCE, logged once, and
         // — unlike the pin store above — a configured-but-unreachable backend
         // is a boot failure rather than a fall back to memory. See
         // `durable_state::DurableStorage::resolve` for why the two differ.
-        let durable = durable_state::DurableStorage::resolve(&env_id)?;
+        let durable = durable_state::DurableStorage::resolve_with(&env_id, &shared_backend)?;
         durable.ensure_reachable()?;
         durable.log_once();
         durable.warn_if_no_revision_affinity();

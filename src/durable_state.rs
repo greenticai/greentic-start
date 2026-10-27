@@ -105,12 +105,30 @@ impl DurableStorage {
     ///
     /// A backend that was not named is not a failure: it resolves to memory,
     /// never to Redis just because a URL happens to be in the environment.
+    #[cfg(test)]
     pub(crate) fn resolve(env_id: &str) -> Result<Self> {
+        Self::resolve_with(env_id, &crate::shared_backend::SharedBackend::none())
+    }
+
+    /// [`resolve`](Self::resolve) with the shared backend a deployed workload
+    /// learned from the staged secret store. The environment variables still
+    /// win for every setting they name; the shared URL fills the gaps and
+    /// names `redis` for the two stores the operator left unnamed.
+    pub(crate) fn resolve_with(
+        env_id: &str,
+        shared: &crate::shared_backend::SharedBackend,
+    ) -> Result<Self> {
         let var = |name: &str| std::env::var(name).ok();
+        let merged = crate::shared_backend::merge_storage_vars(
+            var(greentic_runner_host::storage::config::ENV_SESSION_BACKEND),
+            var(greentic_runner_host::storage::config::ENV_STATE_BACKEND),
+            var(greentic_runner_host::storage::config::ENV_REDIS_URL),
+            shared,
+        );
         let config = StorageConfig::from_vars(
-            var(greentic_runner_host::storage::config::ENV_SESSION_BACKEND).as_deref(),
-            var(greentic_runner_host::storage::config::ENV_STATE_BACKEND).as_deref(),
-            var(greentic_runner_host::storage::config::ENV_REDIS_URL).as_deref(),
+            merged.session_backend.as_deref(),
+            merged.state_backend.as_deref(),
+            merged.redis_url.as_deref(),
             var(greentic_runner_host::storage::config::ENV_SESSION_NAMESPACE).as_deref(),
             Some(env_id),
             var(greentic_runner_host::storage::config::ENV_SESSION_WAIT_TTL_SECS).as_deref(),

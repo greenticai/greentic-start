@@ -712,7 +712,17 @@ impl RevisionServer {
                     // Flow triggers: resolve the shared store once, then run
                     // the cron loop for the server's life. It reads the live
                     // activation on every tick, so reloads need no restart.
-                    crate::triggers::install_store(crate::triggers::store::resolve().await);
+                    // The boot path installs the store before serving so a failure
+                    // stops the boot; this resolves only for callers that skipped it.
+                    if !crate::triggers::store_installed() {
+                        let none = crate::shared_backend::SharedBackend::none();
+                        match crate::triggers::store::resolve(&none).await {
+                            Ok(store) => crate::triggers::install_store(store),
+                            Err(err) => {
+                                return Err(err);
+                            }
+                        }
+                    }
                     let trigger_task = tokio::spawn(crate::triggers::scheduler::run(
                         move || {
                             let activation = trigger_state.current();
