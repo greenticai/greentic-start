@@ -4084,9 +4084,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-state"
-version = "1.2.0-dev.37753700988"
+version = "1.2.0-dev.40676576442"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7254ca414d271ce56d995856526c79decf8bb03524d00d491f646f4f96d0e97c"
+checksum = "5cfaaed4bec4ab8d0657b5d49c5a8ca7a840b7d9c1f7fc65ce64ad5f34290c88"
 dependencies = [
  "dashmap",
  "greentic-interfaces",
