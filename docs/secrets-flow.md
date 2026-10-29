@@ -145,9 +145,14 @@ writes the answer into the dev store it already serves from:
   is not.
 - **The env follows the category** (`env_for_path`), because the runner reads
   the two families at different envs:
-  - `mcp`, `a2a`, `llm`, `knowledge`, `sorla` (the middle path segment) are read
-    at env `default` (`greentic_aw_runtime::scoped_secrets`, `ENV_SEGMENT`), so
-    they are written at `default`.
+  - `mcp`, `a2a`, `llm`, `knowledge`, `sorla`, `infra` (the middle path segment)
+    are read at env `default` (`greentic_aw_runtime::scoped_secrets`, `ENV_SEGMENT`), so
+    they are written at `default`. Name handling differs: `mcp`, `a2a` and
+    `sorla` keys are stored and read verbatim; `llm`, `knowledge` and `infra`
+    keys are canonical (`vector-store/qdrant` is `vector_store_qdrant`) and the
+    reader canonicalises, a no-op for a canonical name.
+    `infra` holds one connection document per kind per environment
+    (`secrets://default/default/_/infra/<canonical kind>`).
   - EVERY other category — a pack segment such as `<pack>`,
     `<pack>_unit_<unit>_<hash>` or a channel pack id, holding an extension
     node's or tool's credential or a channel secret — is read at the revision's

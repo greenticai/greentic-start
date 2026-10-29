@@ -1526,6 +1526,17 @@ mod tests {
         );
     }
 
+    /// The alias-tenant fallback lives in this gate's WASM read path
+    /// (`bundle_tenants`), so an `infra` entry staged under the base tenant
+    /// `default` is reachable from the alias, unchanged by canonicalization.
+    #[test]
+    fn the_gtunnel_alias_tenant_still_reaches_the_default_tenant_infra_entry() {
+        let requested = "secrets://default/default-ba564/_/infra/cache_redis";
+        let retenanted = with_tenant(requested, "default").expect("retenant to base");
+        assert_eq!(retenanted, "secrets://default/default/_/infra/cache_redis");
+        assert_eq!(canonicalize_provider_segment(&retenanted), None);
+    }
+
     #[test]
     fn canonicalize_provider_segment_normalizes_provider_and_key() {
         // The external runner-host requests the raw pack-stem provider; the read
