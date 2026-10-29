@@ -3749,9 +3749,9 @@ dependencies = [
 
 [[package]]
 name = "greentic-runner-host"
-version = "1.2.0-dev.39242949439"
+version = "1.2.0-dev.40815877309"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbd07a7a5f6291c7e3ef71f3a3c1b17917b61e8e61b12d4b2be3c74158e44f64"
+checksum = "305e78cf0e6636c6b68d6df178dde9b2bae30904b0a8743d99f1808b98c8ae7a"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -6682,7 +6682,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.14.0",
+ "itertools 0.13.0",
  "proc-macro2",
  "quote",
  "syn 2.0.119",
