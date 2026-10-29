@@ -323,8 +323,9 @@ static ETAGS: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Mutex::de
 static WRITTEN: LazyLock<Mutex<HashMap<String, BTreeSet<String>>>> = LazyLock::new(Mutex::default);
 
 /// Categories the runner reads at env `default` (`scoped_secrets`): MCP, A2A,
-/// LLM, knowledge-index and SoRLa credentials.
-const RUNNER_CATEGORIES: &[&str] = &["mcp", "a2a", "llm", "knowledge", "sorla"];
+/// LLM, knowledge-index, SoRLa and infrastructure-connection (`infra`)
+/// credentials.
+const RUNNER_CATEGORIES: &[&str] = &["mcp", "a2a", "llm", "knowledge", "sorla", "infra"];
 
 fn is_runner_category(category: &str) -> bool {
     RUNNER_CATEGORIES.contains(&category)

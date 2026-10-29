@@ -550,7 +550,7 @@ async fn secrets_the_admin_stopped_returning_are_deleted() {
 
 #[test]
 fn only_runner_scoped_categories_are_served_at_env_default() {
-    for yes in ["mcp", "a2a", "llm", "knowledge", "sorla"] {
+    for yes in ["mcp", "a2a", "llm", "knowledge", "sorla", "infra"] {
         assert!(is_runner_category(yes), "{yes}");
     }
     // Pack-scoped extension secrets and the webchat signing key live at the
@@ -563,6 +563,45 @@ fn only_runner_scoped_categories_are_served_at_env_default() {
     ] {
         assert!(!is_runner_category(no), "{no}");
     }
+}
+
+#[test]
+fn an_infra_door_secret_is_written_at_env_default() {
+    assert_eq!(
+        env_for_path("_/infra/vector_store_qdrant", "local"),
+        "default"
+    );
+}
+
+#[test]
+fn an_infra_pack_segment_in_the_wrong_position_is_not_a_runner_category() {
+    // The category is the MIDDLE segment, so `x` decides here, not `infra`.
+    assert_eq!(env_for_path("infra/x/y", "local"), "local");
+}
+
+#[tokio::test]
+async fn hydration_does_not_delete_a_staged_infra_entry() {
+    let door = serve(vec![
+        ok(json!({"secrets":[{"path":"_/mcp/a","value":"1"}],"etag":"e1"})),
+        ok(json!({"secrets":[{"path":"_/mcp/b","value":"2"}],"etag":"e2"})),
+    ])
+    .await;
+    let store = MemStore::default();
+    stage(
+        &store,
+        "acme",
+        "infra-survivor",
+        &door.endpoint(),
+        Some(true),
+    );
+    let infra = "secrets://default/acme/_/infra/cache_redis";
+    store.put(infra, b"{\"host\":\"h\"}");
+
+    run(&store, "acme", "infra-survivor").await.unwrap();
+    run(&store, "acme", "infra-survivor").await.unwrap();
+
+    assert!(store.get(infra).is_some(), "staged infra entry was deleted");
+    assert!(!store.deletes.lock().unwrap().contains(&infra.to_string()));
 }
 
 #[tokio::test]
