@@ -152,7 +152,10 @@ writes the answer into the dev store it already serves from:
     keys are canonical (`vector-store/qdrant` is `vector_store_qdrant`) and the
     reader canonicalises, a no-op for a canonical name.
     `infra` holds one connection document per kind per environment
-    (`secrets://default/default/_/infra/<canonical kind>`).
+    (`secrets://default/default/_/infra/<canonical kind>`). Latent collision:
+    if the admin ever mirrors an `infra` entry for the same tenant and path the
+    designer stages, the secrets door would overwrite the designer-staged copy,
+    and a later hydration that no longer returns it would delete it.
   - EVERY other category — a pack segment such as `<pack>`,
     `<pack>_unit_<unit>_<hash>` or a channel pack id, holding an extension
     node's or tool's credential or a channel secret — is read at the revision's

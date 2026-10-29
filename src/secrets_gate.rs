@@ -1526,9 +1526,10 @@ mod tests {
         );
     }
 
-    /// The alias-tenant fallback lives in this gate's WASM read path
-    /// (`bundle_tenants`), so an `infra` entry staged under the base tenant
-    /// `default` is reachable from the alias, unchanged by canonicalization.
+    /// Pins only the pure helpers: re-tenanting an alias-tenant `infra` uri
+    /// yields the base-tenant address and provider canonicalization leaves it
+    /// unchanged. It does NOT exercise the gate's read path, and the runner's
+    /// own infra reader does not go through this gate at all.
     #[test]
     fn the_gtunnel_alias_tenant_still_reaches_the_default_tenant_infra_entry() {
         let requested = "secrets://default/default-ba564/_/infra/cache_redis";

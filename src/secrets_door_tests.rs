@@ -580,28 +580,43 @@ fn an_infra_pack_segment_in_the_wrong_position_is_not_a_runner_category() {
 }
 
 #[tokio::test]
-async fn hydration_does_not_delete_a_staged_infra_entry() {
+async fn hydration_prunes_a_stale_infra_entry_at_the_default_env() {
+    // Pins S2: `infra` must be a runner category, so the door writes the entry
+    // at env `default` and the stale-pruning pass deletes THAT address. If the
+    // category were missing the entry would land at the ingress env (`local`),
+    // and both the presence check and the delete check below would fail.
     let door = serve(vec![
-        ok(json!({"secrets":[{"path":"_/mcp/a","value":"1"}],"etag":"e1"})),
+        ok(json!({"secrets":[
+            {"path":"_/infra/cache_redis","value":"{\"host\":\"h\"}"},
+            {"path":"_/mcp/a","value":"1"},
+        ],"etag":"e1"})),
         ok(json!({"secrets":[{"path":"_/mcp/b","value":"2"}],"etag":"e2"})),
     ])
     .await;
     let store = MemStore::default();
     stage(
         &store,
-        "acme",
-        "infra-survivor",
+        "default",
+        "infra-prune",
         &door.endpoint(),
         Some(true),
     );
-    let infra = "secrets://default/acme/_/infra/cache_redis";
-    store.put(infra, b"{\"host\":\"h\"}");
+    let infra = "secrets://default/default/_/infra/cache_redis";
+    let mcp_a = "secrets://default/default/_/mcp/a";
 
-    run(&store, "acme", "infra-survivor").await.unwrap();
-    run(&store, "acme", "infra-survivor").await.unwrap();
+    run(&store, "default", "infra-prune").await.unwrap();
+    assert!(
+        store.get(infra).is_some(),
+        "infra not written at env default"
+    );
+    assert!(store.get(mcp_a).is_some());
 
-    assert!(store.get(infra).is_some(), "staged infra entry was deleted");
-    assert!(!store.deletes.lock().unwrap().contains(&infra.to_string()));
+    run(&store, "default", "infra-prune").await.unwrap();
+    let deletes = store.deletes.lock().unwrap().clone();
+    assert!(deletes.contains(&infra.to_string()), "infra not pruned");
+    assert!(deletes.contains(&mcp_a.to_string()), "mcp/a not pruned");
+    assert!(store.get(infra).is_none());
+    assert!(store.get(mcp_a).is_none());
 }
 
 #[tokio::test]

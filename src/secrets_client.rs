@@ -308,8 +308,11 @@ mod tests {
         let uri = "secrets://default/default/_/infra/cache_redis";
         let doc = br#"{"host":"redis.internal","port":6379,"scheme":"redis","credential":"s","extras":{}}"#;
         let runtime = Runtime::new()?;
+        // Write the raw deployer-style key straight into the dev store (what
+        // `op secrets put` does), bypassing this client's canonicalisation.
+        let store = DevStore::with_path(store_path.clone())?;
+        runtime.block_on(async { store.put(uri, SecretFormat::Bytes, doc).await })?;
         let client = SecretsClient::open_with_path(store_path)?;
-        runtime.block_on(async { client.write(uri, doc).await })?;
         let value = runtime.block_on(async { client.read(uri).await })?;
         assert_eq!(value, doc.to_vec());
         Ok(())
