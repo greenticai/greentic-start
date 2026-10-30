@@ -1526,6 +1526,18 @@ mod tests {
         );
     }
 
+    /// Pins only the pure helpers: re-tenanting an alias-tenant `infra` uri
+    /// yields the base-tenant address and provider canonicalization leaves it
+    /// unchanged. It does NOT exercise the gate's read path, and the runner's
+    /// own infra reader does not go through this gate at all.
+    #[test]
+    fn the_gtunnel_alias_tenant_still_reaches_the_default_tenant_infra_entry() {
+        let requested = "secrets://default/default-ba564/_/infra/cache_redis";
+        let retenanted = with_tenant(requested, "default").expect("retenant to base");
+        assert_eq!(retenanted, "secrets://default/default/_/infra/cache_redis");
+        assert_eq!(canonicalize_provider_segment(&retenanted), None);
+    }
+
     #[test]
     fn canonicalize_provider_segment_normalizes_provider_and_key() {
         // The external runner-host requests the raw pack-stem provider; the read

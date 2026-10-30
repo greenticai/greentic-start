@@ -229,6 +229,31 @@ mod mcp_uri_tests {
         );
     }
 
+    /// `infra` connections are staged under canonical names (R1), so the
+    /// canonicalising reader looks them up unchanged.
+    #[test]
+    fn an_infra_uri_with_a_canonical_name_is_looked_up_unchanged() {
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(
+                "secrets://default/default/_/infra/vector_store_qdrant"
+            ),
+            None
+        );
+    }
+
+    /// A hyphenated name would be rewritten on read, so a writer must never
+    /// produce one (the deployer maps `infra` to canonical names).
+    #[test]
+    fn a_hyphenated_infra_name_would_be_normalised_so_the_writer_must_not_produce_one() {
+        assert_eq!(
+            canonicalize_dev_store_secret_uri(
+                "secrets://default/default/_/infra/vector-store-qdrant"
+            )
+            .as_deref(),
+            Some("secrets://default/default/_/infra/vector_store_qdrant")
+        );
+    }
+
     /// `sorla` only exempts the CATEGORY segment (index 3). A secret merely
     /// NAMED `sorla` in a different category must still be canonicalized.
     #[test]
@@ -273,6 +298,23 @@ mod tests {
         let value = runtime
             .block_on(async { client.read("secrets://demo/acme/_/mypack/my_secret").await })?;
         assert_eq!(value, b"hello world".to_vec());
+        Ok(())
+    }
+
+    #[test]
+    fn a_dev_store_round_trip_reads_the_staged_infra_document() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let store_path = dir.path().join("secrets.env");
+        let uri = "secrets://default/default/_/infra/cache_redis";
+        let doc = br#"{"host":"redis.internal","port":6379,"scheme":"redis","credential":"s","extras":{}}"#;
+        let runtime = Runtime::new()?;
+        // Write the raw deployer-style key straight into the dev store (what
+        // `op secrets put` does), bypassing this client's canonicalisation.
+        let store = DevStore::with_path(store_path.clone())?;
+        runtime.block_on(async { store.put(uri, SecretFormat::Bytes, doc).await })?;
+        let client = SecretsClient::open_with_path(store_path)?;
+        let value = runtime.block_on(async { client.read(uri).await })?;
+        assert_eq!(value, doc.to_vec());
         Ok(())
     }
 

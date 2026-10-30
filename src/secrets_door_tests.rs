@@ -550,7 +550,7 @@ async fn secrets_the_admin_stopped_returning_are_deleted() {
 
 #[test]
 fn only_runner_scoped_categories_are_served_at_env_default() {
-    for yes in ["mcp", "a2a", "llm", "knowledge", "sorla"] {
+    for yes in ["mcp", "a2a", "llm", "knowledge", "sorla", "infra"] {
         assert!(is_runner_category(yes), "{yes}");
     }
     // Pack-scoped extension secrets and the webchat signing key live at the
@@ -563,6 +563,60 @@ fn only_runner_scoped_categories_are_served_at_env_default() {
     ] {
         assert!(!is_runner_category(no), "{no}");
     }
+}
+
+#[test]
+fn an_infra_door_secret_is_written_at_env_default() {
+    assert_eq!(
+        env_for_path("_/infra/vector_store_qdrant", "local"),
+        "default"
+    );
+}
+
+#[test]
+fn an_infra_pack_segment_in_the_wrong_position_is_not_a_runner_category() {
+    // The category is the MIDDLE segment, so `x` decides here, not `infra`.
+    assert_eq!(env_for_path("infra/x/y", "local"), "local");
+}
+
+#[tokio::test]
+async fn hydration_prunes_a_stale_infra_entry_at_the_default_env() {
+    // Pins S2: `infra` must be a runner category, so the door writes the entry
+    // at env `default` and the stale-pruning pass deletes THAT address. If the
+    // category were missing the entry would land at the ingress env (`local`),
+    // and both the presence check and the delete check below would fail.
+    let door = serve(vec![
+        ok(json!({"secrets":[
+            {"path":"_/infra/cache_redis","value":"{\"host\":\"h\"}"},
+            {"path":"_/mcp/a","value":"1"},
+        ],"etag":"e1"})),
+        ok(json!({"secrets":[{"path":"_/mcp/b","value":"2"}],"etag":"e2"})),
+    ])
+    .await;
+    let store = MemStore::default();
+    stage(
+        &store,
+        "default",
+        "infra-prune",
+        &door.endpoint(),
+        Some(true),
+    );
+    let infra = "secrets://default/default/_/infra/cache_redis";
+    let mcp_a = "secrets://default/default/_/mcp/a";
+
+    run(&store, "default", "infra-prune").await.unwrap();
+    assert!(
+        store.get(infra).is_some(),
+        "infra not written at env default"
+    );
+    assert!(store.get(mcp_a).is_some());
+
+    run(&store, "default", "infra-prune").await.unwrap();
+    let deletes = store.deletes.lock().unwrap().clone();
+    assert!(deletes.contains(&infra.to_string()), "infra not pruned");
+    assert!(deletes.contains(&mcp_a.to_string()), "mcp/a not pruned");
+    assert!(store.get(infra).is_none());
+    assert!(store.get(mcp_a).is_none());
 }
 
 #[tokio::test]
