@@ -177,6 +177,20 @@ pub(crate) fn serve_static_route(
     bundle_root: &Path,
     request_path: &str,
 ) -> Response<Full<Bytes>> {
+    let response = serve_static_route_inner(route_match, bundle_root, request_path);
+    // Operator-chosen embedder origins (`allowed_embed_origins` setup answer)
+    // govern who may frame the served HTML page; unset leaves it untouched.
+    match crate::embed_origins::read_for_pack(bundle_root, &route_match.descriptor.pack_id) {
+        Some(allowed) => crate::embed_origins::apply(response, &allowed),
+        None => response,
+    }
+}
+
+fn serve_static_route_inner(
+    route_match: &StaticRouteMatch<'_>,
+    bundle_root: &Path,
+    request_path: &str,
+) -> Response<Full<Bytes>> {
     // Redirect to trailing-slash when the matched route is a directory (no asset path)
     // and the request doesn't end with '/'. Without this, relative paths in index.html
     // (e.g. ./runtime-bootstrap.js) resolve against the wrong parent directory.
@@ -622,6 +636,72 @@ mod tests {
         });
         // Served the real asset, not the SPA index (the blank-page bug).
         assert_eq!(body, Bytes::from_static(b"console.log(1)"));
+    }
+
+    fn index_route(dir: &Path) -> StaticRouteDescriptor {
+        std::fs::create_dir_all(dir.join("site")).expect("mkdir");
+        std::fs::write(dir.join("site").join("index.html"), "<html>ok</html>").expect("index");
+        descriptor(dir)
+    }
+
+    fn write_answers(bundle: &Path, json: &str) {
+        let answers = bundle.join("state/config/web");
+        std::fs::create_dir_all(&answers).expect("mkdir");
+        std::fs::write(answers.join("setup-answers.json"), json).expect("answers");
+    }
+
+    #[test]
+    fn serve_static_route_sends_frame_ancestors_when_origins_are_configured() {
+        let dir = tempdir().expect("tempdir");
+        let descriptor = index_route(dir.path());
+        write_answers(
+            dir.path(),
+            r#"{"allowed_embed_origins":"https://intranet.example.com"}"#,
+        );
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: String::new(),
+            request_is_directory: true,
+        };
+        let response = serve_static_route(&route_match, dir.path(), "/web/");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "frame-ancestors 'self' https://intranet.example.com"
+        );
+        assert!(response.headers().get("x-frame-options").is_none());
+    }
+
+    #[test]
+    fn serve_static_route_with_only_invalid_origins_fails_closed() {
+        let dir = tempdir().expect("tempdir");
+        let descriptor = index_route(dir.path());
+        write_answers(dir.path(), r#"{"allowed_embed_origins":"*"}"#);
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: String::new(),
+            request_is_directory: true,
+        };
+        let response = serve_static_route(&route_match, dir.path(), "/web/");
+        assert_eq!(
+            response.headers()["content-security-policy"],
+            "frame-ancestors 'self'"
+        );
+    }
+
+    #[test]
+    fn serve_static_route_adds_no_framing_header_without_the_answer() {
+        let dir = tempdir().expect("tempdir");
+        let descriptor = index_route(dir.path());
+        write_answers(dir.path(), r#"{"skin":"x"}"#);
+        let route_match = StaticRouteMatch {
+            descriptor: &descriptor,
+            asset_path: String::new(),
+            request_is_directory: true,
+        };
+        let response = serve_static_route(&route_match, dir.path(), "/web/");
+        assert!(response.headers().get("content-security-policy").is_none());
+        assert!(response.headers().get("x-frame-options").is_none());
     }
 
     #[test]
