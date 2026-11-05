@@ -43,6 +43,7 @@ mod doctor;
 mod doctor_env;
 mod domains;
 mod durable_state;
+mod embed_origins;
 mod endpoint_admit;
 mod endpoint_resolver;
 mod env_tunnel;
