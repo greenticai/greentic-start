@@ -1329,6 +1329,7 @@ fn path_allows_cors(path: &str, interop_path: &str) -> bool {
         && !crate::artifacts::serve_link::is_link_path(path)
         && !crate::interop::a2a::is_cors_excluded(interop_path)
         && !crate::interop::mcp::is_cors_excluded(interop_path)
+        && !crate::interop::openai::is_cors_excluded(interop_path)
 }
 
 /// Resolve → dispatch → execute for a single request. `Err` carries a ready HTTP
@@ -1516,7 +1517,8 @@ async fn serve(
     // unit uses it; computed here because `req` is consumed below.
     let interop_client = if interop_mount.is_some()
         && (crate::interop::a2a::route_for(interop_path).is_some()
-            || crate::interop::mcp::route_for(interop_path).is_some())
+            || crate::interop::mcp::route_for(interop_path).is_some()
+            || crate::interop::openai::route_for(interop_path).is_some())
     {
         crate::interop::anonymous::client_label(
             req.extensions()
@@ -1586,6 +1588,38 @@ async fn serve(
                         mcp_method: mcp_method_header.as_deref(),
                         authorization_unreadable,
                         client: interop_client.as_deref(),
+                        host: host_header.as_deref(),
+                    },
+                )
+                .await;
+            }
+            Ok(None) => {}
+        }
+    }
+
+    // The OpenAI-compatible surface, on the same terms: reserved only for a
+    // private unit whose staged config enables it.
+    if let Some(mount) = interop_mount
+        && let Some(route) = crate::interop::openai::route_for(interop_path)
+    {
+        match resolve_interop_unit(&state, &activation, &mount, InteropFeature::Openai).await {
+            Err(response) => return Err(response),
+            Ok(Some(unit)) => {
+                return serve_openai(
+                    req,
+                    route,
+                    &unit,
+                    &state,
+                    &activation,
+                    &method,
+                    InteropRequestHeaders {
+                        authorization: authorization_header.as_deref(),
+                        version: None,
+                        query: None,
+                        if_none_match: None,
+                        mcp_method: None,
+                        authorization_unreadable,
+                        client: None,
                         host: host_header.as_deref(),
                     },
                 )
@@ -2085,6 +2119,7 @@ async fn load_staged_unit_config(
 enum InteropFeature {
     A2a,
     Mcp,
+    Openai,
 }
 
 impl InteropFeature {
@@ -2092,6 +2127,9 @@ impl InteropFeature {
         match self {
             InteropFeature::A2a => config.a2a,
             InteropFeature::Mcp => config.mcp,
+            // Private units only: a public unit never serves this surface, so
+            // anonymous callers cannot spend the owner's LLM budget through it.
+            InteropFeature::Openai => config.openai && !config.access.is_public(),
         }
     }
 }
@@ -2451,6 +2489,110 @@ async fn serve_interop_inner(
         }
         _ => crate::interop::a2a::rpc::handle_rest_send(&ctx, &request, &caller, &runner).await,
     })
+}
+
+/// Serve one reserved OpenAI-compatible path.
+///
+/// Every exit records its status on the request's telemetry span, like
+/// [`serve_interop`]. The handler itself lives in
+/// [`crate::interop::openai::handler`]; this only gathers what it needs.
+async fn serve_openai(
+    req: Request<Incoming>,
+    route: crate::interop::openai::OpenaiRoute,
+    unit: &InteropUnit,
+    state: &ServeState,
+    activation: &Activation,
+    method: &hyper::Method,
+    headers: InteropRequestHeaders<'_>,
+) -> Result<Response<Full<Bytes>>, Response<Full<Bytes>>> {
+    use crate::interop::openai::{OpenaiRoute, handler, response};
+    let trace = crate::interop::telemetry::RequestTrace::new(
+        crate::interop::metering::event::Surface::Openai,
+        greentic_telemetry::TelemetryCtx::new(unit.tenant.clone())
+            .with_deployment_id(unit.deployment_id.to_string())
+            .with_bundle_id(unit.bundle_id.clone()),
+    );
+    trace.route(route.as_str());
+    let allowed = match route {
+        OpenaiRoute::Models => hyper::Method::GET,
+        OpenaiRoute::ChatCompletions => hyper::Method::POST,
+    };
+    let conversation = header_str(req.headers(), crate::interop::openai::CONVERSATION_HEADER);
+    let answered = if method != allowed {
+        trace.outcome(crate::interop::telemetry::Outcome::Rejected);
+        let mut refusal = response::error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "This path does not accept this method.",
+            None,
+        );
+        if let Ok(value) = header::HeaderValue::from_str(allowed.as_str()) {
+            refusal.headers_mut().insert(header::ALLOW, value);
+        }
+        refusal
+    } else {
+        let ctx = handler::OpenaiContext {
+            config: &unit.config,
+            tenant: &unit.tenant,
+            bundle_id: &unit.bundle_id,
+            deployment_id: unit.deployment_id,
+            limiter: &state.interop.limiter,
+            turns: &state.interop.turns,
+            now_ms: crate::ingress_auth::now_ms(),
+            metering: crate::interop::metering::TurnMetering::for_unit(
+                &state.interop.meter,
+                &unit.config,
+                unit.deployment_id,
+                &unit.bundle_id,
+            )
+            .map(|metering| {
+                metering.tokens_recorded_by_runtime(
+                    activation
+                        .routing
+                        .runtime_metered
+                        .contains(unit.deployment_id, &unit.bundle_id),
+                )
+            }),
+            trace: &trace,
+        };
+        let openai_headers = handler::OpenaiHeaders {
+            authorization: headers.authorization,
+            authorization_unreadable: headers.authorization_unreadable,
+            conversation: conversation.as_deref(),
+        };
+        // Authenticate BEFORE the body is read.
+        match handler::authenticate(&ctx, &openai_headers).await {
+            Err(refusal) => *refusal,
+            Ok(caller) => {
+                let body = if route == OpenaiRoute::ChatCompletions {
+                    match read_body_limited(req).await {
+                        Ok(body) => body,
+                        Err(()) => {
+                            trace.outcome(crate::interop::telemetry::Outcome::Rejected);
+                            trace.http_status(StatusCode::PAYLOAD_TOO_LARGE.as_u16());
+                            return Ok(response::error(
+                                StatusCode::PAYLOAD_TOO_LARGE,
+                                "request_too_large",
+                                "The request body exceeds the size limit.",
+                                None,
+                            ));
+                        }
+                    }
+                } else {
+                    Bytes::new()
+                };
+                let runner = IngressTurnRunner {
+                    state,
+                    activation,
+                    tenant: &unit.tenant,
+                    deployment_id: unit.deployment_id,
+                };
+                handler::handle(&ctx, route, &caller, &openai_headers, &body, &runner).await
+            }
+        }
+    };
+    trace.http_status(answered.status().as_u16());
+    Ok(answered)
 }
 
 /// Serve one reserved MCP path.

@@ -167,10 +167,19 @@ impl AccessPolicy {
 pub(crate) struct InteropConfig {
     pub a2a: bool,
     pub mcp: bool,
+    /// `openai: true`: the unit answers OpenAI-compatible clients on
+    /// `/v1/models` and `/v1/chat/completions`. **Absent means off**, which is
+    /// every document staged before the key existed; a build that predates it
+    /// ignores the key and never serves `/v1`. Private units only (see
+    /// [`super::openai`]).
+    pub openai: bool,
     pub credentials: Vec<Credential>,
     pub tenant_slug: Option<String>,
     pub issuer: Option<String>,
     pub mcp_resource: Option<String>,
+    /// The audience an OAuth token must carry on `/v1`. **Absent means the
+    /// surface accepts the staged bearer alone.**
+    pub openai_resource: Option<String>,
     pub agent: AgentMeta,
     /// Where to record what a turn spent (§8.1). **Absent means metering is
     /// off**, which is every deployment staged before it existed.
@@ -219,6 +228,8 @@ struct RawConfig {
     #[serde(default)]
     mcp: bool,
     #[serde(default)]
+    openai: bool,
+    #[serde(default)]
     credentials: Vec<Value>,
     #[serde(default)]
     tenant_slug: Option<String>,
@@ -226,6 +237,8 @@ struct RawConfig {
     issuer: Option<String>,
     #[serde(default)]
     mcp_resource: Option<String>,
+    #[serde(default)]
+    openai_resource: Option<String>,
     #[serde(default)]
     agent: Option<Value>,
     #[serde(default)]
@@ -314,10 +327,14 @@ pub(crate) fn parse(bytes: &[u8], unit: &str) -> Option<InteropConfig> {
     Some(InteropConfig {
         a2a: raw.a2a,
         mcp: raw.mcp,
+        openai: raw.openai,
         credentials,
         tenant_slug,
         issuer: non_empty(raw.issuer),
         mcp_resource: non_empty(raw.mcp_resource),
+        openai_resource: raw
+            .openai_resource
+            .and_then(|value| valid_a2a_resource(&value, unit)),
         agent,
         metering,
         secrets_door: raw.secrets_door,

@@ -19,6 +19,7 @@ use serde_json::Value;
 pub(crate) enum Surface {
     A2a,
     Mcp,
+    Openai,
 }
 
 impl Surface {
@@ -26,6 +27,7 @@ impl Surface {
         match self {
             Surface::A2a => "a2a",
             Surface::Mcp => "mcp",
+            Surface::Openai => "openai",
         }
     }
 }
