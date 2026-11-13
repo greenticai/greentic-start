@@ -22,8 +22,12 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+// Only the Linux worker path spawns or supervises a child.
+#[cfg(target_os = "linux")]
 use std::process::{Command, Stdio};
-use std::sync::{Condvar, Mutex, OnceLock, PoisonError, mpsc};
+#[cfg(target_os = "linux")]
+use std::sync::mpsc;
+use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::extract::truncate_chars;
@@ -34,6 +38,7 @@ pub(crate) use super::pdf_limits::*;
 pub(crate) const WORKER_ARG: &str = "__greentic-artifact-pdf-text";
 /// Prefix of every worker answer. Output without it is not extracted text.
 pub(crate) const FRAME: &[u8] = b"GREENTIC-PDF-TEXT/1\n";
+#[cfg(target_os = "linux")]
 const POLL: Duration = Duration::from_millis(10);
 /// `RLIMIT_NOFILE` of the worker: stdin, stdout, stderr and a little slack.
 #[cfg(target_os = "linux")]
@@ -209,10 +214,14 @@ fn supervise(
 /// Owns a spawned worker: whatever path leaves [`supervise`] — an error, a
 /// deadline, a panic — the worker is killed and reaped, never leaked or left
 /// a zombie. Killing an already exited child is harmless.
+// Used only by the Linux worker path and its Linux-only tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct ChildGuard {
     child: std::process::Child,
 }
 
+// Used only by the Linux worker path and its Linux-only tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl ChildGuard {
     pub(crate) fn new(child: std::process::Child) -> Self {
         Self { child }
@@ -240,6 +249,8 @@ impl Drop for ChildGuard {
 
 /// At most `cap` bytes of `reader`: it is never asked for more, so a worker
 /// that floods its output costs the host `cap` bytes, not the flood.
+// Used only by the Linux worker path and its Linux-only tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) fn read_capped(reader: impl Read, cap: u64) -> std::io::Result<Vec<u8>> {
     let mut out = Vec::new();
     reader.take(cap).read_to_end(&mut out)?;
@@ -358,12 +369,16 @@ fn extract_pages(bytes: &[u8], max_pages: usize, max_chars: usize) -> String {
 }
 
 /// A counting semaphore bounding concurrent workers.
+// Used only by the Linux worker path and its Linux-only tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct Gate {
     busy: Mutex<usize>,
     freed: Condvar,
     capacity: usize,
 }
 
+// Used only by the Linux worker path and its Linux-only tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct Slot<'a> {
     gate: &'a Gate,
 }
@@ -379,11 +394,15 @@ impl Gate {
 
     /// Slots taken right now.
     #[cfg(test)]
+    // Used only by the Linux-only tests; dead on other platforms.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn in_use(&self) -> usize {
         *self.busy.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// A slot, waiting at most `wait` for one to free up.
+    // Used only by the Linux worker path and its Linux-only tests; dead on other platforms.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub(crate) fn acquire(&self, wait: Duration) -> Option<Slot<'_>> {
         let deadline = Instant::now() + wait;
         let mut busy = self.busy.lock().unwrap_or_else(PoisonError::into_inner);
