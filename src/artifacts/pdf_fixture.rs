@@ -42,6 +42,8 @@ pub(crate) fn text_pdf(text: &str, pages: usize) -> Vec<u8> {
     page_tree(pages, stream("", content.as_bytes()))
 }
 
+// Used only by the Linux-only PDF isolation tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// A one-page PDF whose content stream is `data` declared with `/Filter
 /// /FlateDecode`.
 pub(crate) fn flate_content_pdf(data: &[u8]) -> Vec<u8> {
@@ -71,6 +73,8 @@ fn page_tree(pages: usize, content: Vec<u8>) -> Vec<u8> {
     assemble(&objects)
 }
 
+// Used only by the Linux-only PDF isolation tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// A zlib stream that inflates to `prefix` followed by `1 + 258 * repeats`
 /// spaces, while being about `13 * repeats / 8` bytes long: a decompression
 /// bomb, written bit by bit so building it costs nothing. `prefix` must be
@@ -101,6 +105,8 @@ pub(crate) fn zlib_bomb(prefix: &[u8], repeats: u64) -> Vec<u8> {
     out
 }
 
+// Used only by the Linux-only PDF isolation tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// Adler-32 with a closed form for runs of one byte.
 struct Adler32 {
     a: u128,
@@ -113,6 +119,8 @@ impl Default for Adler32 {
     }
 }
 
+// Used only by the Linux-only PDF isolation tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl Adler32 {
     const MOD: u128 = 65521;
 
@@ -129,6 +137,8 @@ impl Adler32 {
     }
 }
 
+// Used only by the Linux-only PDF isolation tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Default)]
 struct BitWriter {
     out: Vec<u8>,
@@ -136,6 +146,8 @@ struct BitWriter {
     len: u32,
 }
 
+// Used only by the Linux-only PDF isolation tests; dead on other platforms.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl BitWriter {
     /// Append `n` bits of `value`, least significant first (deflate fields).
     fn put(&mut self, value: u32, n: u32) {
