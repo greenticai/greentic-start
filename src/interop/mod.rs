@@ -15,6 +15,7 @@ pub(crate) mod input_request;
 pub(crate) mod limits;
 pub(crate) mod mcp;
 pub(crate) mod metering;
+pub(crate) mod openai;
 pub(crate) mod policy_door;
 pub(crate) mod reply;
 pub(crate) mod structured_output;
