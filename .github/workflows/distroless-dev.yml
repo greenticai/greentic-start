@@ -19,6 +19,12 @@ on:
     branches: [develop]
   pull_request:
     paths:
+      # Changes to runtime source or its resolved dependencies must exercise
+      # both native image builds before merge, not first fail during publication.
+      - Cargo.toml
+      - Cargo.lock
+      - rust-toolchain.toml
+      - src/**
       - Dockerfile.distroless
       - .github/workflows/distroless-dev.yml
       - .github/workflows/distroless.yml
