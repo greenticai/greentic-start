@@ -50,3 +50,21 @@ integration and doc tests passed. See the deployer handover's validation table
 for exact names and release-check limitations. The overlay was removed and the
 original Cargo.lock restored; compatible published dependency floors are still
 required before this runtime can be released.
+
+
+## PR and release sequencing
+
+Follow Bima's *Greentic handover* (2026-11-16, updated 2026-11-17), sections
+13.2–13.4: feature PRs target `develop`, with no feature-PR version bump.
+The upstream prerequisite is [greentic-deployer PR #705](https://github.com/greenticai/greentic-deployer/pull/705).
+Keep this runtime PR draft until that change has landed and successfully
+published both packages, then update both Cargo dependency floors and the
+lockfile to their verified published versions. A merge to runtime `develop`
+triggers publication, so the temporary source overlay is not sufficient to
+make this PR ready to land.
+
+After the compatible runtime image is published, record its exact digest and
+verified capability. Designer must coordinate its Cargo/tool pins,
+`Dockerfile.tools`, effective runtime digests and relevant ratchet verdicts.
+Keep its current size guard until the compatible capability/preflight changes
+land; make the Designer release bump a separate `chore(release)` PR.
