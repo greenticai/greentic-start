@@ -6,6 +6,16 @@
 
 The repo is centered on startup/runtime concerns rather than setup UX. It integrates Greentic shared crates for pack manifests, runner hosting, secrets, QA/setup forms, and bundle distribution. Current code also includes startup-time gating for bundles that declare `greentic.static-routes.v1`, but it does not implement static-route serving itself.
 
+## Current Cloud Run seed transport
+
+`src/seed_copy.rs` reconstructs the shared deploy-spec chunk protocol before
+opening the environment store; `src/seed_chunks_tests.rs` covers integrity,
+missing mounts, private atomic installation and legacy rollback. The image
+capability and published-dependency release blocker are documented in
+`docs/secret-store-chunks.md`. Validation there records the two independently
+reproduced failures in untouched network tests; the full runtime gate remains
+failing, while all 22 seed-copy tests pass with matching local dependencies.
+
 ## 2. Main Components and Functionality
 
 - **Path:** `Cargo.toml`

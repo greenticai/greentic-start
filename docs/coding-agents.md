@@ -460,3 +460,11 @@ If you change:
 - app-flow execution wiring
 
 update this document and the human-facing [README](../README.md) together.
+
+## Cloud Run encrypted seed stores
+
+`seed_copy` runs before the first store open. The versioned chunk protocol,
+atomic/private reconstruction, image capability label and coordinated
+published-dependency requirement are documented in
+[secret-store-chunks.md](secret-store-chunks.md). Do not advertise the chunk
+capability on a runtime image without this boot implementation.

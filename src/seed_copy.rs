@@ -74,7 +74,21 @@ pub(crate) const SEED_DIR_ENV: &str = "GREENTIC_SEED_DIR";
 /// Must be called in the synchronous, single-threaded early-boot section, after
 /// `GREENTIC_ENV` is resolved and before the first env-store access.
 pub(crate) fn maybe_seed_env_store() -> anyhow::Result<()> {
+    let transport = match std::env::var(greentic_deploy_spec::secret_chunks::TRANSPORT_ENV) {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => anyhow::bail!(crate::operator_i18n::tr(
+            "seed.secret_chunks.marker_invalid",
+            "Invalid or unsupported secret-store transport marker."
+        )),
+    };
     let Some(seed) = std::env::var_os(SEED_DIR_ENV) else {
+        if transport.is_some() {
+            anyhow::bail!(crate::operator_i18n::tr(
+                "seed.secret_chunks.seed_required",
+                "Secret-store transport requires a seed directory."
+            ));
+        }
         return Ok(());
     };
     let seed_dir = PathBuf::from(seed);
@@ -100,7 +114,7 @@ pub(crate) fn maybe_seed_env_store() -> anyhow::Result<()> {
             dest.display()
         ),
     );
-    let copied = seed_env_store_from(&seed_dir, &dest)?;
+    let copied = seed_env_store_from_with_transport(&seed_dir, &dest, transport.as_deref())?;
     operator_log::info(
         module_path!(),
         format!("seeded {copied} file(s) into environment `{env_id}`"),
@@ -115,6 +129,20 @@ pub(crate) fn maybe_seed_env_store() -> anyhow::Result<()> {
 ///
 /// Exposed for integration tests; production callers use `maybe_seed_env_store`.
 pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<u64> {
+    seed_env_store_from_with_transport(seed_dir, dest_root, None)
+}
+
+fn seed_env_store_from_with_transport(
+    seed_dir: &Path,
+    dest_root: &Path,
+    transport: Option<&str>,
+) -> anyhow::Result<u64> {
+    if transport.is_some_and(|value| value != greentic_deploy_spec::secret_chunks::SCHEMA) {
+        anyhow::bail!(crate::operator_i18n::tr(
+            "seed.secret_chunks.marker_invalid",
+            "Invalid or unsupported secret-store transport marker."
+        ));
+    }
     let seed_canon = fs::canonicalize(seed_dir).with_context(|| {
         format!(
             "GREENTIC_SEED_DIR points to a path that does not exist or is unreadable: `{}`",
@@ -137,8 +165,36 @@ pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<
         );
     }
 
+    // Verify the entire encrypted store before overlaying anything. A corrupt or
+    // partial chunk mount must not replace the previous writable secret store.
+    let chunked_store = read_chunked_store(&seed_canon, transport.is_some()).with_context(|| {
+        crate::operator_i18n::tr(
+            "seed.secret_chunks.invalid",
+            "Cannot reconstruct the encrypted secret-store seed; verify the manifest, pinned versions, lengths and integrity checks.",
+        )
+    })?;
     let copied = copy_tree_with(&seed_canon, dest_root, true, &seed_pointer::OciBlobPuller)
         .with_context(|| format!("seeding environment store from `{}`", seed_dir.display()))?;
+    let copied = if let Some(bytes) = chunked_store {
+        let target = dest_root.join(greentic_deploy_spec::secret_chunks::STORE_PATH);
+        let parent = target
+            .parent()
+            .expect("fixed secret-store path has a parent");
+        // copy_tree_with checked/created these directories without following
+        // destination symlinks. They are private to this runtime identity.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+        }
+        install_with(&target, |file, _| {
+            std::io::Write::write_all(file, &bytes)
+                .context("installing verified encrypted secret store")
+        })?;
+        copied + 1
+    } else {
+        copied
+    };
     if copied == 0 {
         anyhow::bail!(
             "GREENTIC_SEED_DIR `{}` contained no files to seed (empty or partial mount?)",
@@ -146,6 +202,79 @@ pub fn seed_env_store_from(seed_dir: &Path, dest_root: &Path) -> anyhow::Result<
         );
     }
     Ok(copied)
+}
+
+/// Read only canonical, bounded regular files under the seed mount. Neither
+/// JSON errors nor chunk I/O errors may echo encrypted payload content.
+fn read_chunked_store(seed: &Path, required: bool) -> anyhow::Result<Option<Vec<u8>>> {
+    use greentic_deploy_spec::secret_chunks::{self as protocol, ChunkError, ChunkManifest};
+    use std::io::Read;
+    fn bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ChunkError> {
+        let meta =
+            fs::symlink_metadata(path).map_err(|_| ChunkError("missing chunk transport file"))?;
+        if !meta.is_file() || meta.len() > limit as u64 {
+            return Err(ChunkError("invalid chunk transport file type or length"));
+        }
+        let mut bytes = Vec::new();
+        File::open(path)
+            .map_err(|_| ChunkError("cannot open chunk transport file"))?
+            .take(limit as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| ChunkError("cannot read chunk transport file"))?;
+        if bytes.len() > limit {
+            return Err(ChunkError("chunk transport file exceeds bound"));
+        }
+        Ok(bytes)
+    }
+    let manifest_path = seed.join(protocol::MANIFEST_PATH);
+    match fs::symlink_metadata(&manifest_path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            if required {
+                return Err(ChunkError("required chunk manifest is missing").into());
+            }
+            if fs::symlink_metadata(seed.join(protocol::CHUNK_DIR)).is_ok() {
+                anyhow::bail!("chunk transport directory exists without its manifest");
+            }
+            return Ok(None);
+        }
+        Err(_) => anyhow::bail!("cannot inspect chunk transport manifest"),
+        Ok(_) => {}
+    }
+    if fs::symlink_metadata(seed.join(protocol::STORE_PATH)).is_ok() {
+        anyhow::bail!("seed contains both legacy and chunked secret stores");
+    }
+    // Reject symlinked parents as well as leaves; canonical paths in the
+    // manifest alone cannot prevent a parent redirect outside the seed mount.
+    for relative in [".greentic", ".greentic/dev", protocol::CHUNK_DIR] {
+        let meta = fs::symlink_metadata(seed.join(relative))
+            .map_err(|_| ChunkError("missing chunk transport directory"))?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(ChunkError("invalid chunk transport directory").into());
+        }
+    }
+    let manifest = ChunkManifest::decode(&bounded(&manifest_path, protocol::SECRET_VERSION_CAP)?)?;
+    let expected: std::collections::BTreeSet<_> = manifest
+        .chunks
+        .iter()
+        .map(|c| format!("{:06}.bin", c.index))
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in fs::read_dir(seed.join(protocol::CHUNK_DIR))? {
+        let entry = entry?;
+        let name = entry
+            .file_name()
+            .into_string()
+            .map_err(|_| ChunkError("invalid chunk file name"))?;
+        if !seen.insert(name.clone()) || !expected.contains(&name) {
+            return Err(ChunkError("unexpected or duplicate chunk file").into());
+        }
+    }
+    if seen != expected {
+        return Err(ChunkError("incomplete chunk transport directory").into());
+    }
+    Ok(Some(manifest.reconstruct(|chunk| {
+        bounded(&seed.join(&chunk.path), protocol::CHUNK_BYTES)
+    })?))
 }
 
 /// Recursively overlay the regular files of `src` onto `dst`, creating
@@ -187,6 +316,15 @@ fn copy_tree_with(
         let entry = entry.with_context(|| format!("reading an entry under `{}`", src.display()))?;
         let from = entry.path();
         let to = dst.join(entry.file_name());
+        // Transport artifacts never become runtime dev-store records. The root
+        // entry point verifies them and installs only the reconstructed file.
+        if src.ends_with(".greentic/dev")
+            && (entry.file_name() == ".dev.secrets.chunks.v1.json"
+                || entry.file_name() == ".dev.secrets.chunks.v1")
+        {
+            continue;
+        }
+
         // `file_type()` does not follow symlinks: `is_dir`/`is_file` are true only
         // for real directories/files, so links fall through to the skip branch.
         let file_type = entry
@@ -291,6 +429,9 @@ fn install_with(
             .open(&tmp)
             .with_context(|| format!("creating seed temp file `{}`", tmp.display()))?;
         fill(&mut dst_f, &tmp)?;
+        dst_f
+            .sync_all()
+            .context("syncing seed file before atomic installation")?;
         drop(dst_f);
         set_writable(&tmp)?;
         fs::rename(&tmp, to)
@@ -690,3 +831,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "seed_chunks_tests.rs"]
+mod chunk_tests;
