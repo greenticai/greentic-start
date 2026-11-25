@@ -127,6 +127,9 @@ RUN set -eu \
 # no shell. The musl-static binary needs no runtime apt layer; squashfs-tools is
 # gone because bundle_ref.rs reads SquashFS in-process via `backhand` (P0.4).
 FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+# Verified by the deployer against the digest-pinned image config before
+# staging an oversized encrypted secret store. Inherited by runtime variants.
+LABEL io.greentic.secret-store.chunks="1"
 
 COPY --from=build /out/greentic-start /usr/local/bin/greentic-start
 COPY --from=cloudflared /cloudflared /usr/local/bin/cloudflared

@@ -134,6 +134,7 @@ pub(crate) fn env_with_active_bundle(tenant: &str, bundle_id: &str) -> (Environm
     let deployment_id = DeploymentId::new();
     let mut env = env_with(Vec::new());
     env.bundles = vec![BundleDeployment {
+        pack_name: None,
         schema: SchemaVersion::new(SchemaVersion::BUNDLE_DEPLOYMENT_V1),
         deployment_id,
         env_id: env_id(),

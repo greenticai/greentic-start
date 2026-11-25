@@ -4,5 +4,8 @@
   "cli.start.lifecycle.bundle_sources": "Supported bundle refs: path, file://, http(s)://, oci://, repo://, store://.",
   "cli.start.lifecycle.version_line": "Current supported line: 0.5.x",
   "cli.start.bundle.resolve": "Bundle refs resolve through local paths or distributor-backed OCI mappings before runtime starts.",
-  "cli.start.extension_roles": "Platform runtime packs are classified separately from optional extension packs so lifecycle boot can reason about core services."
+  "cli.start.extension_roles": "Platform runtime packs are classified separately from optional extension packs so lifecycle boot can reason about core services.",
+  "seed.secret_chunks.invalid": "Cannot reconstruct the encrypted secret-store seed; verify the manifest, pinned versions, lengths and integrity checks.",
+  "seed.secret_chunks.marker_invalid": "Invalid or unsupported secret-store transport marker.",
+  "seed.secret_chunks.seed_required": "Secret-store transport requires a seed directory."
 }

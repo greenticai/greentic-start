@@ -217,6 +217,9 @@ default-features = false
 # the whole lane back to its first publish, which is what this said before
 # greentic-start#625 and is what CLAUDE.md's `>=M.m.p-dev.RUNID` rule exists to
 # stop.
+# Chunked Cloud Run seeds additionally require secret_chunks from the coordinated
+# deployer/deploy-spec release. Update both floors and Cargo.lock to that build
+# before releasing this runtime; see docs/secret-store-chunks.md.
 [dependencies.greentic-deploy-spec]
 version = ">=1.2.0-dev.35969201904, <1.3.0-0"
 
