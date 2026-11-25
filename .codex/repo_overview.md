@@ -8,6 +8,11 @@ The repo is centered on startup/runtime concerns rather than setup UX. It integr
 
 ## Current Cloud Run seed transport
 
+The runtime now requires the verified crates.io protocol cohort
+`1.2.0-dev.45669060982` for both deploy-spec and deployer, with stable 1.2.0
+excluded. Docker honors Cargo.lock and dependency/source PR changes trigger
+both native image builds; see `docs/secret-store-chunks.md` for release evidence.
+
 `src/seed_copy.rs` reconstructs the shared deploy-spec chunk protocol before
 opening the environment store; `src/seed_chunks_tests.rs` covers integrity,
 missing mounts, private atomic installation and legacy rollback. The image
